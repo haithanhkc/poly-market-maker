@@ -2,6 +2,11 @@
 
 Market maker keeper for the Polymarket CLOB.
 
+The sell-only equal-gross-USD Up/Down helper is documented in
+[README.vi.md](README.vi.md). Its paper demo does not use the keeper below
+and does not need credentials. English limits are in
+[docs/sell_equal_limitations.md](docs/sell_equal_limitations.md).
+
 ## NOTE
 
 This software is experimental and in active development.

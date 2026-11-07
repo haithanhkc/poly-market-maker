@@ -1,0 +1,6 @@
+# Paper and replay use the Python standard library only.
+# Python 3.10 or newer is enough. Do not install this file's legacy
+# requirements.txt pins (py-clob-client, web3 5) for the sell bot.
+#
+# Optional live adapter, Python >= 3.11, not imported by tests:
+# see requirements-sell-bot-live.txt

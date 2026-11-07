@@ -1,0 +1,23 @@
+{
+  "config": "config/sell_equal_demo.json",
+  "steps": [
+    {"op": "market", "ts": "1700000000", "accepting": true, "ended": false},
+    {"op": "user", "ts": "1700000000"},
+    {"op": "tick"},
+    {
+      "op": "fill",
+      "outcome": "up",
+      "price": "0.60",
+      "shares": "10",
+      "fill_id": "fill-up-10"
+    },
+    {
+      "op": "expect",
+      "gross_up": "6",
+      "gross_down": "0",
+      "hedge_outcome": "down",
+      "hedge_price": "0.40",
+      "hedge_size": "15"
+    }
+  ]
+}

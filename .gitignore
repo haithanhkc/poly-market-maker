@@ -133,5 +133,8 @@ dmypy.json
 # logs
 logs/
 
+# sell-equal runtime state
+state/
+
 # vscode settings
 .vscode/

@@ -1,0 +1,4 @@
+# Optional. Not installed by CI and not used by paper/replay tests.
+# Verified against the published wheel polymarket-client 0.17.0.
+# Requires Python >= 3.11. Do not use the archived py-clob-client for this bot.
+polymarket-client==0.17.0

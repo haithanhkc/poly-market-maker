@@ -1,0 +1,61 @@
+{
+  "fetched_at": "2026-11-07T04:18:14Z",
+  "source": "Public GET only. No account, no order, no signature.",
+  "clob_market_url": "https://clob.polymarket.com/clob-markets/0xe4966d642938113525dfb125060bda90b9f8d8c25945ae352de1b75c160bc383",
+  "gamma_url": "https://gamma-api.polymarket.com/markets?condition_ids=0xe4966d642938113525dfb125060bda90b9f8d8c25945ae352de1b75c160bc383",
+  "notes": [
+    "Bitcoin Up or Down, November 6 11:15PM-11:20PM ET. The window end is Gamma endDate 2026-11-07T04:20:00Z.",
+    "GET /book did not include a protocol version field. GET /clob-markets field v was v1.",
+    "Legacy GET /markets end_date_iso was 2026-11-07T00:00:00Z and is not used.",
+    "Maker and taker base fee fields were 1000 and fd.r was 0.07. This bot still targets gross price*shares and does not subtract those fees.",
+    "This snapshot goes stale as soon as the 5-minute window ends. Live mode must fetch again and will refuse a passed endDate."
+  ],
+  "clob_market": {
+    "c": "0xe4966d642938113525dfb125060bda90b9f8d8c25945ae352de1b75c160bc383",
+    "v": "v1",
+    "ao": true,
+    "mts": 0.01,
+    "mos": 5,
+    "mbf": 1000,
+    "tbf": 1000,
+    "fd": {"r": 0.07, "e": 1, "to": true},
+    "t": [
+      {
+        "t": "44857089090901365835706371888611204979538894171442730872794600452065181330944",
+        "o": "Up"
+      },
+      {
+        "t": "17424551638207318915606858171665237870653355896978276914963148187077601073259",
+        "o": "Down"
+      }
+    ]
+  },
+  "gamma_market": {
+    "conditionId": "0xe4966d642938113525dfb125060bda90b9f8d8c25945ae352de1b75c160bc383",
+    "slug": "btc-updown-5m-1794024900",
+    "question": "Bitcoin Up or Down - November 6, 11:15PM-11:20PM ET",
+    "outcomes": "[\"Up\", \"Down\"]",
+    "clobTokenIds": "[\"44857089090901365835706371888611204979538894171442730872794600452065181330944\", \"17424551638207318915606858171665237870653355896978276914963148187077601073259\"]",
+    "closed": false,
+    "acceptingOrders": true,
+    "negRisk": false,
+    "endDate": "2026-11-07T04:20:00Z",
+    "end_date_iso": "2026-11-07T00:00:00Z"
+  },
+  "up_book": {
+    "market": "0xe4966d642938113525dfb125060bda90b9f8d8c25945ae352de1b75c160bc383",
+    "asset_id": "44857089090901365835706371888611204979538894171442730872794600452065181330944",
+    "timestamp": "1794024846085",
+    "tick_size": "0.01",
+    "min_order_size": "5",
+    "neg_risk": false
+  },
+  "down_book": {
+    "market": "0xe4966d642938113525dfb125060bda90b9f8d8c25945ae352de1b75c160bc383",
+    "asset_id": "17424551638207318915606858171665237870653355896978276914963148187077601073259",
+    "timestamp": "1794025094870",
+    "tick_size": "0.01",
+    "min_order_size": "5",
+    "neg_risk": false
+  }
+}
