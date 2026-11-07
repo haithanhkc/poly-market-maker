@@ -36,6 +36,13 @@ class UrllibTransport:
         self.timeout = timeout
 
     def get_json(self, url: str) -> object:
+        return self._read(url, parse_float=None)
+
+    def get_json_decimal(self, url: str) -> object:
+        """GET JSON, keeping the original decimal literals for prices and sizes."""
+        return self._read(url, parse_float=str)
+
+    def _read(self, url: str, *, parse_float) -> object:
         if not url.startswith(ALLOWED_PREFIXES):
             raise PublicDataError("refusing non-official host")
         request = urllib.request.Request(
@@ -53,7 +60,8 @@ class UrllibTransport:
         except urllib.error.URLError as exc:
             raise PublicDataError(f"network error for {url}: {exc.reason}") from exc
         try:
-            return json.loads(raw)
+            kwargs = {} if parse_float is None else {"parse_float": parse_float}
+            return json.loads(raw, **kwargs)
         except json.JSONDecodeError as exc:
             raise PublicDataError(f"invalid json from {url}") from exc
 
@@ -109,3 +117,42 @@ class PublicReadClient:
         if not isinstance(payload, dict):
             raise PublicDataError("resolution payload is not an object")
         return payload
+
+    def fetch_trades_page(
+        self, condition_id: str, limit: int = 500, cursor: Optional[str] = None
+    ) -> dict:
+        params = {"condition": condition_id, "limit": str(int(limit))}
+        if cursor:
+            params["cursor"] = cursor
+        query = urllib.parse.urlencode(params)
+        payload = self._get(f"{DATA}/v2/trades?{query}", decimal_floats=True)
+        if not isinstance(payload, dict):
+            raise PublicDataError("trade payload is not an object")
+        return payload
+
+    def fetch_price_history(
+        self,
+        token_id: str,
+        start_s: int,
+        end_s: int,
+        bucket_seconds: int = 60,
+        cursor: Optional[str] = None,
+    ) -> dict:
+        params = {
+            "token_id": token_id,
+            "start": str(int(start_s)),
+            "end": str(int(end_s)),
+            "bucket_seconds": str(int(bucket_seconds)),
+        }
+        if cursor:
+            params["cursor"] = cursor
+        query = urllib.parse.urlencode(params)
+        payload = self._get(f"{DATA}/v2/prices-history?{query}", decimal_floats=True)
+        if not isinstance(payload, dict):
+            raise PublicDataError("price history payload is not an object")
+        return payload
+
+    def _get(self, url: str, *, decimal_floats: bool) -> object:
+        if decimal_floats and hasattr(self.transport, "get_json_decimal"):
+            return self.transport.get_json_decimal(url)
+        return self.transport.get_json(url)

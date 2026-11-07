@@ -54,6 +54,9 @@ class Engine:
         self._batch: list[dict] = []
         self._skip_once: set[tuple[str, str, str]] = set()
         self.mode = "library"
+        # Long replays flush the ledger once at the end. Live paper mode keeps
+        # the default and writes state after every event.
+        self.persist_each_event = True
 
     @classmethod
     def create(
@@ -162,6 +165,10 @@ class Engine:
     def _finish(self) -> None:
         if self.writer is not None:
             self.writer.write(self._batch)
+        if self.state_path is not None and self.persist_each_event:
+            save_state(self.state_path, self.state)
+
+    def flush(self) -> None:
         if self.state_path is not None:
             save_state(self.state_path, self.state)
 

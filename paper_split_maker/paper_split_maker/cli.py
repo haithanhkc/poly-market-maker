@@ -7,6 +7,13 @@ import json
 from pathlib import Path
 
 from paper_split_maker.config import ConfigError, load_config
+from paper_split_maker.historical import (
+    fetch_snapshot,
+    load_historical_snapshot,
+    parse_utc,
+    run_historical,
+    save_snapshot,
+)
 from paper_split_maker.session import run_demo, run_paper, run_replay
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -38,14 +45,48 @@ def main(argv: list[str] | None = None) -> int:
     paper.add_argument("--duration-seconds", type=int, required=True)
     paper.add_argument("--max-markets", type=int, required=True)
 
+    fetch = sub.add_parser(
+        "historical-fetch",
+        help="download a labeled public snapshot (no order book; prints and payouts)",
+    )
+    fetch.add_argument("--snapshot", type=Path, required=True)
+    fetch.add_argument("--start", default="2026-11-06T17:00:00Z")
+    fetch.add_argument("--end", default="2026-11-07T17:00:00Z")
+
+    hist = sub.add_parser(
+        "historical-replay",
+        help="replay a reconstructed public snapshot on the paper ledger",
+    )
+    _add_out(hist)
+    hist.add_argument("--config", type=Path, required=True)
+    hist.add_argument("--snapshot", type=Path, required=True)
+
     args = parser.parse_args(argv)
     try:
+        if args.command == "historical-fetch":
+            snapshot = fetch_snapshot(parse_utc(args.start), parse_utc(args.end))
+            save_snapshot(args.snapshot, snapshot)
+            print(
+                json.dumps(
+                    {
+                        "snapshot": str(args.snapshot),
+                        "markets": len(snapshot["markets"]),
+                        "label": snapshot["label"],
+                        "synthetic_order_books": True,
+                    },
+                    indent=2,
+                )
+            )
+            return 0
         config = load_config(args.config)
         out = Path(args.out)
         if args.command == "demo":
             summary = run_demo(config, out, args.scenario)
         elif args.command == "replay":
             summary = run_replay(config, args.scenario, out)
+        elif args.command == "historical-replay":
+            snapshot = load_historical_snapshot(args.snapshot)
+            summary = run_historical(config, snapshot, out)
         else:
             summary = run_paper(
                 config,
@@ -89,6 +130,14 @@ def _print_summary(summary: dict) -> None:
         "at_risk_cap": summary.get("at_risk_cap"),
         "public_data_ok": summary.get("public_data_ok"),
         "disclaimer_vi": summary.get("disclaimer_vi"),
+        "net_pnl_usdc": (summary.get("historical") or {}).get("net_pnl_usdc"),
+        "net_pnl_pct_of_initial": (summary.get("historical") or {}).get(
+            "net_pnl_pct_of_initial"
+        ),
+        "worst_case_equity_minimum": (summary.get("historical") or {}).get(
+            "worst_case_equity_minimum"
+        ),
+        "markets_declined": (summary.get("historical") or {}).get("markets_declined"),
     }
     print(json.dumps(brief, ensure_ascii=False, indent=2, sort_keys=True))
 

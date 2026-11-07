@@ -175,6 +175,28 @@ Chạy pytest trong thư mục này. `conftest.py` bảo suite gốc của repo 
 
 `paper` thoát khi hết thời lượng. Lần chạy đầu tạo `state.json`. Muốn sổ mới thì dùng thư mục `--out` khác. Không có cờ reset.
 
+### Replay lịch sử (phản sự thật, không phải kết quả live)
+
+`historical-replay` chạy sổ giấy trên 10 thị trường BTC Up/Down 5 phút lấy từ dữ liệu public. Snapshot đã lưu nằm ở `data/bkk_2026-11-07.snapshot.json`, nhãn `reconstructed-from-public-prints`. Cửa sổ là ngày 7 tháng 11 năm 2026 theo giờ Bangkok (UTC+7), tức 2026-11-06T17:00:00Z đến 2026-11-07T17:00:00Z.
+
+Không có sổ lệnh lịch sử public. `GET /book` chỉ là sổ đang mở và trả 404 sau khi thị trường đóng. Replay dựng lại top-of-book từ print Data API `/v2/trades`, đối chiếu giá 1 phút `/v2/prices-history`, và chỉ tất toán bằng payout `/v2/resolutions`. Giả định nằm trong snapshot: ask là print BUY cuối làm tròn lên tick, bid là print SELL cuối làm tròn xuống; nếu spread quan sát nhỏ hơn 0.02 thì bid bị hạ để spread thành 0.02, nhằm đứng vào ask với hàng chờ 5 shares (cùng mức `improve_queue_shares`) thay vì treo phía sau với hàng chờ 0. Print BUY đúng giá, sau khi trừ 5 shares, mới khớp. Print SELL không khớp lệnh bán. Print giá cao hơn không xuyên qua (`trade_through_fills` = false). Giá history nằm ngoài bid/ask quan sát thì sổ bị coi là không chắc và bot không báo giá mới.
+
+Cấu hình `config.historical200.json` dùng vốn 200 USDC. Trần lỗ 3% không đổi: ngân sách 6 USDC, sàn 194, không nới sau lỗ hay sau restart. Giới hạn theo thị trường được thu nhỏ theo tỷ lệ, không nới sàn: `per_market_budget` 8 (cùng tỷ lệ 4% như 40/1000), `split_clip` 5 (20 nhân 200/1000 ra 4, nâng lên đúng size tối thiểu 5), `min_pair_inventory` 5. Mọi thông số rủi ro còn lại giữ mặc định, gồm `max_open_markets` 2. Mười phiên không chồng lên nhau nên sổ chỉ mở một thị trường tại một thời điểm.
+
+```bash
+python3 -m paper_split_maker historical-replay \
+  --config config.historical200.json \
+  --snapshot data/bkk_2026-11-07.snapshot.json \
+  --out /tmp/psm-historical
+```
+
+Lệnh `historical-fetch` tải lại snapshot từ API public (GET, không thân, không khóa). Kết quả là phản sự thật trên sổ dựng lại. Nó không chứng minh khớp lệnh thật và không chứng minh lợi nhuận live.
+
+```bash
+python3 -m paper_split_maker historical-fetch \
+  --snapshot data/bkk_2026-11-07.snapshot.json
+```
+
 Mã thoát 2 là lỗi cấu hình hoặc lỗi đọc file. Phiên paper kết thúc đúng hạn kể cả khi API public lỗi; `summary.json` có `public_data_ok`.
 
 ## Bối cảnh ví đã được kể lại
