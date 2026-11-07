@@ -25,7 +25,9 @@ def main(argv: list[str] | None = None) -> int:
     demo.add_argument("--config", type=Path, required=True)
     demo.add_argument("--scenario", type=Path, default=DEFAULT_SCENARIO)
 
-    replay = sub.add_parser("replay", help="replay a labeled synthetic/fixture scenario")
+    replay = sub.add_parser(
+        "replay", help="replay a labeled synthetic/fixture scenario"
+    )
     _add_out(replay)
     replay.add_argument("--config", type=Path, required=True)
     replay.add_argument("--scenario", type=Path, required=True)
@@ -62,7 +64,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _add_out(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--out", type=Path, required=True, help="directory for the ledger, logs, and summary")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="directory for the ledger, logs, and summary",
+    )
 
 
 def _print_summary(summary: dict) -> None:

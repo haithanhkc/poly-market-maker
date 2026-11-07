@@ -8,7 +8,11 @@ from pathlib import Path
 
 from paper_split_maker.decimal_utils import money
 from paper_split_maker.models import State
-from paper_split_maker.risk import best_case_equity, market_contribution, worst_case_equity
+from paper_split_maker.risk import (
+    best_case_equity,
+    market_contribution,
+    worst_case_equity,
+)
 
 CSV_FIELDS = [
     "ts",
@@ -56,12 +60,16 @@ class LogWriter:
             for row in rows:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
         with self.csv_path.open("a", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            writer = csv.DictWriter(
+                handle, fieldnames=CSV_FIELDS, extrasaction="ignore"
+            )
             for row in rows:
                 writer.writerow({key: row.get(key, "") for key in CSV_FIELDS})
 
 
-def build_summary(state: State, *, mode: str, resumed: bool, notes: list[str] | None = None) -> dict:
+def build_summary(
+    state: State, *, mode: str, resumed: bool, notes: list[str] | None = None
+) -> dict:
     worst = worst_case_equity(state)
     best = best_case_equity(state)
     markets = []
@@ -95,7 +103,9 @@ def build_summary(state: State, *, mode: str, resumed: bool, notes: list[str] | 
         "resumed": resumed,
         "live_orders": False,
         "paper_only": True,
-        "synthetic_data_present": any(market.synthetic for market in state.markets.values()),
+        "synthetic_data_present": any(
+            market.synthetic for market in state.markets.values()
+        ),
         "initial_capital": money(state.initial_capital),
         "loss_floor": money(state.loss_floor),
         "loss_budget_usdc": money(state.initial_capital - state.loss_floor),
@@ -129,5 +139,8 @@ def build_summary(state: State, *, mode: str, resumed: bool, notes: list[str] | 
 
 def write_summary(directory: Path, summary: dict) -> Path:
     path = Path(directory) / "summary.json"
-    path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     return path

@@ -13,7 +13,12 @@ from paper_split_maker.normalize import (
     events_from_ws_message,
     gamma_market_event,
 )
-from paper_split_maker.public_client import GAMMA, PublicDataError, PublicReadClient, UrllibTransport
+from paper_split_maker.public_client import (
+    GAMMA,
+    PublicDataError,
+    PublicReadClient,
+    UrllibTransport,
+)
 from paper_split_maker.session import run_paper
 from tests.helpers import make_engine
 
@@ -27,8 +32,8 @@ def _gamma(**overrides):
         "conditionId": "0xabc",
         "slug": "btc-updown-5m-1",
         "question": "Bitcoin Up or Down",
-        "outcomes": "[\"Up\", \"Down\"]",
-        "clobTokenIds": "[\"111\", \"222\"]",
+        "outcomes": '["Up", "Down"]',
+        "clobTokenIds": '["111", "222"]',
         "endDate": "2030-01-01T00:00:05Z",
         "orderPriceMinTickSize": "0.01",
         "orderMinSize": "5",
@@ -45,10 +50,17 @@ def test_gamma_v1_and_v2_mapping_refuses_yes_no_and_unknown_version():
     assert event["up_token_id"] == "111"
     assert event["down_token_id"] == "222"
     assert event["synthetic"] is False
-    swapped = gamma_market_event(_gamma(outcomes='["Down", "Up"]', clobTokenIds='["222", "111"]'))
+    swapped = gamma_market_event(
+        _gamma(outcomes='["Down", "Up"]', clobTokenIds='["222", "111"]')
+    )
     assert swapped["up_token_id"] == "111"
     assert swapped["up_index"] == 1
-    v2 = _gamma(version="v2", clobTokenIds=None, positionIds=["900", "901"], outcomes=["Up", "Down"])
+    v2 = _gamma(
+        version="v2",
+        clobTokenIds=None,
+        positionIds=["900", "901"],
+        outcomes=["Up", "Down"],
+    )
     parsed = gamma_market_event(v2)
     assert parsed["up_token_id"] == "900"
     assert gamma_market_event(_gamma(outcomes='["Yes", "No"]')) is None
@@ -58,11 +70,49 @@ def test_gamma_v1_and_v2_mapping_refuses_yes_no_and_unknown_version():
 
 def test_resolution_and_ws_duplicates():
     market = gamma_market_event(_gamma())
-    assert data_api_resolution_event(market, {"data": [{"condition_id": "0xabc", "status": "proposed", "payouts": [1_000_000, 0]}]}) is None
-    assert data_api_resolution_event(market, {"data": [{"condition_id": "0xabc", "status": "resolved", "payouts": [1, 0], "market_type": "BINARY"}]}) is None
+    assert (
+        data_api_resolution_event(
+            market,
+            {
+                "data": [
+                    {
+                        "condition_id": "0xabc",
+                        "status": "proposed",
+                        "payouts": [1_000_000, 0],
+                    }
+                ]
+            },
+        )
+        is None
+    )
+    assert (
+        data_api_resolution_event(
+            market,
+            {
+                "data": [
+                    {
+                        "condition_id": "0xabc",
+                        "status": "resolved",
+                        "payouts": [1, 0],
+                        "market_type": "BINARY",
+                    }
+                ]
+            },
+        )
+        is None
+    )
     official = data_api_resolution_event(
         market,
-        {"data": [{"condition_id": "0xABC", "status": "resolved", "payouts": [0, 1_000_000], "market_type": "BINARY"}]},
+        {
+            "data": [
+                {
+                    "condition_id": "0xABC",
+                    "status": "resolved",
+                    "payouts": [0, 1_000_000],
+                    "market_type": "BINARY",
+                }
+            ]
+        },
     )
     assert official["payouts"] == [0, 1_000_000]
     assert official["source"] == "data-api-v2"
@@ -122,7 +172,13 @@ def test_ws_label_conflict_cash(tmp_path):
         engine,
         [
             market_event(),
-            {"type": "split", "event_id": "s", "ts": 1, "market_id": "m1", "amount": "10"},
+            {
+                "type": "split",
+                "event_id": "s",
+                "ts": 1,
+                "market_id": "m1",
+                "amount": "10",
+            },
             {
                 "type": "resolution",
                 "event_id": "bad-ws",
@@ -275,7 +331,9 @@ def test_cli_demo_is_idempotent_on_restart(tmp_path):
 
 def test_cli_replay_refuses_unlabeled_scenario(tmp_path):
     scenario = tmp_path / "plain.json"
-    scenario.write_text(json.dumps({"label": "production", "events": []}), encoding="utf-8")
+    scenario.write_text(
+        json.dumps({"label": "production", "events": []}), encoding="utf-8"
+    )
     code = main(
         [
             "replay",

@@ -87,7 +87,10 @@ class Engine:
         assert_ledger_invariants(self.state)
 
     def at_cap(self) -> bool:
-        return worst_case_equity(self.state) <= self.state.loss_floor + self.config.freeze_band
+        return (
+            worst_case_equity(self.state)
+            <= self.state.loss_floor + self.config.freeze_band
+        )
 
     def handle_event(self, event: dict) -> list[dict]:
         self._batch = []
@@ -99,7 +102,9 @@ class Engine:
         if event_id is not None:
             event_id = str(event_id)
             if event_id in self.state.applied_event_ids:
-                self._emit(kind="duplicate_event", reason="duplicate_event", detail=event_id)
+                self._emit(
+                    kind="duplicate_event", reason="duplicate_event", detail=event_id
+                )
                 self._finish()
                 return list(self._batch)
             self.state.applied_event_ids.add(event_id)
@@ -112,7 +117,11 @@ class Engine:
                 self._finish()
                 return list(self._batch)
             if stamp < self.state.now_ms:
-                self._emit(kind="out_of_order_clock", reason="out_of_order_clock", detail=str(stamp))
+                self._emit(
+                    kind="out_of_order_clock",
+                    reason="out_of_order_clock",
+                    detail=str(stamp),
+                )
                 if kind in {"heartbeat", "clock", "split", "merge"}:
                     self._finish()
                     return list(self._batch)
@@ -146,7 +155,9 @@ class Engine:
     def summary(self, notes: Optional[list[str]] = None) -> dict:
         from paper_split_maker.logs import build_summary
 
-        return build_summary(self.state, mode=self.mode, resumed=self.resumed, notes=notes)
+        return build_summary(
+            self.state, mode=self.mode, resumed=self.resumed, notes=notes
+        )
 
     def _finish(self) -> None:
         if self.writer is not None:
@@ -154,7 +165,13 @@ class Engine:
         if self.state_path is not None:
             save_state(self.state_path, self.state)
 
-    def _emit(self, kind: str, market: Optional[Market] = None, order: Optional[Order] = None, **fields) -> None:
+    def _emit(
+        self,
+        kind: str,
+        market: Optional[Market] = None,
+        order: Optional[Order] = None,
+        **fields,
+    ) -> None:
         price = fields.pop("price", None)
         size = fields.pop("size", None)
         outcome = fields.pop("outcome", None)
@@ -164,8 +181,12 @@ class Engine:
         row = {
             "ts": self.state.now_ms,
             "kind": kind,
-            "market_id": market.market_id if market is not None else fields.pop("market_id", ""),
-            "order_id": order.order_id if order is not None else fields.pop("order_id", ""),
+            "market_id": market.market_id
+            if market is not None
+            else fields.pop("market_id", ""),
+            "order_id": order.order_id
+            if order is not None
+            else fields.pop("order_id", ""),
             "outcome": outcome or "",
             "price": money(price) if isinstance(price, Decimal) else (price or ""),
             "size": money(size) if isinstance(size, Decimal) else (size or ""),
@@ -188,7 +209,11 @@ class Engine:
         }:
             if len(self.state.risk_rejections) < 200:
                 self.state.risk_rejections.append(
-                    {"ts": self.state.now_ms, "reason": row["reason"], "market_id": row["market_id"]}
+                    {
+                        "ts": self.state.now_ms,
+                        "reason": row["reason"],
+                        "market_id": row["market_id"],
+                    }
                 )
 
     def _note_cap(self) -> None:
@@ -217,11 +242,16 @@ class Engine:
 
     def _promote(self) -> None:
         for order in list(self.state.orders.values()):
-            if order.status == "queued" and self.state.now_ms >= order.submit_ts + self.state.ack_latency_ms:
+            if (
+                order.status == "queued"
+                and self.state.now_ms >= order.submit_ts + self.state.ack_latency_ms
+            ):
                 order.status = "live"
                 order.live_ts = order.submit_ts + self.state.ack_latency_ms
                 market = self.state.markets[order.market_id]
-                self._emit(kind="order_live", market=market, order=order, size=order.remaining)
+                self._emit(
+                    kind="order_live", market=market, order=order, size=order.remaining
+                )
             if (
                 order.status == "cancel_requested"
                 and order.cancel_ready_ts is not None
@@ -275,7 +305,9 @@ class Engine:
         else:
             for order in self.state.orders.values():
                 if order.status == "cancel_requested":
-                    order.cancel_ready_ts = self.state.now_ms + self.state.cancel_latency_ms
+                    order.cancel_ready_ts = (
+                        self.state.now_ms + self.state.cancel_latency_ms
+                    )
             self._emit(kind="feed", reason="reconnected")
 
     def _on_market_open(self, event: dict) -> None:
@@ -296,18 +328,26 @@ class Engine:
                 existing.end_ts_ms = market.end_ts_ms
                 self._emit(kind="market_open", market=existing, reason="idempotent")
                 return
-            self._emit(kind="reject", market=existing, reason="market_identity_conflict")
+            self._emit(
+                kind="reject", market=existing, reason="market_identity_conflict"
+            )
             return
-        open_count = sum(1 for item in self.state.markets.values() if item.status != "redeemed")
+        open_count = sum(
+            1 for item in self.state.markets.values() if item.status != "redeemed"
+        )
         if open_count >= self.config.max_open_markets:
-            self._emit(kind="reject", reason="max_open_markets", detail=market.market_id)
+            self._emit(
+                kind="reject", reason="max_open_markets", detail=market.market_id
+            )
             return
         market.reserve_active = True
         market.operational_reserve_amount = self.state.operational_reserve
         self.state.markets[market.market_id] = market
         if worst_case_equity(self.state) < self.state.loss_floor:
             del self.state.markets[market.market_id]
-            self._emit(kind="quote_reject", reason="risk_floor", detail=market.market_id)
+            self._emit(
+                kind="quote_reject", reason="risk_floor", detail=market.market_id
+            )
             return
         self._emit(
             kind="market_open",
@@ -328,19 +368,27 @@ class Engine:
             stamp = int(event.get("book_ts", event["ts"]))
         except (KeyError, TypeError, ValueError):
             market.book(outcome).uncertain = True
-            self._emit(kind="book", market=market, outcome=outcome, reason="uncertain_book")
+            self._emit(
+                kind="book", market=market, outcome=outcome, reason="uncertain_book"
+            )
             return
         book = market.book(outcome)
         digest = str(event.get("hash") or "")
         if book.ts_ms >= 0 and stamp < book.ts_ms:
-            self._emit(kind="book", market=market, outcome=outcome, reason="out_of_order_book")
+            self._emit(
+                kind="book", market=market, outcome=outcome, reason="out_of_order_book"
+            )
             return
         if book.ts_ms == stamp and digest and book.digest == digest:
-            self._emit(kind="book", market=market, outcome=outcome, reason="duplicate_book")
+            self._emit(
+                kind="book", market=market, outcome=outcome, reason="duplicate_book"
+            )
             return
         if book.ts_ms == stamp and digest and book.digest and book.digest != digest:
             book.uncertain = True
-            self._emit(kind="book", market=market, outcome=outcome, reason="uncertain_book")
+            self._emit(
+                kind="book", market=market, outcome=outcome, reason="uncertain_book"
+            )
             return
         try:
             if "tick_size" in event and event["tick_size"] not in (None, ""):
@@ -351,17 +399,25 @@ class Engine:
                 minimum = Decimal(str(event["min_order_size"]))
                 if minimum > market.min_order_size:
                     market.min_order_size = minimum
-            bids = _aggregate_levels(event.get("bids") or [], market.tick_size, descending=True)
-            asks = _aggregate_levels(event.get("asks") or [], market.tick_size, descending=False)
+            bids = _aggregate_levels(
+                event.get("bids") or [], market.tick_size, descending=True
+            )
+            asks = _aggregate_levels(
+                event.get("asks") or [], market.tick_size, descending=False
+            )
         except (ValueError, ArithmeticError):
             book.uncertain = True
-            self._emit(kind="book", market=market, outcome=outcome, reason="uncertain_book")
+            self._emit(
+                kind="book", market=market, outcome=outcome, reason="uncertain_book"
+            )
             return
         asset = event.get("asset_id")
         expected = market.up_token_id if outcome == "up" else market.down_token_id
         if asset is not None and str(asset) != expected:
             book.uncertain = True
-            self._emit(kind="book", market=market, outcome=outcome, reason="token_mismatch")
+            self._emit(
+                kind="book", market=market, outcome=outcome, reason="token_mismatch"
+            )
             return
         book.bids = bids
         book.asks = asks
@@ -380,18 +436,33 @@ class Engine:
             return
         trade_id = str(trade_id)
         if trade_id in self.state.seen_trade_ids:
-            self._emit(kind="duplicate_trade", market=market, reason="duplicate_trade", detail=trade_id)
+            self._emit(
+                kind="duplicate_trade",
+                market=market,
+                reason="duplicate_trade",
+                detail=trade_id,
+            )
             return
         self.state.seen_trade_ids.add(trade_id)
         if self.state.fill_mode != "queue":
-            self._emit(kind="trade_ignored", market=market, reason="fill_mode_none", detail=trade_id)
+            self._emit(
+                kind="trade_ignored",
+                market=market,
+                reason="fill_mode_none",
+                detail=trade_id,
+            )
             return
         outcome = str(event.get("outcome") or "")
         if outcome not in {"up", "down"}:
             self._emit(kind="trade_ignored", market=market, reason="bad_outcome")
             return
         if str(event.get("taker_side") or "").upper() != "BUY":
-            self._emit(kind="trade_ignored", market=market, outcome=outcome, reason="not_lifting_ask")
+            self._emit(
+                kind="trade_ignored",
+                market=market,
+                outcome=outcome,
+                reason="not_lifting_ask",
+            )
             return
         try:
             price = Decimal(str(event["price"]))
@@ -460,7 +531,12 @@ class Engine:
             return
         market = self.state.markets[order.market_id]
         if not market.synthetic:
-            self._emit(kind="reject", market=market, order=order, reason="adverse_fill_on_live_market")
+            self._emit(
+                kind="reject",
+                market=market,
+                order=order,
+                reason="adverse_fill_on_live_market",
+            )
             return
         try:
             size = qdown(Decimal(str(event["size"])), Decimal("0.000001"))
@@ -468,11 +544,15 @@ class Engine:
             self._emit(kind="reject", market=market, order=order, reason="bad_size")
             return
         if size <= 0 or size > order.remaining:
-            self._emit(kind="reject", market=market, order=order, size=size, reason="no_short")
+            self._emit(
+                kind="reject", market=market, order=order, size=size, reason="no_short"
+            )
             return
         self._apply_fill(market, order, size, synthetic=True)
 
-    def _apply_fill(self, market: Market, order: Order, size: Decimal, *, synthetic: bool) -> None:
+    def _apply_fill(
+        self, market: Market, order: Order, size: Decimal, *, synthetic: bool
+    ) -> None:
         proceeds = net_maker_proceeds(size, order.price, self.state.maker_fee_rate)
         self.state.cash += proceeds
         market.net_cash_flow += proceeds
@@ -509,14 +589,26 @@ class Engine:
             return
         winner = _winner_from_resolution(market, event)
         if winner is None:
-            self._emit(kind="resolution_rejected", market=market, reason=str(event.get("_reject_reason") or "unresolved_outcome"))
+            self._emit(
+                kind="resolution_rejected",
+                market=market,
+                reason=str(event.get("_reject_reason") or "unresolved_outcome"),
+            )
             return
         if market.status == "redeemed":
-            reason = "idempotent" if market.winner == winner else "resolution_conflict_after_redeem"
-            self._emit(kind="resolution", market=market, reason=reason, detail=winner or "")
+            reason = (
+                "idempotent"
+                if market.winner == winner
+                else "resolution_conflict_after_redeem"
+            )
+            self._emit(
+                kind="resolution", market=market, reason=reason, detail=winner or ""
+            )
             return
         if market.resolution_conflict:
-            self._emit(kind="resolution_rejected", market=market, reason="resolution_conflict")
+            self._emit(
+                kind="resolution_rejected", market=market, reason="resolution_conflict"
+            )
             return
         if market.winner and market.winner != winner:
             market.resolution_conflict = True
@@ -524,16 +616,25 @@ class Engine:
             if market.status == "resolved":
                 market.status = "expired_unresolved"
             self._cancel_market(market, "resolution_conflict")
-            self._emit(kind="resolution_rejected", market=market, reason="resolution_conflict")
+            self._emit(
+                kind="resolution_rejected", market=market, reason="resolution_conflict"
+            )
             return
         if market.status == "redeemed":
-            self._emit(kind="resolution", market=market, reason="idempotent", detail=winner)
+            self._emit(
+                kind="resolution", market=market, reason="idempotent", detail=winner
+            )
             return
         market.winner = winner
         market.status = "resolved"
         market.resolution_source = str(event.get("source"))
         market.resolution_ts_ms = self.state.now_ms
-        self._emit(kind="resolution", market=market, reason=str(event.get("source")), detail=winner)
+        self._emit(
+            kind="resolution",
+            market=market,
+            reason=str(event.get("source")),
+            detail=winner,
+        )
         self._cancel_market(market, "resolved")
         self._try_redeem(market)
 
@@ -573,7 +674,9 @@ class Engine:
         if market is None:
             return
         outcome = event.get("outcome")
-        self._cancel_market(market, "manual_cancel", outcome=str(outcome) if outcome else None)
+        self._cancel_market(
+            market, "manual_cancel", outcome=str(outcome) if outcome else None
+        )
 
     def _decide(self, market: Market) -> None:
         if market.status == "redeemed":
@@ -607,7 +710,10 @@ class Engine:
             return
         if self._quotes_possible(market) and not self.at_cap():
             self._auto_split(market)
-        proposals = [propose(self.state, market, "up", self.config), propose(self.state, market, "down", self.config)]
+        proposals = [
+            propose(self.state, market, "up", self.config),
+            propose(self.state, market, "down", self.config),
+        ]
         proposals.sort(key=lambda item: (0 if item.repair else 1, item.outcome))
         self._sync_working(market, proposals)
         if any(item.reason == "ok" for item in proposals):
@@ -640,7 +746,11 @@ class Engine:
         if self.state.cash < amount:
             amount = self.state.cash
         amount = qdown(amount, self.config.order_size_quantum)
-        minimum = market.min_order_size if market.min_order_size > self.config.min_order_size else self.config.min_order_size
+        minimum = (
+            market.min_order_size
+            if market.min_order_size > self.config.min_order_size
+            else self.config.min_order_size
+        )
         if amount < minimum:
             reason = "per_market_budget" if room < minimum else "insufficient_cash"
             self._skip(market, reason)
@@ -650,7 +760,10 @@ class Engine:
     def _sync_working(self, market: Market, proposals: list[Proposal]) -> None:
         by_outcome = {item.outcome: item for item in proposals}
         for order in list(self.state.orders.values()):
-            if order.market_id != market.market_id or order.status not in WORKING_ORDER_STATUSES:
+            if (
+                order.market_id != market.market_id
+                or order.status not in WORKING_ORDER_STATUSES
+            ):
                 continue
             proposal = by_outcome.get(order.outcome)
             if proposal is None or proposal.price <= 0 or proposal.price != order.price:
@@ -665,7 +778,9 @@ class Engine:
             require_repair = self.at_cap()
             size = self._largest_size(market, proposal, require_repair)
             if size is None:
-                free = market.inventory(proposal.outcome) - reserved(self.state, market, proposal.outcome)
+                free = market.inventory(proposal.outcome) - reserved(
+                    self.state, market, proposal.outcome
+                )
                 minimum = (
                     market.min_order_size
                     if market.min_order_size > self.config.min_order_size
@@ -681,15 +796,25 @@ class Engine:
                 continue
             self._commit_order(market, proposal, size, risk_reducing=require_repair)
 
-    def _largest_size(self, market: Market, proposal: Proposal, require_repair: bool) -> Optional[Decimal]:
+    def _largest_size(
+        self, market: Market, proposal: Proposal, require_repair: bool
+    ) -> Optional[Decimal]:
         quantum = self.config.order_size_quantum
-        minimum = market.min_order_size if market.min_order_size > self.config.min_order_size else self.config.min_order_size
+        minimum = (
+            market.min_order_size
+            if market.min_order_size > self.config.min_order_size
+            else self.config.min_order_size
+        )
         desired = qdown(proposal.size, quantum)
         if desired < minimum:
             return None
-        if self._size_ok(market, proposal.outcome, proposal.price, desired, require_repair):
+        if self._size_ok(
+            market, proposal.outcome, proposal.price, desired, require_repair
+        ):
             return desired
-        if not self._size_ok(market, proposal.outcome, proposal.price, minimum, require_repair):
+        if not self._size_ok(
+            market, proposal.outcome, proposal.price, minimum, require_repair
+        ):
             return None
         span = int((desired - minimum) / quantum)
         lo = 0
@@ -698,7 +823,9 @@ class Engine:
         while lo <= hi:
             mid = (lo + hi) // 2
             size = minimum + quantum * mid
-            if self._size_ok(market, proposal.outcome, proposal.price, size, require_repair):
+            if self._size_ok(
+                market, proposal.outcome, proposal.price, size, require_repair
+            ):
                 best = size
                 lo = mid + 1
             else:
@@ -742,7 +869,9 @@ class Engine:
                 return False
         return True
 
-    def _commit_order(self, market: Market, proposal: Proposal, size: Decimal, *, risk_reducing: bool) -> None:
+    def _commit_order(
+        self, market: Market, proposal: Proposal, size: Decimal, *, risk_reducing: bool
+    ) -> None:
         book = market.book(proposal.outcome)
         best_ask = book.best_ask()
         if best_ask is not None and proposal.price < best_ask:
@@ -780,20 +909,36 @@ class Engine:
         )
 
     def _split(self, market: Market, amount: Decimal, reason: str) -> bool:
-        if market.status != "open" or self._in_stop_window(market) or market.status == "expired_unresolved":
+        if (
+            market.status != "open"
+            or self._in_stop_window(market)
+            or market.status == "expired_unresolved"
+        ):
             self._emit(kind="reject", market=market, size=amount, reason="near_expiry")
             return False
         if self.at_cap():
-            self._emit(kind="quote_reject", market=market, size=amount, reason="exposure_frozen")
+            self._emit(
+                kind="quote_reject",
+                market=market,
+                size=amount,
+                reason="exposure_frozen",
+            )
             return False
         if amount <= 0:
             self._emit(kind="reject", market=market, reason="bad_size")
             return False
         if amount > self.state.cash:
-            self._emit(kind="reject", market=market, size=amount, reason="insufficient_cash")
+            self._emit(
+                kind="reject", market=market, size=amount, reason="insufficient_cash"
+            )
             return False
         if market.gross_split + amount > self.state.per_market_budget:
-            self._emit(kind="quote_reject", market=market, size=amount, reason="per_market_budget")
+            self._emit(
+                kind="quote_reject",
+                market=market,
+                size=amount,
+                reason="per_market_budget",
+            )
             return False
         market.up += amount
         market.down += amount
@@ -801,7 +946,9 @@ class Engine:
         market.up -= amount
         market.down -= amount
         if projected < self.state.loss_floor:
-            self._emit(kind="quote_reject", market=market, size=amount, reason="risk_floor")
+            self._emit(
+                kind="quote_reject", market=market, size=amount, reason="risk_floor"
+            )
             return False
         self.state.cash -= amount
         market.up += amount
@@ -818,7 +965,9 @@ class Engine:
         free_up = market.up - reserved(self.state, market, "up")
         free_down = market.down - reserved(self.state, market, "down")
         if amount > free_up or amount > free_down:
-            self._emit(kind="reject", market=market, size=amount, reason="reserved_inventory")
+            self._emit(
+                kind="reject", market=market, size=amount, reason="reserved_inventory"
+            )
             return False
         market.up -= amount
         market.down -= amount
@@ -826,7 +975,9 @@ class Engine:
         market.up += amount
         market.down += amount
         if projected < self.state.loss_floor:
-            self._emit(kind="quote_reject", market=market, size=amount, reason="risk_floor")
+            self._emit(
+                kind="quote_reject", market=market, size=amount, reason="risk_floor"
+            )
             return False
         market.up -= amount
         market.down -= amount
@@ -844,7 +995,11 @@ class Engine:
             self._merge(market, amount, reason)
 
     def _try_redeem(self, market: Market) -> bool:
-        if market.status != "resolved" or market.winner not in {"up", "down"} or market.resolution_conflict:
+        if (
+            market.status != "resolved"
+            or market.winner not in {"up", "down"}
+            or market.resolution_conflict
+        ):
             return False
         if self._working(market):
             return False
@@ -859,7 +1014,9 @@ class Engine:
         if not market.realized_recorded:
             self.state.realized_pnl += market.net_cash_flow
             market.realized_recorded = True
-        self._emit(kind="redeem", market=market, size=payout, reason=market.winner or "")
+        self._emit(
+            kind="redeem", market=market, size=payout, reason=market.winner or ""
+        )
         return True
 
     def _refresh_expiry(self, market: Market) -> None:
@@ -867,16 +1024,24 @@ class Engine:
             market.status = "expired_unresolved"
             self._emit(kind="expiry", market=market, reason="expired_unresolved")
 
-    def _cancel_market(self, market: Market, reason: str, outcome: Optional[str] = None) -> None:
+    def _cancel_market(
+        self, market: Market, reason: str, outcome: Optional[str] = None
+    ) -> None:
         for order in list(self.state.orders.values()):
-            if order.market_id != market.market_id or order.status not in WORKING_ORDER_STATUSES:
+            if (
+                order.market_id != market.market_id
+                or order.status not in WORKING_ORDER_STATUSES
+            ):
                 continue
             if outcome and order.outcome != outcome:
                 continue
             self._request_cancel(market, order, reason)
 
     def _request_cancel(self, market: Market, order: Order, reason: str) -> None:
-        if order.status not in WORKING_ORDER_STATUSES or order.status == "cancel_requested":
+        if (
+            order.status not in WORKING_ORDER_STATUSES
+            or order.status == "cancel_requested"
+        ):
             return
         order.status = "cancel_requested"
         order.cancel_request_ts = self.state.now_ms
@@ -884,7 +1049,13 @@ class Engine:
             order.cancel_ready_ts = self.state.now_ms + self.state.cancel_latency_ms
         else:
             order.cancel_ready_ts = None
-        self._emit(kind="cancel_request", market=market, order=order, size=order.remaining, reason=reason)
+        self._emit(
+            kind="cancel_request",
+            market=market,
+            order=order,
+            size=order.remaining,
+            reason=reason,
+        )
 
     def _working(self, market: Market, outcome: Optional[str] = None) -> list[Order]:
         return [
@@ -899,7 +1070,11 @@ class Engine:
         return bool(self._working(market, outcome))
 
     def _feeds_ok(self, market: Market) -> bool:
-        return self.state.feed_up and self._book_fresh(market, "up") and self._book_fresh(market, "down")
+        return (
+            self.state.feed_up
+            and self._book_fresh(market, "up")
+            and self._book_fresh(market, "down")
+        )
 
     def _book_fresh(self, market: Market, outcome: str) -> bool:
         book = market.book(outcome)
@@ -911,7 +1086,10 @@ class Engine:
         return age <= self.config.stale_after_ms
 
     def _in_stop_window(self, market: Market) -> bool:
-        return self.state.now_ms >= market.end_ts_ms - self.config.stop_quoting_before_expiry_ms
+        return (
+            self.state.now_ms
+            >= market.end_ts_ms - self.config.stop_quoting_before_expiry_ms
+        )
 
     def _in_cooldown(self, market: Market) -> bool:
         return self.state.now_ms < market.last_action_ts + self.config.quote_cooldown_ms
@@ -923,7 +1101,9 @@ def _jsonable(value):
     return value
 
 
-def _aggregate_levels(raw, tick: Decimal, *, descending: bool) -> list[tuple[Decimal, Decimal]]:
+def _aggregate_levels(
+    raw, tick: Decimal, *, descending: bool
+) -> list[tuple[Decimal, Decimal]]:
     grouped: dict[Decimal, Decimal] = {}
     if not isinstance(raw, list):
         raise ValueError("levels")
@@ -1013,9 +1193,15 @@ def _winner_from_resolution(market: Market, event: dict) -> Optional[str]:
     if source == "clob-market-resolved":
         asset = str(event.get("winning_asset_id") or "")
         label = str(event.get("winning_outcome") or "")
-        if asset == market.up_token_id and label.casefold() == market.up_label.casefold():
+        if (
+            asset == market.up_token_id
+            and label.casefold() == market.up_label.casefold()
+        ):
             return "up"
-        if asset == market.down_token_id and label.casefold() == market.down_label.casefold():
+        if (
+            asset == market.down_token_id
+            and label.casefold() == market.down_label.casefold()
+        ):
             return "down"
         event["_reject_reason"] = "outcome_mapping_conflict"
         return None

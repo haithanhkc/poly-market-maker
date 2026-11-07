@@ -79,7 +79,12 @@ def _levels(raw) -> Optional[list[tuple[str, str]]]:
             D(size)
         except (ValueError, ArithmeticError):
             return None
-        levels.append((str(price) if not isinstance(price, str) else price, str(size) if not isinstance(size, str) else size))
+        levels.append(
+            (
+                str(price) if not isinstance(price, str) else price,
+                str(size) if not isinstance(size, str) else size,
+            )
+        )
     return levels
 
 
@@ -106,7 +111,9 @@ def extract_token_ids(market: dict) -> Optional[list[str]]:
     return None
 
 
-def gamma_market_event(payload: dict, *, market_id: Optional[str] = None, synthetic: bool = False) -> Optional[dict]:
+def gamma_market_event(
+    payload: dict, *, market_id: Optional[str] = None, synthetic: bool = False
+) -> Optional[dict]:
     """Return a market_open event, or None when the payload is not a usable Up/Down market."""
     if not isinstance(payload, dict):
         return None
@@ -133,7 +140,9 @@ def gamma_market_event(payload: dict, *, market_id: Optional[str] = None, synthe
         return None
     slug = str(payload.get("slug") or "")
     question = str(payload.get("question") or slug)
-    tick_raw = payload.get("orderPriceMinTickSize") or payload.get("tick_size") or "0.01"
+    tick_raw = (
+        payload.get("orderPriceMinTickSize") or payload.get("tick_size") or "0.01"
+    )
     min_size_raw = payload.get("orderMinSize") or payload.get("min_order_size") or "5"
     try:
         tick = D(tick_raw)
@@ -170,7 +179,9 @@ def gamma_market_event(payload: dict, *, market_id: Optional[str] = None, synthe
     }
 
 
-def clob_book_event(market_id: str, outcome: str, payload: dict, *, event_id: Optional[str] = None) -> Optional[dict]:
+def clob_book_event(
+    market_id: str, outcome: str, payload: dict, *, event_id: Optional[str] = None
+) -> Optional[dict]:
     if not isinstance(payload, dict):
         return None
     bids = _levels(payload.get("bids"))
@@ -215,7 +226,9 @@ def data_api_trade_events(market: dict, payload: dict) -> list[dict]:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        token = str(row.get("token_id") or row.get("asset_id") or row.get("asset") or "")
+        token = str(
+            row.get("token_id") or row.get("asset_id") or row.get("asset") or ""
+        )
         if token == up_token:
             outcome = "up"
         elif token == down_token:
@@ -226,7 +239,9 @@ def data_api_trade_events(market: dict, payload: dict) -> list[dict]:
         if not trade_id:
             trade_id = "|".join(
                 [
-                    str(row.get("transaction_hash") or row.get("transactionHash") or ""),
+                    str(
+                        row.get("transaction_hash") or row.get("transactionHash") or ""
+                    ),
                     token,
                     str(row.get("price")),
                     str(row.get("size")),
@@ -272,7 +287,9 @@ def data_api_resolution_event(market: dict, payload: dict) -> Optional[dict]:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        row_condition = str(row.get("condition_id") or row.get("conditionId") or "").lower()
+        row_condition = str(
+            row.get("condition_id") or row.get("conditionId") or ""
+        ).lower()
         if row_condition and row_condition != condition:
             continue
         chosen = row
@@ -305,7 +322,9 @@ def data_api_resolution_event(market: dict, payload: dict) -> Optional[dict]:
     }
 
 
-def events_from_ws_message(markets_by_asset: dict[str, tuple[str, str]], message: dict) -> list[dict]:
+def events_from_ws_message(
+    markets_by_asset: dict[str, tuple[str, str]], message: dict
+) -> list[dict]:
     """Normalize one public market-channel message. Unknown assets are ignored."""
     if not isinstance(message, dict):
         return []

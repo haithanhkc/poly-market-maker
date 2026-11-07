@@ -89,7 +89,7 @@ class Market:
     realized_recorded: bool = False
     up_book: LevelBook = field(default_factory=LevelBook)
     down_book: LevelBook = field(default_factory=LevelBook)
-    last_action_ts: int = -10**18
+    last_action_ts: int = -(10**18)
     last_skip_reason: Optional[str] = None
     tape_seeded: bool = False
 
@@ -304,8 +304,12 @@ class State:
             "trade_through_fills": self.trade_through_fills,
             "published_taker_fee_rate": money(self.published_taker_fee_rate),
             "rebate_share": money(self.rebate_share),
-            "markets": {key: market.to_dict() for key, market in sorted(self.markets.items())},
-            "orders": {key: order.to_dict() for key, order in sorted(self.orders.items())},
+            "markets": {
+                key: market.to_dict() for key, market in sorted(self.markets.items())
+            },
+            "orders": {
+                key: order.to_dict() for key, order in sorted(self.orders.items())
+            },
             "applied_event_ids": sorted(self.applied_event_ids),
             "seen_trade_ids": sorted(self.seen_trade_ids),
             "risk_rejections": list(self.risk_rejections),
@@ -341,8 +345,12 @@ class State:
             was_at_cap=bool(data.get("was_at_cap", False)),
             schema_version=version,
         )
-        state.markets = {key: Market.from_dict(value) for key, value in data["markets"].items()}
-        state.orders = {key: Order.from_dict(value) for key, value in data["orders"].items()}
+        state.markets = {
+            key: Market.from_dict(value) for key, value in data["markets"].items()
+        }
+        state.orders = {
+            key: Order.from_dict(value) for key, value in data["orders"].items()
+        }
         state.applied_event_ids = set(data.get("applied_event_ids", []))
         state.seen_trade_ids = set(data.get("seen_trade_ids", []))
         state.risk_rejections = list(data.get("risk_rejections", []))

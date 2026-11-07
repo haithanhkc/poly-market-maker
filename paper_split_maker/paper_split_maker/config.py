@@ -90,9 +90,17 @@ class Config:
             raise ConfigError("clip_size must be at least min_order_size")
         if self.order_size_quantum <= 0 or self.default_tick <= 0:
             raise ConfigError("quantums must be positive")
-        if self.min_price <= 0 or self.max_price >= 1 or self.min_price > self.max_price:
+        if (
+            self.min_price <= 0
+            or self.max_price >= 1
+            or self.min_price > self.max_price
+        ):
             raise ConfigError("price bounds must sit inside (0, 1)")
-        if self.min_edge < 0 or self.skew_edge_per_share < 0 or self.skew_size_per_share < 0:
+        if (
+            self.min_edge < 0
+            or self.skew_edge_per_share < 0
+            or self.skew_size_per_share < 0
+        ):
             raise ConfigError("edge and skew must be non-negative")
         if self.max_spread <= 0:
             raise ConfigError("max_spread must be positive")
@@ -228,7 +236,9 @@ def config_from_mapping(data: dict) -> Config:
         elif key == "poll_interval_seconds":
             kwargs[key] = float(value)
         elif key == "market_slugs":
-            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) for item in value
+            ):
                 raise ConfigError("market_slugs must be a list of strings")
             kwargs[key] = tuple(value)
         else:

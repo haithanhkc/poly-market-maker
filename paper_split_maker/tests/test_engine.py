@@ -48,18 +48,26 @@ def test_worst_case_formula_pins_inventory_orders_and_fee_reserve(tmp_path):
         status="queued",
         submit_ts=0,
     )
-    assert sell_worst_term(Decimal("5"), Decimal("0.52"), Decimal("0.07")) == Decimal("-2.48736")
+    assert sell_worst_term(Decimal("5"), Decimal("0.52"), Decimal("0.07")) == Decimal(
+        "-2.48736"
+    )
     assert worst_case_equity(engine.state) == Decimal("997.45264")
     engine.assert_invariants()
 
 
 def test_symmetric_demo_scenario_is_flat_to_slightly_positive(tmp_path):
     config = config_from_mapping(
-        __import__("json").loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+        __import__("json").loads(
+            (ROOT / "config.example.json").read_text(encoding="utf-8")
+        )
     )
     from paper_split_maker.session import run_demo
 
-    summary = run_demo(config, tmp_path / "out", ROOT / "paper_split_maker" / "scenarios" / "symmetric_demo.json")
+    summary = run_demo(
+        config,
+        tmp_path / "out",
+        ROOT / "paper_split_maker" / "scenarios" / "symmetric_demo.json",
+    )
     assert summary["live_orders"] is False
     assert Decimal(summary["cash"]) == Decimal("1000.20")
     assert Decimal(summary["realized_pnl"]) == Decimal("0.20")
@@ -183,7 +191,13 @@ def test_extreme_book_and_reversal_do_not_invent_a_winner_or_cross(tmp_path):
     for order in engine.state.orders.values():
         if order.status in {"queued", "live", "cancel_requested"}:
             assert order.price >= Decimal("0.03")
-    run(engine, [{"type": "clock", "ts": 50_000, "event_id": "expire"}, {"type": "heartbeat", "ts": 50_000, "event_id": "hb-exp"}])
+    run(
+        engine,
+        [
+            {"type": "clock", "ts": 50_000, "event_id": "expire"},
+            {"type": "heartbeat", "ts": 50_000, "event_id": "hb-exp"},
+        ],
+    )
     market = engine.state.markets["m1"]
     assert market.status == "expired_unresolved"
     assert market.winner is None
@@ -201,8 +215,16 @@ def test_only_one_side_can_fill(tmp_path):
             {"type": "heartbeat", "ts": 0, "event_id": "hb"},
         ],
     )
-    assert len([order for order in engine.state.orders.values() if order.outcome == "up"]) == 1
-    assert len([order for order in engine.state.orders.values() if order.outcome == "down"]) == 1
+    assert (
+        len([order for order in engine.state.orders.values() if order.outcome == "up"])
+        == 1
+    )
+    assert (
+        len(
+            [order for order in engine.state.orders.values() if order.outcome == "down"]
+        )
+        == 1
+    )
     up = next(order for order in engine.state.orders.values() if order.outcome == "up")
     before = worst_case_equity(engine.state)
     run(
@@ -221,7 +243,9 @@ def test_only_one_side_can_fill(tmp_path):
     market = engine.state.markets["m1"]
     assert market.up == Decimal("15")
     assert market.down == Decimal("20")
-    down = next(order for order in engine.state.orders.values() if order.outcome == "down")
+    down = next(
+        order for order in engine.state.orders.values() if order.outcome == "down"
+    )
     assert down.status != "filled"
     assert worst_case_equity(engine.state) >= before
     assert worst_case_equity(engine.state) >= engine.state.loss_floor
@@ -280,7 +304,10 @@ def test_cancel_latency_still_allows_a_fill_and_disconnect_holds_the_cancel(tmp_
     )
     up = next(order for order in engine.state.orders.values() if order.outcome == "up")
     assert up.status == "live"
-    run(engine, [{"type": "cancel", "event_id": "c1", "ts": 150, "order_id": up.order_id}])
+    run(
+        engine,
+        [{"type": "cancel", "event_id": "c1", "ts": 150, "order_id": up.order_id}],
+    )
     assert up.status == "cancel_requested"
     run(
         engine,
@@ -299,8 +326,13 @@ def test_cancel_latency_still_allows_a_fill_and_disconnect_holds_the_cancel(tmp_
         ],
     )
     assert up.status == "filled"
-    down = next(order for order in engine.state.orders.values() if order.outcome == "down")
-    run(engine, [{"type": "cancel", "event_id": "c2", "ts": 420, "order_id": down.order_id}])
+    down = next(
+        order for order in engine.state.orders.values() if order.outcome == "down"
+    )
+    run(
+        engine,
+        [{"type": "cancel", "event_id": "c2", "ts": 420, "order_id": down.order_id}],
+    )
     run(engine, [{"type": "feed", "event_id": "down", "ts": 430, "status": "down"}])
     run(engine, [{"type": "clock", "event_id": "wait", "ts": 5000}])
     assert down.status == "cancel_requested"
@@ -312,7 +344,9 @@ def test_cancel_latency_still_allows_a_fill_and_disconnect_holds_the_cancel(tmp_
 
 
 def test_stale_feed_stops_new_quotes_but_keeps_reservation_until_cancel(tmp_path):
-    engine = make_engine(tmp_path, stale_after_ms=1000, ack_latency_ms=0, cancel_latency_ms=300)
+    engine = make_engine(
+        tmp_path, stale_after_ms=1000, ack_latency_ms=0, cancel_latency_ms=300
+    )
     run(
         engine,
         [
@@ -327,7 +361,9 @@ def test_stale_feed_stops_new_quotes_but_keeps_reservation_until_cancel(tmp_path
     assert any(row["reason"] == "stale_feed" for row in logs)
     assert any(row["kind"] == "cancel_request" for row in logs)
     assert not any(row["kind"] == "quote_submit" for row in logs)
-    assert any(order.status == "cancel_requested" for order in engine.state.orders.values())
+    assert any(
+        order.status == "cancel_requested" for order in engine.state.orders.values()
+    )
     # A print during the cancel window still fills.
     run(
         engine,
@@ -391,12 +427,31 @@ def test_reconnect_duplicate_and_old_book_do_not_rewind(tmp_path):
     )
     book = engine.state.markets["m1"].up_book
     assert book.best_bid() == Decimal("0.48")
-    fills = [order for order in engine.state.orders.values() if order.outcome == "up" and order.status == "filled"]
+    fills = [
+        order
+        for order in engine.state.orders.values()
+        if order.outcome == "up" and order.status == "filled"
+    ]
     assert len(fills) == 1
     assert engine.state.cash > cash
     # Applying the duplicate event id is a no-op.
     again = engine.state.cash
-    run(engine, [{"type": "trade", "event_id": "dup-2", "ts": 300, "market_id": "m1", "outcome": "up", "price": "0.99", "size": "100", "taker_side": "BUY", "trade_id": "other"}])
+    run(
+        engine,
+        [
+            {
+                "type": "trade",
+                "event_id": "dup-2",
+                "ts": 300,
+                "market_id": "m1",
+                "outcome": "up",
+                "price": "0.99",
+                "size": "100",
+                "taker_side": "BUY",
+                "trade_id": "other",
+            }
+        ],
+    )
     assert engine.state.cash == again
 
 
@@ -410,15 +465,48 @@ def test_merge_cannot_spend_tokens_reserved_by_an_open_order(tmp_path):
             {"type": "heartbeat", "ts": 0, "event_id": "hb"},
         ],
     )
-    logs = run(engine, [{"type": "merge", "event_id": "too-much", "ts": 1, "market_id": "m1", "amount": "20"}])
+    logs = run(
+        engine,
+        [
+            {
+                "type": "merge",
+                "event_id": "too-much",
+                "ts": 1,
+                "market_id": "m1",
+                "amount": "20",
+            }
+        ],
+    )
     assert any(row["reason"] == "reserved_inventory" for row in logs)
     assert engine.state.markets["m1"].up == Decimal("20")
-    logs = run(engine, [{"type": "merge", "event_id": "ok", "ts": 2, "market_id": "m1", "amount": "15"}])
+    logs = run(
+        engine,
+        [
+            {
+                "type": "merge",
+                "event_id": "ok",
+                "ts": 2,
+                "market_id": "m1",
+                "amount": "15",
+            }
+        ],
+    )
     assert any(row["kind"] == "merge" for row in logs)
     market = engine.state.markets["m1"]
     assert market.up == Decimal("5")
     assert market.down == Decimal("5")
-    logs = run(engine, [{"type": "merge", "event_id": "reserved", "ts": 3, "market_id": "m1", "amount": "1"}])
+    logs = run(
+        engine,
+        [
+            {
+                "type": "merge",
+                "event_id": "reserved",
+                "ts": 3,
+                "market_id": "m1",
+                "amount": "1",
+            }
+        ],
+    )
     assert any(row["reason"] == "reserved_inventory" for row in logs)
     assert market.up == Decimal("5")
 
@@ -450,7 +538,11 @@ def test_fee_reserve_blocks_a_quote_that_zero_fee_would_allow(tmp_path):
 
 
 def test_operational_reserve_can_refuse_a_new_market(tmp_path):
-    engine = make_engine(tmp_path, operational_reserve=Decimal("31"), global_rounding_reserve=Decimal("0"))
+    engine = make_engine(
+        tmp_path,
+        operational_reserve=Decimal("31"),
+        global_rounding_reserve=Decimal("0"),
+    )
     logs = run(engine, [market_event()])
     assert "m1" not in engine.state.markets
     assert any(row["reason"] == "risk_floor" for row in logs)
@@ -477,12 +569,25 @@ def test_accumulated_losses_and_restart_do_not_reset_the_floor(tmp_path):
             [
                 market_event(market_id, event_id=f"open-{market_id}", ts=index * 1000),
                 *both_books(market_id, "0.02", "0.10", ts=index * 1000, ask_size="1"),
-                {"type": "heartbeat", "ts": index * 1000, "event_id": f"hb-{index}", "market_id": market_id},
+                {
+                    "type": "heartbeat",
+                    "ts": index * 1000,
+                    "event_id": f"hb-{index}",
+                    "market_id": market_id,
+                },
             ],
         )
         market = engine.state.markets[market_id]
-        ups = [order for order in engine.state.orders.values() if order.market_id == market_id and order.outcome == "up"]
-        downs = [order for order in engine.state.orders.values() if order.market_id == market_id and order.outcome == "down"]
+        ups = [
+            order
+            for order in engine.state.orders.values()
+            if order.market_id == market_id and order.outcome == "up"
+        ]
+        downs = [
+            order
+            for order in engine.state.orders.values()
+            if order.market_id == market_id and order.outcome == "down"
+        ]
         if not ups:
             return
         run(
@@ -508,7 +613,11 @@ def test_accumulated_losses_and_restart_do_not_reset_the_floor(tmp_path):
                         "ts": index * 1000 + 20,
                         "order_id": downs[0].order_id,
                     },
-                    {"type": "clock", "event_id": f"clk-{index}", "ts": index * 1000 + 200},
+                    {
+                        "type": "clock",
+                        "event_id": f"clk-{index}",
+                        "ts": index * 1000 + 200,
+                    },
                 ],
             )
         run(
@@ -533,7 +642,8 @@ def test_accumulated_losses_and_restart_do_not_reset_the_floor(tmp_path):
     cycle(2, "up")
     assert "m2" in engine.state.markets
     assert not any(
-        order.market_id == "m2" and order.status in {"queued", "live", "cancel_requested"}
+        order.market_id == "m2"
+        and order.status in {"queued", "live", "cancel_requested"}
         for order in engine.state.orders.values()
     )
     assert worst_case_equity(engine.state) >= first_floor
@@ -574,7 +684,11 @@ def test_two_markets_share_one_aggregate_floor(tmp_path):
         events.extend(both_books(market_id, "0.10", "0.20", ts=0, ask_size="1"))
     events.append({"type": "heartbeat", "ts": 0, "event_id": "hb"})
     run(engine, events)
-    working = [order for order in engine.state.orders.values() if order.status in {"queued", "live", "cancel_requested"}]
+    working = [
+        order
+        for order in engine.state.orders.values()
+        if order.status in {"queued", "live", "cancel_requested"}
+    ]
     markets_quoting = {order.market_id for order in working}
     assert markets_quoting == {"a"}
     assert worst_case_equity(engine.state) >= engine.state.loss_floor
@@ -582,9 +696,32 @@ def test_two_markets_share_one_aggregate_floor(tmp_path):
 
 def test_oversize_split_and_adverse_fill_cannot_short_or_overspend(tmp_path):
     engine = make_engine(tmp_path, auto_split=False)
-    run(engine, [market_event(), {"type": "split", "event_id": "s", "ts": 1, "market_id": "m1", "amount": "100000"}])
+    run(
+        engine,
+        [
+            market_event(),
+            {
+                "type": "split",
+                "event_id": "s",
+                "ts": 1,
+                "market_id": "m1",
+                "amount": "100000",
+            },
+        ],
+    )
     assert engine.state.cash == Decimal("1000")
-    run(engine, [{"type": "split", "event_id": "s2", "ts": 2, "market_id": "m1", "amount": "20"}])
+    run(
+        engine,
+        [
+            {
+                "type": "split",
+                "event_id": "s2",
+                "ts": 2,
+                "market_id": "m1",
+                "amount": "20",
+            }
+        ],
+    )
     assert engine.state.cash == Decimal("980")
     from paper_split_maker.models import Order
 
@@ -620,7 +757,19 @@ def test_adverse_fill_is_refused_on_a_non_synthetic_market(tmp_path):
     engine = make_engine(tmp_path, auto_split=False)
     event = market_event()
     event["synthetic"] = False
-    run(engine, [event, {"type": "split", "event_id": "s", "ts": 1, "market_id": "m1", "amount": "10"}])
+    run(
+        engine,
+        [
+            event,
+            {
+                "type": "split",
+                "event_id": "s",
+                "ts": 1,
+                "market_id": "m1",
+                "amount": "10",
+            },
+        ],
+    )
     from paper_split_maker.models import Order
 
     engine.state.orders["o"] = Order(
@@ -654,7 +803,19 @@ def test_adverse_fill_is_refused_on_a_non_synthetic_market(tmp_path):
 
 def test_untrusted_and_conflicting_resolution_do_not_pay(tmp_path):
     engine = make_engine(tmp_path, auto_split=False, merge_when_idle=False)
-    run(engine, [market_event(), {"type": "split", "event_id": "s", "ts": 1, "market_id": "m1", "amount": "10"}])
+    run(
+        engine,
+        [
+            market_event(),
+            {
+                "type": "split",
+                "event_id": "s",
+                "ts": 1,
+                "market_id": "m1",
+                "amount": "10",
+            },
+        ],
+    )
     run(
         engine,
         [
@@ -724,7 +885,13 @@ def test_fixture_resolution_rejected_for_non_synthetic_market(tmp_path):
         engine,
         [
             event,
-            {"type": "split", "event_id": "s", "ts": 1, "market_id": "m1", "amount": "10"},
+            {
+                "type": "split",
+                "event_id": "s",
+                "ts": 1,
+                "market_id": "m1",
+                "amount": "10",
+            },
             {
                 "type": "resolution",
                 "event_id": "fix",
@@ -771,7 +938,10 @@ def test_near_expiry_and_cooldown_do_not_open_new_risk(tmp_path):
     assert any(row["reason"] == "near_expiry" for row in logs)
     assert not any(row["kind"] == "quote_submit" and row["ts"] == 6000 for row in logs)
     run(engine, [{"type": "clock", "ts": 6_000, "event_id": "confirm-stop"}])
-    assert all(order.status in {"cancelled", "filled"} for order in engine.state.orders.values())
+    assert all(
+        order.status in {"cancelled", "filled"}
+        for order in engine.state.orders.values()
+    )
     assert engine.state.markets["m1"].winner is None
     assert worst_case_equity(engine.state) >= engine.state.loss_floor
 
@@ -828,7 +998,14 @@ def test_randomized_actions_keep_the_floor(tmp_path):
             merge_when_idle=True,
         )
         end_ts = 10**9
-        run(engine, [market_event("m", end_ts=end_ts, min_order_size="1", event_id=f"open-{trial}")])
+        run(
+            engine,
+            [
+                market_event(
+                    "m", end_ts=end_ts, min_order_size="1", event_id=f"open-{trial}"
+                )
+            ],
+        )
         ts = 0
         seq = 0
         for _step in range(18):
@@ -849,7 +1026,10 @@ def test_randomized_actions_keep_the_floor(tmp_path):
                     ),
                 )
             elif roll == 1:
-                run(engine, [{"type": "heartbeat", "ts": ts, "event_id": f"hb-{trial}-{seq}"}])
+                run(
+                    engine,
+                    [{"type": "heartbeat", "ts": ts, "event_id": f"hb-{trial}-{seq}"}],
+                )
             elif roll == 2:
                 run(
                     engine,
@@ -868,7 +1048,11 @@ def test_randomized_actions_keep_the_floor(tmp_path):
                     ],
                 )
             elif roll == 3:
-                working = [order for order in engine.state.orders.values() if order.status in {"queued", "live", "cancel_requested"}]
+                working = [
+                    order
+                    for order in engine.state.orders.values()
+                    if order.status in {"queued", "live", "cancel_requested"}
+                ]
                 if working:
                     order = rng.choice(working)
                     run(
@@ -879,7 +1063,10 @@ def test_randomized_actions_keep_the_floor(tmp_path):
                                 "event_id": f"adv-{trial}-{seq}",
                                 "ts": ts,
                                 "order_id": order.order_id,
-                                "size": str(order.remaining + rng.choice([Decimal("0"), Decimal("1")])),
+                                "size": str(
+                                    order.remaining
+                                    + rng.choice([Decimal("0"), Decimal("1")])
+                                ),
                                 "label": "synthetic",
                             }
                         ],
@@ -898,9 +1085,29 @@ def test_randomized_actions_keep_the_floor(tmp_path):
                     ],
                 )
             elif roll == 5:
-                run(engine, [{"type": "feed", "event_id": f"fd-{trial}-{seq}", "ts": ts, "status": rng.choice(["up", "down"])}])
+                run(
+                    engine,
+                    [
+                        {
+                            "type": "feed",
+                            "event_id": f"fd-{trial}-{seq}",
+                            "ts": ts,
+                            "status": rng.choice(["up", "down"]),
+                        }
+                    ],
+                )
             else:
-                run(engine, [{"type": "cancel", "event_id": f"cx-{trial}-{seq}", "ts": ts, "market_id": "m"}])
+                run(
+                    engine,
+                    [
+                        {
+                            "type": "cancel",
+                            "event_id": f"cx-{trial}-{seq}",
+                            "ts": ts,
+                            "market_id": "m",
+                        }
+                    ],
+                )
             engine.assert_invariants()
             assert engine.state.cash >= 0
             assert worst_case_equity(engine.state) >= engine.state.loss_floor

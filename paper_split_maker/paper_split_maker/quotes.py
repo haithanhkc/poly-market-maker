@@ -73,7 +73,11 @@ def propose(state: State, market: Market, outcome: str, config: Config) -> Propo
     if size > free:
         size = free
     size = qdown(size, config.order_size_quantum)
-    minimum = market.min_order_size if market.min_order_size > config.min_order_size else config.min_order_size
+    minimum = (
+        market.min_order_size
+        if market.min_order_size > config.min_order_size
+        else config.min_order_size
+    )
     if size < minimum:
         return Proposal(
             outcome=outcome,

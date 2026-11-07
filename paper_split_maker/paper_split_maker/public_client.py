@@ -47,7 +47,9 @@ class UrllibTransport:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
-            raise PublicDataError(f"http {exc.code} for {url}", status=exc.code) from exc
+            raise PublicDataError(
+                f"http {exc.code} for {url}", status=exc.code
+            ) from exc
         except urllib.error.URLError as exc:
             raise PublicDataError(f"network error for {url}: {exc.reason}") from exc
         try:
@@ -60,12 +62,16 @@ class PublicReadClient:
     def __init__(self, transport: Optional[Transport] = None):
         self.transport = transport or UrllibTransport()
 
-    def discover_btc_updown(self, now_s: int, limit: int, slugs: Optional[list[str]] = None) -> list[dict]:
+    def discover_btc_updown(
+        self, now_s: int, limit: int, slugs: Optional[list[str]] = None
+    ) -> list[dict]:
         if slugs:
             candidates = list(slugs)
         else:
             start = (int(now_s) // 300) * 300
-            candidates = [f"btc-updown-5m-{start + offset * 300}" for offset in range(4)]
+            candidates = [
+                f"btc-updown-5m-{start + offset * 300}" for offset in range(4)
+            ]
         found: list[dict] = []
         for slug in candidates:
             if len(found) >= limit:

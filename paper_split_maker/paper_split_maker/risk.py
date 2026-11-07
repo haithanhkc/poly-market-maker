@@ -39,12 +39,16 @@ def sell_worst_term(size: Decimal, price: Decimal, fee_rate: Decimal) -> Decimal
     return gross - conservative_fee(size, price, fee_rate) - size
 
 
-def net_maker_proceeds(size: Decimal, price: Decimal, maker_fee_rate: Decimal) -> Decimal:
+def net_maker_proceeds(
+    size: Decimal, price: Decimal, maker_fee_rate: Decimal
+) -> Decimal:
     gross = floor_cash(size * price)
     return gross - conservative_fee(size, price, maker_fee_rate)
 
 
-def working_orders(state: State, market_id: str, extra: list[Order] | None = None) -> list[Order]:
+def working_orders(
+    state: State, market_id: str, extra: list[Order] | None = None
+) -> list[Order]:
     orders = [
         order
         for order in state.orders.values()
@@ -63,7 +67,9 @@ def reserved(state: State, market: Market, outcome: str) -> Decimal:
     return total
 
 
-def market_contribution(state: State, market: Market, extra: list[Order] | None = None) -> Decimal:
+def market_contribution(
+    state: State, market: Market, extra: list[Order] | None = None
+) -> Decimal:
     if market.status == "redeemed":
         return ZERO
     up_terms = ZERO
@@ -94,7 +100,9 @@ def market_contribution(state: State, market: Market, extra: list[Order] | None 
     return value
 
 
-def worst_case_equity(state: State, extra: list[Order] | None = None, cash_delta: Decimal = ZERO) -> Decimal:
+def worst_case_equity(
+    state: State, extra: list[Order] | None = None, cash_delta: Decimal = ZERO
+) -> Decimal:
     total = state.cash + cash_delta - state.global_rounding_reserve
     for market in state.markets.values():
         total += market_contribution(state, market, extra if extra else None)
@@ -110,7 +118,9 @@ def best_case_equity(state: State) -> Decimal:
         up_proceeds = ZERO
         down_proceeds = ZERO
         for order in working_orders(state, market.market_id):
-            proceeds = net_maker_proceeds(order.remaining, order.price, state.maker_fee_rate)
+            proceeds = net_maker_proceeds(
+                order.remaining, order.price, state.maker_fee_rate
+            )
             if order.outcome == "up":
                 up_proceeds += proceeds
             else:
@@ -149,7 +159,9 @@ def assert_ledger_invariants(state: State) -> None:
         up_reserved = reserved(state, market, "up")
         down_reserved = reserved(state, market, "down")
         if up_reserved > market.up or down_reserved > market.down:
-            raise InvariantError(f"{market.market_id} reserved inventory exceeds holdings")
+            raise InvariantError(
+                f"{market.market_id} reserved inventory exceeds holdings"
+            )
         if market.up_token_id == market.down_token_id:
             raise InvariantError("outcome tokens are not distinct")
     for order in state.orders.values():

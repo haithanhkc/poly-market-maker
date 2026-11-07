@@ -169,6 +169,8 @@ python3 -m paper_split_maker paper \
   --out /tmp/psm-paper
 ```
 
+Chạy pytest trong thư mục này. `conftest.py` bảo suite gốc của repo (lệnh `pytest` ở thư mục cha) bỏ qua cây này, để package `tests` của keeper không bị đè.
+
 `demo` và `replay` chạy offline. File kịch bản phải có `label` chứa `synthetic` hoặc `fixture`. `symmetric_demo.json` là sổ đối xứng giả: ask 0.52 hai phía, hàng chờ 10, sau đó print mua vượt hàng chờ. Kỳ vọng của fixture này là cash 1000.20 và realized 0.20 trước rebate ước tính 0.034944. Đó là số của fixture, không phải kết quả live.
 
 `paper` thoát khi hết thời lượng. Lần chạy đầu tạo `state.json`. Muốn sổ mới thì dùng thư mục `--out` khác. Không có cờ reset.

@@ -24,7 +24,9 @@ def load_scenario(path: Path) -> tuple[dict, list[dict]]:
         raise ConfigError("scenario must be an object with an events list")
     label = str(data.get("label") or "")
     if "synthetic" not in label.casefold() and "fixture" not in label.casefold():
-        raise ConfigError("scenario label must say synthetic or fixture; unlabeled files are refused")
+        raise ConfigError(
+            "scenario label must say synthetic or fixture; unlabeled files are refused"
+        )
     for event in data["events"]:
         if not isinstance(event, dict):
             raise ConfigError("scenario events must be objects")
@@ -137,7 +139,10 @@ def run_paper(
                 "down_token_id": market.down_token_id,
             }
             try:
-                for outcome, token in (("up", market.up_token_id), ("down", market.down_token_id)):
+                for outcome, token in (
+                    ("up", market.up_token_id),
+                    ("down", market.down_token_id),
+                ):
                     book = reader.fetch_book(token)
                     event = clob_book_event(
                         market.market_id,
@@ -153,11 +158,15 @@ def run_paper(
                     event["book_ts"] = event["ts"]
                     event["ts"] = stamp
                     engine.handle_event(event)
-                for trade in data_api_trade_events(view, reader.fetch_trades(market.condition_id)):
+                for trade in data_api_trade_events(
+                    view, reader.fetch_trades(market.condition_id)
+                ):
                     trade["trade_ts"] = trade["ts"]
                     trade["ts"] = stamp
                     engine.handle_event(trade)
-                resolution = data_api_resolution_event(view, reader.fetch_resolution(market.condition_id))
+                resolution = data_api_resolution_event(
+                    view, reader.fetch_resolution(market.condition_id)
+                )
                 if resolution is not None:
                     engine.handle_event(resolution)
             except PublicDataError as exc:
@@ -166,10 +175,26 @@ def run_paper(
                 break
         if failed:
             public_ok = False
-            engine.handle_event({"type": "feed", "status": "down", "ts": stamp, "event_id": f"feed-down-{polls}"})
+            engine.handle_event(
+                {
+                    "type": "feed",
+                    "status": "down",
+                    "ts": stamp,
+                    "event_id": f"feed-down-{polls}",
+                }
+            )
         elif not engine.state.feed_up:
-            engine.handle_event({"type": "feed", "status": "up", "ts": stamp, "event_id": f"feed-up-{polls}"})
-        engine.handle_event({"type": "heartbeat", "ts": stamp, "event_id": f"hb-{polls}-{stamp}"})
+            engine.handle_event(
+                {
+                    "type": "feed",
+                    "status": "up",
+                    "ts": stamp,
+                    "event_id": f"feed-up-{polls}",
+                }
+            )
+        engine.handle_event(
+            {"type": "heartbeat", "ts": stamp, "event_id": f"hb-{polls}-{stamp}"}
+        )
         remaining = deadline - clock()
         if remaining <= 0:
             break

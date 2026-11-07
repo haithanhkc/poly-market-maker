@@ -110,8 +110,26 @@ def book_event(
     }
 
 
-def both_books(market_id: str, bid: str, ask: str, ts: int, ask_size: str = "10") -> list[dict]:
+def both_books(
+    market_id: str, bid: str, ask: str, ts: int, ask_size: str = "10"
+) -> list[dict]:
     return [
-        book_event(market_id, "up", bid, ask, ts=ts, ask_size=ask_size, digest=f"up-{ts}-{ask}-{ask_size}"),
-        book_event(market_id, "down", bid, ask, ts=ts, ask_size=ask_size, digest=f"down-{ts}-{ask}-{ask_size}"),
+        book_event(
+            market_id,
+            "up",
+            bid,
+            ask,
+            ts=ts,
+            ask_size=ask_size,
+            digest=f"up-{ts}-{ask}-{ask_size}",
+        ),
+        book_event(
+            market_id,
+            "down",
+            bid,
+            ask,
+            ts=ts,
+            ask_size=ask_size,
+            digest=f"down-{ts}-{ask}-{ask_size}",
+        ),
     ]
