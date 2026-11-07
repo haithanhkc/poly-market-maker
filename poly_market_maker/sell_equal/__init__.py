@@ -1,7 +1,8 @@
-"""Sell-only equal gross-USD Up/Down helper.
+"""Legacy sell-only helper: equal gross USD, not equal shares.
 
-Paper and replay run without credentials. Live trading is a separate opt-in
-adapter and is not started by importing this package.
+Paper and replay run without credentials. This is not the share-balanced
+session mode. Live trading is a separate opt-in adapter and is not started
+by importing this package.
 """
 
 __all__ = ["__version__"]

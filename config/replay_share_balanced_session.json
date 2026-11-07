@@ -1,0 +1,19 @@
+{
+  "config": "config/share_balanced_session.example.json",
+  "steps": [
+    {"op": "book", "outcome": "up", "ts": "1700000000", "bids": [["0.49", "80"]], "asks": [["0.50", "80"]]},
+    {"op": "book", "outcome": "down", "ts": "1700000000", "bids": [["0.49", "80"]], "asks": [["0.50", "80"]]},
+    {"op": "user", "ts": "1700000000"},
+    {"op": "tick"},
+    {"op": "book", "outcome": "up", "ts": "1700000010", "bids": [["0.60", "40"]], "asks": [["0.62", "40"]]},
+    {"op": "book", "outcome": "down", "ts": "1700000010", "bids": [["0.60", "40"]], "asks": [["0.62", "40"]]},
+    {"op": "user", "ts": "1700000010"},
+    {"op": "tick"},
+    {"op": "fill", "outcome": "up", "price": "0.62", "shares": "5", "fill_id": "fill-up-5"},
+    {"op": "at", "ts": "1700000270"},
+    {"op": "book", "outcome": "up", "ts": "1700000270", "bids": [["0.60", "40"]], "asks": [["0.62", "40"]]},
+    {"op": "book", "outcome": "down", "ts": "1700000270", "bids": [["0.60", "40"]], "asks": [["0.62", "40"]]},
+    {"op": "user", "ts": "1700000270"},
+    {"op": "tick"}
+  ]
+}

@@ -1,6 +1,37 @@
-# Bot bán Up/Down theo giá trị USD gộp bằng nhau
+# Hai chế độ bán, không phải một
 
-Chương trình này nằm trong fork `haithanhkc/poly-market-maker`. Giấy phép MIT gốc được giữ nguyên trong `LICENSE.txt`.
+Chương trình nằm trong fork `haithanhkc/poly-market-maker`. Giấy phép MIT gốc giữ nguyên trong `LICENSE.txt`.
+
+Có hai chế độ tách biệt:
+
+- `share_balanced_session`: chế độ mới. Cân số share Up/Down còn lại trong một phiên. Mọi lệnh bán là maker, `post_only=true`. Không tắt được.
+- `legacy_equal_gross_usd`: chế độ cũ trong `poly_market_maker.sell_equal`. Cân USD gộp, không cân share. Không bị đổi thầm thành chế độ mới.
+
+Không chế độ nào tự split, tự mua, tự chuyển vốn sang thị trường khác, hay tự chạy nền trên máy bạn.
+
+## Chế độ share-balanced, paper
+
+Bạn tự split trước. Bot chỉ bán số share đã khai trong snapshot. Snapshot phải có `cost_basis_source=explicit_allocation` và `cost_basis_usd` của đúng phần được cấp. Không có cơ sở giá thì bot từ chối. Nó không lấy cả ví làm vốn và không coi khoản nạp là cost.
+
+Ví dụ an toàn: vốn và cost 100 USD, 100 Up và 100 Down, ngưỡng +2 USD và -2 USD. Ngưỡng -2 là chặn rủi ro trước khi treo lệnh, không phải lệnh cắt lỗ đã khớp. Ngưỡng +2 dùng sàn thanh toán thận trọng: tiền bán gộp + min(Up còn, Down còn) - cost - phí. Rebate chưa trả không được cộng. Maker crypto theo tài liệu hiện tại có phí 0; phí taker `C * 0.07 * p * (1-p)` chỉ để ước tính, không để gửi lệnh taker.
+
+Một lệnh tối thiểu 5 share tại giá 0,50 làm sàn thanh toán giảm 2,50 USD nếu chỉ một phía khớp. Ngân sách 2 USD không chứa nổi lệnh đó, nên bot ghi `min_size_exceeds_risk_budget` và bỏ qua. Khối lượng thấp hoặc bằng không là đúng, không phải lỗi cần nới rủi ro.
+
+Mọi lệnh submit đi qua một chỗ và luôn `post_only=true`. Sổ lệnh đổi trước lúc gửi khiến lệnh vượt bid thì bị từ chối. Không gửi lại dạng taker, market, IOC hay FOK. Không cân bằng, không chốt +2/-2, không xử lý feed cũ bằng cách lấy thanh khoản. Nếu không treo được giá maker trong tick, min size và ngân sách, bot chờ hoặc dừng rủi ro mới và giữ phần còn lại đến lúc resolve. Hủy lệnh không có nghĩa là đã đóng vị thế. Không đảm bảo hai chân đều khớp, không đảm bảo lỗ không quá 2 USD, không đảm bảo có lãi, không phải bubblebust.
+
+Trên Windows, trong thư mục repo:
+
+```bat
+py -3 -m unittest tests.test_share_balanced_session
+py -3 -m poly_market_maker.share_balanced_session demo
+py -3 -m poly_market_maker.share_balanced_session replay --script config\replay_share_balanced_session.json
+```
+
+`demo` không cần secret và không gửi lệnh thật. Nó mô phỏng một phiên: lần đầu bỏ qua vì 5 share tại 0,50 vượt ngân sách 2 USD, sau đó mới treo maker khi ask là 0,62, một chân Up khớp 5 share, tới gần hết phiên thì hủy lệnh của bot và in phần còn lại. `py -3 -m poly_market_maker.share_balanced_session live` luôn từ chối, kể cả khi có `--send`.
+
+File mẫu: `config/share_balanced_session.example.json` và `config/share_balanced_baseline.json`. Đồng hồ trong file là mô phỏng, không có nghĩa cửa sổ BTC 5 phút thật còn mở.
+
+## Chế độ cũ: USD gộp
 
 Bot chỉ **bán** số share Up và Down đang có. Sau khi một lệnh SELL **thực sự khớp** (kể cả khớp một phần), bot tính số tiền gộp đã bán và có thể treo một lệnh SELL phía còn lại sao cho **cùng số USD gộp**, không phải cùng số share.
 

@@ -1,0 +1,12 @@
+{
+  "cost_basis_source": "explicit_allocation",
+  "condition_id": "0xe4966d642938113525dfb125060bda90b9f8d8c25945ae352de1b75c160bc383",
+  "slug": "btc-updown-5m-1794024900",
+  "up_token_id": "44857089090901365835706371888611204979538894171442730872794600452065181330944",
+  "down_token_id": "17424551638207318915606858171665237870653355896978276914963148187077601073259",
+  "allocated_up": "100",
+  "allocated_down": "100",
+  "cost_basis_usd": "100",
+  "capital_usd": "100",
+  "note": "Declared cost of this manual split only. Not a wallet balance and not a deposit."
+}

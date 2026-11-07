@@ -30,6 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     script = "config/replay_equal_usd.json" if args.command == "demo" else args.script
     config, steps = load_script(script)
     engine, _broker, _checks = run_replay(config, steps)
+    print("mode=legacy_equal_gross_usd")
     _print_summary(engine)
     return 0
 
