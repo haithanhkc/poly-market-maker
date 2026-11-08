@@ -64,5 +64,11 @@
     "requote_vol_window_ms":  30000,
     "requote_size_threshold":  "1",
     "close_improve_seconds":  90,
-    "sell_ready_timeout_seconds":  30
+    "sell_ready_timeout_seconds":  30,
+    "pair_min_edge":  "0.01",
+    "max_unpaired_fraction":  "0.5",
+    "stale_feed_seconds":  10,
+    "split_lead_seconds":  45,
+    "max_runtime_seconds":  2400,
+    "redeem_max_attempts":  5
 }

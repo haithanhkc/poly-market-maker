@@ -276,6 +276,50 @@ def data_api_trade_events(market: dict, payload: dict) -> list[dict]:
     return events
 
 
+def resolution_settled(condition_id: str, payload: dict) -> bool:
+    """True when the Data API shows a final binary payout.
+
+    A missing market, an empty row, or payout denominators that are still zero
+    is not settled. Redeem must wait for this.
+    """
+    if data_api_resolution_event(
+        {"market_id": condition_id, "condition_id": condition_id}, payload
+    ) is not None:
+        return True
+    if not isinstance(payload, dict):
+        return False
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        rows = [payload]
+    condition = str(condition_id).lower()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_condition = str(
+            row.get("condition_id") or row.get("conditionId") or ""
+        ).lower()
+        if row_condition and row_condition != condition:
+            continue
+        denominator = row.get("payoutDenominator")
+        if denominator is None:
+            denominator = row.get("payout_denominator")
+        numerators = row.get("payoutNumerators")
+        if numerators is None:
+            numerators = row.get("payout_numerators")
+        try:
+            settled_den = int(denominator) > 0
+        except (TypeError, ValueError):
+            settled_den = False
+        if not settled_den or not isinstance(numerators, list):
+            continue
+        try:
+            if any(int(item) > 0 for item in numerators):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def data_api_resolution_event(market: dict, payload: dict) -> Optional[dict]:
     if not isinstance(payload, dict):
         return None

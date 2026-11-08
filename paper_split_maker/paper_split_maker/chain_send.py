@@ -92,6 +92,16 @@ def eoa_confirmed(tx_hash: str) -> bool:
 BALANCE_RPCS = ("https://polygon.drpc.org", "https://polygon-bor-rpc.publicnode.com")
 
 
+def pusd_balance_shares(owner: str, rpc_call=None):
+    """pUSD ERC-20 balanceOf(owner), in shares (6 decimals)."""
+    from decimal import Decimal
+
+    data = "0x70a08231" + owner.lower().replace("0x", "").rjust(64, "0")
+    call = rpc_call or _rpc_eth_call
+    units = int(str(call(PUSD, data)), 16)
+    return Decimal(units) / Decimal("1000000")
+
+
 def erc1155_balance(owner: str, token_id: str, rpc_call=None) -> int:
     """CTF balanceOf(owner, id) in base units, read from a public RPC."""
     from paper_split_maker.chain_data import CTF

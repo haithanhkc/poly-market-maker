@@ -22,7 +22,13 @@ from paper_split_maker.models import (
     Order,
     State,
 )
-from paper_split_maker.quotes import Proposal, ladder_prices, pair_min_price, propose
+from paper_split_maker.quotes import (
+    Proposal,
+    ladder_prices,
+    pair_edge_floor,
+    pair_min_price,
+    propose,
+)
 from paper_split_maker.risk import (
     assert_ledger_invariants,
     best_case_equity,
@@ -453,6 +459,8 @@ class Engine:
             )
             return
         if book.ts_ms == stamp and digest and book.digest == digest:
+            # A repeated snapshot is still a message. Quiet books stay fresh.
+            book.received_ms = self.state.now_ms
             self._emit(
                 kind="book", market=market, outcome=outcome, reason="duplicate_book"
             )
@@ -497,6 +505,7 @@ class Engine:
         book.ts_ms = stamp
         book.digest = digest
         book.uncertain = False
+        book.received_ms = self.state.now_ms
         self._record_mid(market, outcome)
         self._note_volatility(market)
         self._emit(kind="book", market=market, outcome=outcome, reason="ok")
@@ -835,7 +844,19 @@ class Engine:
             ),
         ]
         proposals.sort(key=lambda item: (0 if item.repair else 1, item.outcome))
+        for item in proposals:
+            if item.reason == "pair_floor":
+                self._note_pair_block(market, item.outcome, item.price)
         self._sync_working(market, proposals)
+        if (
+            self._in_close_improve(market)
+            and any(item.reason == "pair_floor" for item in proposals)
+            and not any(item.reason == "ok" for item in proposals)
+            and not self._working(market)
+        ):
+            # The floor cannot be met. Merge the pair and hold the remainder
+            # for resolution instead of cutting the ask down to the bid.
+            self._merge_free(market, "pair_floor")
         if any(item.reason == "ok" for item in proposals):
             self._place_proposals(market, proposals)
         elif self.config.merge_when_idle and not self._working(market):
@@ -968,6 +989,10 @@ class Engine:
                 or order.status not in WORKING_ORDER_STATUSES
             ):
                 continue
+            floor = pair_edge_floor(market, order.outcome, self.config)
+            if floor is not None and order.price < floor:
+                self._request_cancel(market, order, "pair_floor")
+                continue
             start = order.live_ts if order.live_ts is not None else order.submit_ts
             if self.state.now_ms - start < rest_ms:
                 # Leave a resting sell alone until it has had time to fill.
@@ -1075,9 +1100,16 @@ class Engine:
         if tick <= 0 or size <= 0:
             return None
         low = ceil_tick(max(self.config.min_price, bid + tick), tick)
-        pair = pair_min_price(market, outcome, self.config)
-        if pair is not None:
-            paired = ceil_tick(pair, tick)
+        floors = [
+            item
+            for item in (
+                pair_min_price(market, outcome, self.config),
+                pair_edge_floor(market, outcome, self.config),
+            )
+            if item is not None
+        ]
+        if floors:
+            paired = ceil_tick(max(floors), tick)
             if paired > low:
                 low = paired
         high = qdown(self.config.max_price, tick)
@@ -1110,6 +1142,21 @@ class Engine:
             return proposal
         tick = market.tick_size
         aggressive = bid + tick
+        edge = pair_edge_floor(market, proposal.outcome, self.config)
+        if edge is not None:
+            edged = ceil_tick(edge, tick)
+            if edged > aggressive:
+                aggressive = edged
+        if proposal.price < aggressive:
+            return Proposal(
+                outcome=proposal.outcome,
+                price=ZERO,
+                size=ZERO,
+                fair=proposal.fair,
+                required_edge=proposal.required_edge,
+                repair=proposal.repair,
+                reason="pair_floor",
+            )
         if aggressive >= proposal.price:
             return proposal
         deadline = self._preclose_ms(market)
@@ -1489,7 +1536,42 @@ class Engine:
                 continue
             if outcome and order.outcome != outcome:
                 continue
+            if (
+                self.mode == "live"
+                and reason == "stale_feed"
+                and not self._price_moved_past(market, order)
+                and self._rested_ms(order)
+                < int(self.config.min_order_rest_seconds) * 1000
+            ):
+                continue
             self._request_cancel(market, order, reason)
+
+    def _price_moved_past(self, market: Market, order: Order) -> bool:
+        """A resting sell is through when the bid has traded up to its price."""
+        bid = market.book(order.outcome).best_bid()
+        return bid is not None and bid >= order.price
+
+    def _note_pair_block(self, market: Market, outcome: str, price: Decimal) -> None:
+        seen = getattr(self, "pair_blocked", None)
+        if seen is None:
+            seen = set()
+            self.pair_blocked = seen
+        seen.add(market.market_id)
+        key = (market.market_id, outcome)
+        once = getattr(self, "_pair_block_once", None)
+        if once is None:
+            once = set()
+            self._pair_block_once = once
+        if key in once:
+            return
+        once.add(key)
+        self._emit(
+            kind="pair_floor_block",
+            market=market,
+            outcome=outcome,
+            price=price,
+            reason="pair_floor",
+        )
 
     def _request_cancel(self, market: Market, order: Order, reason: str) -> None:
         if (
@@ -1541,7 +1623,20 @@ class Engine:
 
     def _book_fresh(self, market: Market, outcome: str) -> bool:
         book = market.book(outcome)
-        if book.uncertain or book.ts_ms < 0:
+        if book.uncertain:
+            return False
+        if self.mode == "live":
+            # Freshness is the last time we received a book, not the exchange
+            # timestamp. A quiet book does not go stale just because nothing
+            # inside it changed. ``stale_after_ms`` stays the paper threshold.
+            if book.received_ms < 0:
+                return False
+            age = self.state.now_ms - book.received_ms
+            limit = int(self.config.stale_feed_seconds) * 1000
+            if age < 0:
+                return -age <= self.config.clock_skew_ms
+            return age <= limit
+        if book.ts_ms < 0:
             return False
         age = self.state.now_ms - book.ts_ms
         if age < 0:

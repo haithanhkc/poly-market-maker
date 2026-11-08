@@ -98,6 +98,18 @@ class Config:
     # After the open, give posts this long before unwinding a session whose
     # sells are failing. Floor-blocked quotes are left until the normal close.
     sell_ready_timeout_seconds: int = 30
+    # A sell that pairs already-sold opposite shares must clear 1 + this - avg.
+    pair_min_edge: Decimal = Decimal("0.01")
+    # One side may be sold this far ahead of the other, as a fraction of the split.
+    max_unpaired_fraction: Decimal = Decimal("0.5")
+    # Live books are stale only after this long with no message, not on a quiet book.
+    stale_feed_seconds: int = 10
+    # Split the next session this many seconds before it opens.
+    split_lead_seconds: int = 45
+    # Hard stop for a live run. The duration flag does not cut a session off.
+    max_runtime_seconds: int = 2400
+    # Give up on a redeem after this many attempts and leave it for redeem-pending.
+    redeem_max_attempts: int = 5
     # 0 disables the pause. Otherwise pull quotes when the mid jumps.
     vol_pause_move: Decimal = Decimal("0")
     vol_pause_window_ms: int = 0
@@ -185,6 +197,18 @@ class Config:
             raise ConfigError("rest and close windows must be non-negative")
         if self.requote_vol_k < 0 or self.requote_size_threshold < 0:
             raise ConfigError("requote volatility settings must be non-negative")
+        if self.pair_min_edge < 0:
+            raise ConfigError("pair_min_edge must be non-negative")
+        if self.max_unpaired_fraction < 0 or self.max_unpaired_fraction > 1:
+            raise ConfigError("max_unpaired_fraction must be in [0, 1]")
+        if self.stale_feed_seconds < 1:
+            raise ConfigError("stale_feed_seconds must be at least 1")
+        if self.split_lead_seconds < 0:
+            raise ConfigError("split_lead_seconds must be non-negative")
+        if self.max_runtime_seconds <= 0:
+            raise ConfigError("max_runtime_seconds must be positive")
+        if self.redeem_max_attempts < 1:
+            raise ConfigError("redeem_max_attempts must be at least 1")
         if self.requote_vol_window_ms < 0:
             raise ConfigError("requote_vol_window_ms must be non-negative")
         if self.vol_pause_move < 0 or self.btc_pause_move < 0:
@@ -263,6 +287,8 @@ _DECIMAL_FIELDS = {
     "btc_pause_move",
     "requote_vol_k",
     "requote_size_threshold",
+    "pair_min_edge",
+    "max_unpaired_fraction",
     "taker_repair_max_usdc",
     "max_fee_gwei",
     "priority_fee_gwei",
@@ -284,6 +310,10 @@ _INT_FIELDS = {
     "requote_vol_window_ms",
     "close_improve_seconds",
     "sell_ready_timeout_seconds",
+    "stale_feed_seconds",
+    "split_lead_seconds",
+    "max_runtime_seconds",
+    "redeem_max_attempts",
     "vol_pause_window_ms",
     "vol_pause_hold_ms",
     "pre_split_lead_ms",

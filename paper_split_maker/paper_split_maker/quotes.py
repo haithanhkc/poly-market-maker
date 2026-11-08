@@ -29,6 +29,93 @@ class Proposal:
     reason: str = "ok"
 
 
+def pair_edge_floor(market: Market, outcome: str, config: Config):
+    """Minimum price for shares that pair with the other side already sold.
+
+    Each pair pays 1 at resolution, so selling this side below
+    ``1 + pair_min_edge - avg_opposite`` locks in a loss on those shares.
+    """
+    edge = config.pair_min_edge
+    if outcome == "up":
+        opposite, proceeds, own = (
+            market.sold_down_shares,
+            market.sold_down_proceeds,
+            market.sold_up_shares,
+        )
+    else:
+        opposite, proceeds, own = (
+            market.sold_up_shares,
+            market.sold_up_proceeds,
+            market.sold_down_shares,
+        )
+    if opposite <= 0 or opposite <= own:
+        return None
+    average = proceeds / opposite
+    floor = Decimal("1") + edge - average
+    if floor <= 0:
+        return None
+    return floor
+
+
+def unpaired_sell_room(market: Market, outcome: str, price: Decimal, config: Config):
+    """How many shares of ``outcome`` may still be sold.
+
+    Shares that catch up to the other side are always allowed. Extra one-sided
+    size is capped by ``max_unpaired_fraction`` of the split and by the loss
+    budget ``initial_capital * max_loss_fraction``.
+    """
+    split = market.gross_split
+    if split <= 0:
+        return None
+    if outcome == "up":
+        sold, other, proceeds = (
+            market.sold_up_shares,
+            market.sold_down_shares,
+            market.sold_up_proceeds,
+        )
+    else:
+        sold, other, proceeds = (
+            market.sold_down_shares,
+            market.sold_up_shares,
+            market.sold_down_proceeds,
+        )
+    minimum = (
+        market.min_order_size
+        if market.min_order_size > config.min_order_size
+        else config.min_order_size
+    )
+    cap = config.max_unpaired_fraction * split
+    # A 5-share split cannot post half a minimum order. The fraction still
+    # caps a full-size split (15 of 30) and the loss budget caps a cheap sell.
+    if ZERO < cap < minimum <= split:
+        cap = minimum
+    ahead = sold - other
+    if ahead < 0:
+        ahead = ZERO
+    fraction_room = cap - ahead
+    if fraction_room < 0:
+        fraction_room = ZERO
+    budget = config.initial_capital * config.max_loss_fraction
+    existing = ZERO
+    if ahead > 0 and sold > 0:
+        existing = ahead * (Decimal("1") - proceeds / sold)
+        if existing < 0:
+            existing = ZERO
+    remain = budget - existing
+    loss_per = Decimal("1") - price
+    if remain <= 0:
+        loss_room = ZERO
+    elif loss_per <= 0:
+        loss_room = fraction_room
+    else:
+        loss_room = remain / loss_per
+    fresh = fraction_room if fraction_room < loss_room else loss_room
+    catch_up = other - sold
+    if catch_up < 0:
+        catch_up = ZERO
+    return catch_up + fresh
+
+
 def pair_min_price(market: Market, outcome: str, config: Config):
     """Minimum offer for the unfilled side of shares already sold.
 
@@ -107,16 +194,22 @@ def propose(state: State, market: Market, outcome: str, config: Config) -> Propo
     fair = (bid + ask) / 2
     raw = ask if ask >= fair + required_edge else fair + required_edge
     price = ceil_tick(raw, market.tick_size)
-    floor = pair_min_price(market, outcome, config)
+    floors = [
+        item
+        for item in (
+            pair_min_price(market, outcome, config),
+            pair_edge_floor(market, outcome, config),
+        )
+        if item is not None
+    ]
+    floor = max(floors) if floors else None
     if floor is not None and price < floor:
         price = ceil_tick(floor, market.tick_size)
+    held = floor is not None
     if price < config.min_price or price > config.max_price or price >= 1:
-        return _no("pair_floor" if floor is not None else "no_edge", outcome)
+        return _no("pair_floor" if held else "no_edge", outcome)
     if price <= bid:
-        return _no(
-            "pair_floor" if floor is not None and price <= bid else "would_cross",
-            outcome,
-        )
+        return _no("pair_floor" if held else "would_cross", outcome)
     repair = self_inv > other_inv
     if adverse > 0:
         size = config.clip_size - config.skew_size_per_share * adverse
@@ -125,6 +218,9 @@ def propose(state: State, market: Market, outcome: str, config: Config) -> Propo
     free = self_inv - reserved(state, market, outcome)
     if size > free:
         size = free
+    room = unpaired_sell_room(market, outcome, price, config)
+    if room is not None and size > room:
+        size = room
     size = qdown(size, config.order_size_quantum)
     minimum = (
         market.min_order_size
@@ -132,6 +228,7 @@ def propose(state: State, market: Market, outcome: str, config: Config) -> Propo
         else config.min_order_size
     )
     if size < minimum:
+        blocked = room is not None and room < minimum
         return Proposal(
             outcome=outcome,
             price=price,
@@ -139,7 +236,13 @@ def propose(state: State, market: Market, outcome: str, config: Config) -> Propo
             fair=fair,
             required_edge=required_edge,
             repair=repair,
-            reason="below_min_size" if free > 0 else "insufficient_inventory",
+            reason=(
+                "pair_floor"
+                if blocked
+                else "below_min_size"
+                if free > 0
+                else "insufficient_inventory"
+            ),
         )
     return Proposal(
         outcome=outcome,

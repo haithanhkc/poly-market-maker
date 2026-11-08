@@ -88,7 +88,15 @@ def main(argv: list[str] | None = None) -> int:
     live.add_argument("--dry-run", action="store_true")
     live.add_argument("--yes-i-understand-live-risk", action="store_true")
 
+    pending = sub.add_parser(
+        "redeem-pending",
+        help="retry redeems that were deferred after the market resolved",
+    )
+    pending.add_argument("--file", type=Path, required=True)
+
     args = parser.parse_args(argv)
+    if args.command == "redeem-pending":
+        return _cmd_redeem_pending(args)
     try:
         if args.command == "live":
             return _run_live(args)
@@ -211,8 +219,42 @@ def _run_live(args) -> int:
         Path(args.out),
         duration_seconds=args.duration_seconds,
         max_markets=args.max_markets,
+        read_chain_balance=True,
     )
     _print_summary(summary)
+    return 0
+
+
+def _cmd_redeem_pending(args) -> int:
+    """Retry a deferred redeem file. Loads keys only when this command runs."""
+    from paper_split_maker.live_runner import redeem_pending_once
+    from paper_split_maker.normalize import resolution_settled
+
+    creds = load_credentials(dict(os.environ))
+
+    def resolved(condition_id: str) -> bool:
+        from paper_split_maker.public_client import PublicReadClient
+
+        payload = PublicReadClient().fetch_resolution(condition_id)
+        return resolution_settled(condition_id, payload)
+
+    def submit(record: dict) -> None:
+        from paper_split_maker.chain_send import submit_position
+
+        submit_position(
+            creds,
+            "redeem",
+            str(record.get("condition_id") or ""),
+            str(record.get("amount") or "0"),
+            "v1",
+            False,
+            500_000,
+            "0",
+            "0",
+        )
+
+    result = redeem_pending_once(args.file, submit=submit, resolved=resolved)
+    print(json.dumps(result))
     return 0
 
 

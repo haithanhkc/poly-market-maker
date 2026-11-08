@@ -161,18 +161,54 @@ def _refresh_readiness(engine, client, creds, notes: list[str], now: float) -> b
     return engine.exchange_ready
 
 
+def _lead_ms(config) -> int:
+    """How early the next session is split. ``split_lead_seconds`` wins."""
+    seconds = int(getattr(config, "split_lead_seconds", 0) or 0)
+    if seconds > 0:
+        return seconds * 1000
+    return int(getattr(config, "pre_split_lead_ms", 0) or 0)
+
+
+def _runtime_seconds(config) -> int:
+    """Hard wall-clock cap. The duration flag must not end a session early."""
+    runtime = int(getattr(config, "max_runtime_seconds", 2400) or 2400)
+    return runtime if runtime > 0 else 2400
+
+
 def _sessions_are_done(engine, max_markets: int) -> bool:
     done = getattr(engine, "sessions_finished", set())
     return max_markets > 0 and len(done) >= max_markets
 
 
+def _was_quoted(engine, market) -> bool:
+    if market.market_id in getattr(engine, "sell_accepted", set()):
+        return True
+    if market.market_id in getattr(engine, "pair_blocked", set()):
+        return True
+    failures = getattr(engine, "post_failures", {})
+    if int(failures.get(market.market_id, 0) or 0) > 0:
+        return True
+    return any(
+        order.market_id == market.market_id for order in engine.state.orders.values()
+    )
+
+
 def _note_session_done(engine, market) -> None:
+    """Count a session only after it was split, quoted, and is flat.
+
+    A window we skipped, or one still working, does not count toward
+    ``--max-markets``.
+    """
     joined = getattr(engine, "preopen_joined", set())
     if market.market_id not in joined and market.slug not in joined:
+        return
+    if market.gross_split <= 0:
         return
     if market.pending_split > 0 or market.up > 0 or market.down > 0:
         return
     if engine._working(market):
+        return
+    if not _was_quoted(engine, market):
         return
     _ensure_live_state(engine)
     engine.sessions_finished.add(market.market_id)
@@ -190,6 +226,7 @@ def run_confirmed_live(
     now_s=None,
     sleep=None,
     poster=None,
+    read_chain_balance=False,
 ) -> dict:
     from paper_split_maker.live_clob import (
         build_client,
@@ -226,7 +263,14 @@ def run_confirmed_live(
         else "Market websocket package is missing; books come from REST.",
     ]
     print(describe_user_subscribe(creds.funder, max_markets))
-    deadline = clock() + duration_seconds
+    # duration_seconds is accepted for the CLI but does not cut a session off.
+    # The run stops after max_markets traded sessions, or at this hard cap.
+    deadline = clock() + _runtime_seconds(config)
+    engine.read_chain_balance = bool(read_chain_balance)
+    engine.resolution_reader = reader
+    engine.redeem_pending_path = str(Path(out_dir) / "redeem_pending.json")
+    engine.chain_events = []
+    engine.chain_worker = ChainWorker(engine, creds, notes)
     try:
         while clock() < deadline:
             if config.kill_switch_file and Path(config.kill_switch_file).exists():
@@ -282,6 +326,8 @@ def run_confirmed_live(
     finally:
         ws_stop.set()
         _shutdown_live(engine, client, creds, notes, cancel_all)
+        _stop_chain_worker(engine, notes)
+        _drain_chain_events(engine, notes)
     summary = engine.summary(notes=notes)
     summary["mode"] = "live"
     summary["funder"] = creds.funder
@@ -351,6 +397,7 @@ def _live_tick(
     _send_new_quotes(engine, client, post_only_sells, creds, notes)
     _unwind_failed_posts(engine, stamp, notes)
     _flush_chain(engine, creds, notes)
+    _drain_chain_events(engine, notes)
     for market in list(engine.state.markets.values()):
         _note_session_done(engine, market)
 
@@ -547,11 +594,12 @@ def _poll_public(
     if current_slug not in engine.state.markets and _market_by_slug(engine, current_slug) is None:
         _note_skipped_start(engine, current_slug, notes)
     _forget_missed_sessions(engine, stamp, notes)
-    if stamp >= next_open * 1000 - config.pre_split_lead_ms:
+    lead_ms = _lead_ms(config)
+    if stamp >= next_open * 1000 - lead_ms:
         # Free the ending session before discovery, or the new market is
         # refused by the loss floor while the old sell is still working.
         _flatten_for_rollover(
-            engine, next_open, stamp, lead_ms=config.pre_split_lead_ms
+            engine, next_open, stamp, lead_ms=lead_ms
         )
     slugs = _candidate_slugs(config, now_s, max_markets)
     poll_now = stamp / 1000
@@ -574,7 +622,7 @@ def _poll_public(
                 stamp,
                 notes,
                 allow_started=False,
-                lead_ms=config.pre_split_lead_ms,
+                lead_ms=_lead_ms(config),
             )
     open_markets = [
         market
@@ -752,8 +800,9 @@ def _consider_pre_split(
         # This session has started. Never split it on the way in; the
         # following window is handled once it is the upcoming one.
         return
-    if stamp >= next_open * 1000 - config.pre_split_lead_ms:
-        _flatten_for_rollover(engine, next_open, stamp, lead_ms=config.pre_split_lead_ms)
+    lead_ms = _lead_ms(config)
+    if stamp >= next_open * 1000 - lead_ms:
+        _flatten_for_rollover(engine, next_open, stamp, lead_ms=lead_ms)
     existing = _market_by_slug(engine, slug)
     if existing is not None and existing.gross_split > 0:
         return
@@ -761,7 +810,7 @@ def _consider_pre_split(
     skipped = getattr(engine, "skipped_unready", set())
     if slug in skipped:
         return
-    in_lead = next_open * 1000 - config.pre_split_lead_ms <= stamp < next_open * 1000
+    in_lead = next_open * 1000 - lead_ms <= stamp < next_open * 1000
     if (
         in_lead
         and not pending
@@ -776,7 +825,7 @@ def _consider_pre_split(
     if not should_pre_split(
         stamp,
         next_open * 1000,
-        config.pre_split_lead_ms,
+        lead_ms,
         pending or slug in getattr(engine, "split_sent", set()),
         not engine.at_cap(),
     ):
@@ -810,7 +859,7 @@ def _consider_pre_split(
     payload = dict(found[0])
     payload.setdefault("slug", slug)
     if not _load_market(
-        engine, payload, stamp, notes, allow_started=False, lead_ms=config.pre_split_lead_ms
+        engine, payload, stamp, notes, allow_started=False, lead_ms=lead_ms
     ):
         # The engine refused the market: never split on-chain for it.
         notes.append(f"{slug} not accepted by engine; no split")
@@ -823,6 +872,22 @@ def _consider_pre_split(
     if amount is None:
         notes.append(f"{slug} not split; cash is below the minimum order")
         return
+    available = _collateral_shares(engine, creds, notes)
+    if available is not None and available < amount:
+        from paper_split_maker.decimal_utils import qdown
+
+        amount = qdown(available, config.order_size_quantum)
+        minimum = (
+            market.min_order_size
+            if market.min_order_size > config.min_order_size
+            else config.min_order_size
+        )
+        if amount < minimum:
+            notes.append(
+                f"{slug} not split; pUSD balance {available} is below the minimum"
+            )
+            return
+        notes.append(f"{slug} split sized to the pUSD balance {amount}")
     split_now = float(getattr(engine, "clock_now", 0) or (stamp / 1000))
     if _call_is_waiting(engine, "split", split_now):
         return
@@ -1262,14 +1327,51 @@ def _remember_assets(engine, asset_ids: list[str]) -> None:
         asset_ids[:] = wanted
 
 
+def _collateral_shares(engine, creds, notes: list[str]):
+    """On-chain pUSD, when a reader is configured. None means use the ledger cash.
+
+    The live CLI turns the RPC read on. Tests inject ``collateral_balance``
+    and never open a socket.
+    """
+    from decimal import Decimal
+
+    fn = getattr(engine, "collateral_balance", None)
+    if not callable(fn) and not getattr(engine, "read_chain_balance", False):
+        return None
+    try:
+        if callable(fn):
+            value = fn()
+        else:
+            from paper_split_maker.chain_send import pusd_balance_shares
+
+            value = pusd_balance_shares(creds.funder)
+        return Decimal(str(value))
+    except Exception as exc:
+        text = creds.redact(f"pUSD balance read failed: {exc}")
+        notes.append(text)
+        _log_exchange_error(engine, "collateral", text)
+        return None
+
+
 def _flush_chain(engine, creds, notes: list[str]) -> None:
+    """Hand merge/redeem to the background worker and return immediately.
+
+    A slow or failing redeem must not delay the next session's split.
+    Without a worker (direct unit calls) the submit still runs here.
+    """
     _ensure_live_state(engine)
-    now = float(getattr(engine, "clock_now", 0) or time.time())
-    if now < engine.call_ready_at.get("chain", 0):
-        return
     items = list(engine.chain_outbox)
     engine.chain_outbox.clear()
     if not items:
+        return
+    worker = getattr(engine, "chain_worker", None)
+    if worker is not None:
+        for item in items:
+            worker.submit(dict(item))
+        return
+    now = float(getattr(engine, "clock_now", 0) or time.time())
+    if now < engine.call_ready_at.get("chain", 0):
+        engine.chain_outbox.extend(items)
         return
     from paper_split_maker.chain_send import submit_position
 
@@ -1298,6 +1400,257 @@ def _flush_chain(engine, creds, notes: list[str]) -> None:
             engine.call_ready_at["chain"] = now + _backoff_delay(fails)
             engine.chain_outbox.extend(items[index:])
             return
+
+
+class ChainWorker:
+    """Merge and redeem off the quote thread."""
+
+    def __init__(self, engine, creds, notes: list[str]):
+        self.engine = engine
+        self.creds = creds
+        self.notes = notes
+        self.queue: queue.Queue = queue.Queue()
+        self.stop = threading.Event()
+        self.attempts: dict[str, int] = {}
+        self.later: list[tuple[float, dict]] = []
+        self.thread = threading.Thread(
+            target=self._loop, name="chain-worker", daemon=True
+        )
+        self.thread.start()
+
+    def submit(self, item: dict) -> None:
+        self.queue.put(item)
+
+    def _loop(self) -> None:
+        while not self.stop.is_set() or not self.queue.empty() or self.later:
+            self._promote_later()
+            try:
+                item = self.queue.get(timeout=0.05)
+            except queue.Empty:
+                if self.stop.is_set():
+                    break
+                continue
+            try:
+                self._handle(item)
+            except Exception as exc:
+                self._record(
+                    item,
+                    "chain_error",
+                    self.creds.redact(f"{item.get('action')} failed: {exc}"),
+                )
+        self._defer_remaining()
+
+    def _promote_later(self) -> None:
+        now = time.monotonic()
+        ready = []
+        pending = []
+        for when, item in self.later:
+            if when <= now:
+                ready.append(item)
+            else:
+                pending.append((when, item))
+        self.later = pending
+        for item in ready:
+            self.queue.put(item)
+
+    def _defer_remaining(self) -> None:
+        for _when, item in self.later:
+            if item.get("action") == "redeem":
+                self._defer(item, "stopped before the market resolved")
+        self.later.clear()
+
+    def _handle(self, item: dict) -> None:
+        action = str(item.get("action") or "")
+        if action == "redeem" and not _redeem_is_resolved(self.engine, item):
+            self._retry_redeem(item, "market is not resolved")
+            return
+        from paper_split_maker.chain_send import submit_position
+
+        route = getattr(self.engine, "market_routes", {}).get(
+            item.get("market_id"), {"version": "v1", "neg_risk": False}
+        )
+        try:
+            submit_position(
+                self.creds,
+                action,
+                item.get("condition_id"),
+                item.get("amount"),
+                route.get("version") or "v1",
+                bool(route.get("neg_risk")),
+                self.engine.config.gas_limit,
+                str(self.engine.config.max_fee_gwei),
+                str(self.engine.config.priority_fee_gwei),
+            )
+        except Exception as exc:
+            text = self.creds.redact(f"{action} failed: {exc}")
+            if action == "redeem" or "no market found" in text.lower():
+                self._retry_redeem(item, text)
+                return
+            self._retry_later(item, text)
+            return
+        self.notes.append(f"{action} submitted for {item.get('market_id')}")
+
+    def _retry_later(self, item: dict, text: str) -> None:
+        key = f"{item.get('action')}:{item.get('condition_id')}"
+        count = self.attempts.get(key, 0) + 1
+        self.attempts[key] = count
+        limit = int(getattr(self.engine.config, "redeem_max_attempts", 5) or 5)
+        self.notes.append(text)
+        if count >= limit:
+            self._record(item, "chain_gave_up", text)
+            return
+        self.later.append((time.monotonic() + _backoff_delay(count), item))
+
+    def _retry_redeem(self, item: dict, text: str) -> None:
+        key = f"redeem:{item.get('condition_id')}"
+        count = self.attempts.get(key, 0) + 1
+        self.attempts[key] = count
+        limit = int(getattr(self.engine.config, "redeem_max_attempts", 5) or 5)
+        lowered = text.lower()
+        missing = "no market found" in lowered
+        if count >= limit or missing:
+            # "No market found" is not retried. Other misses stop after N.
+            self._defer(item, text)
+            return
+        self.notes.append(text)
+        self.later.append((time.monotonic() + _backoff_delay(count), item))
+
+    def _defer(self, item: dict, text: str) -> None:
+        self._record(item, "redeem_deferred", text)
+        _save_redeem_pending(self.engine, item, text)
+
+    def _record(self, item: dict, kind: str, text: str) -> None:
+        events = getattr(self.engine, "chain_events", None)
+        if events is None:
+            events = []
+            self.engine.chain_events = events
+        events.append(
+            {
+                "kind": kind,
+                "market_id": str(item.get("market_id") or ""),
+                "reason": kind,
+                "detail": text[:300],
+                "note": text,
+            }
+        )
+
+
+def _redeem_is_resolved(engine, item: dict) -> bool:
+    condition = str(item.get("condition_id") or "")
+    fn = getattr(engine, "redeem_resolved", None)
+    if callable(fn):
+        try:
+            return bool(fn(condition))
+        except Exception:
+            return False
+    reader = getattr(engine, "resolution_reader", None)
+    fetch = getattr(reader, "fetch_resolution", None) if reader is not None else None
+    if fetch is None:
+        return False
+    try:
+        payload = fetch(condition)
+    except Exception:
+        return False
+    from paper_split_maker.normalize import resolution_settled
+
+    try:
+        return bool(resolution_settled(condition, payload))
+    except Exception:
+        return False
+
+
+def _save_redeem_pending(engine, item: dict, text: str) -> None:
+    path = getattr(engine, "redeem_pending_path", "")
+    if not path:
+        return
+    try:
+        existing = []
+        file = Path(path)
+        if file.exists():
+            existing = json.loads(file.read_text(encoding="utf-8"))
+        if not isinstance(existing, list):
+            existing = []
+        condition = str(item.get("condition_id") or "")
+        if any(str(row.get("condition_id") or "") == condition for row in existing if isinstance(row, dict)):
+            return
+        existing.append(
+            {
+                "market_id": str(item.get("market_id") or ""),
+                "condition_id": condition,
+                "amount": str(item.get("amount") or ""),
+                "reason": text[:300],
+            }
+        )
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(json.dumps(existing), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _drain_chain_events(engine, notes: list[str]) -> None:
+    events = getattr(engine, "chain_events", None)
+    if not events:
+        return
+    pending = list(events)
+    events.clear()
+    for event in pending:
+        note = str(event.get("note") or "")
+        if note and note not in notes:
+            notes.append(note)
+        try:
+            pending_batch = list(engine._batch)
+            engine._batch = []
+            engine._emit(
+                kind=str(event.get("kind") or "chain_error"),
+                reason=str(event.get("reason") or ""),
+                detail=str(event.get("detail") or "")[:300],
+                market_id=str(event.get("market_id") or ""),
+            )
+            engine._finish()
+            engine._batch = pending_batch
+        except Exception:
+            continue
+
+
+def _stop_chain_worker(engine, notes: list[str]) -> None:
+    worker = getattr(engine, "chain_worker", None)
+    if worker is None:
+        return
+    worker.stop.set()
+    worker.thread.join(timeout=3)
+    _drain_chain_events(engine, notes)
+
+
+def redeem_pending_once(path, *, submit, resolved) -> dict:
+    """Retry deferred redeems that are resolved now. Does not loop."""
+    file = Path(path)
+    records = json.loads(file.read_text(encoding="utf-8")) if file.exists() else []
+    if not isinstance(records, list):
+        records = []
+    done = []
+    left = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        condition = str(record.get("condition_id") or "")
+        try:
+            ready = bool(resolved(condition))
+        except Exception:
+            ready = False
+        if not ready:
+            left.append(record)
+            continue
+        try:
+            submit(record)
+        except Exception as exc:
+            record = dict(record)
+            record["attempts"] = int(record.get("attempts") or 0) + 1
+            record["reason"] = str(exc)[:300]
+            left.append(record)
+            continue
+        done.append(condition)
+    file.write_text(json.dumps(left), encoding="utf-8")
+    return {"redeemed": done, "left": len(left)}
 
 
 def drain_market_ws(engine, ws_queue, stamp: int, creds=None, notes: list[str] | None = None) -> int:

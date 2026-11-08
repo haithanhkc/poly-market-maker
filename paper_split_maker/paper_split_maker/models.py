@@ -25,6 +25,8 @@ class LevelBook:
     asks: list[tuple[Decimal, Decimal]] = field(default_factory=list)
     digest: str = ""
     uncertain: bool = True
+    # Local receipt time. A quiet book stays fresh until this ages out.
+    received_ms: int = -1
 
     def best_bid(self) -> Optional[Decimal]:
         return self.bids[0][0] if self.bids else None
@@ -45,6 +47,7 @@ class LevelBook:
             "asks": [[money(p), money(s)] for p, s in self.asks],
             "digest": self.digest,
             "uncertain": self.uncertain,
+            "received_ms": self.received_ms,
         }
 
     @classmethod
@@ -55,6 +58,7 @@ class LevelBook:
             asks=[(_d(p), _d(s)) for p, s in data["asks"]],
             digest=str(data.get("digest", "")),
             uncertain=bool(data["uncertain"]),
+            received_ms=int(data.get("received_ms", -1)),
         )
 
 
