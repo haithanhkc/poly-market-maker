@@ -387,7 +387,16 @@ class Engine:
             )
             return
         for item in self.state.markets.values():
-            if item.status in ("expired_unresolved", "resolved") and not self._working(item):
+            finished = item.status in ("expired_unresolved", "resolved")
+            flat_after_split = (
+                item.gross_split > 0
+                and item.up == 0
+                and item.down == 0
+                and item.pending_split <= 0
+                and not self._working(item)
+            )
+            if (finished or flat_after_split) and not self._working(item):
+                # A finished session must not keep a reserve that blocks the next one.
                 item.reserve_active = False
         market.reserve_active = True
         market.operational_reserve_amount = self.state.operational_reserve
@@ -811,10 +820,74 @@ class Engine:
         if any(item.reason == "ok" for item in proposals):
             self._place_proposals(market, proposals)
         elif self.config.merge_when_idle and not self._working(market):
-            self._merge_free(market, "idle_no_edge")
+            if self._wait_for_sell(market):
+                # The pair stays until a side is expensive enough to sell
+                # under the loss floor, or the session reaches its stop window.
+                self._skip(market, "waiting_for_price")
+            else:
+                self._merge_free(market, "idle_no_edge")
         for item in proposals:
             if item.reason != "ok":
                 self._skip(market, item.reason, item.outcome)
+
+    def _wait_for_sell(self, market: Market) -> bool:
+        """True when a live split should be held for a later, floor-legal sell."""
+        if self.mode != "live":
+            return False
+        if market.gross_split <= 0 or market.status != "open":
+            return False
+        if self._in_stop_window(market):
+            return False
+        return market.up > 0 or market.down > 0
+
+    def retire_finished(self) -> list[str]:
+        """Remove markets that are finished, flat, and have no working orders.
+
+        Leaving them tracked blocks discovery of the next session and keeps
+        their dead books in the poll. Cash and realized PnL stay on the ledger.
+        Terminal orders leave with the market so every remaining order still
+        points at a market.
+        """
+        removed: list[str] = []
+        for market in list(self.state.markets.values()):
+            if market.status == "open" or market.pending_split > 0:
+                continue
+            if self._working(market) or market.up > 0 or market.down > 0:
+                continue
+            for order_id, order in list(self.state.orders.items()):
+                if order.market_id == market.market_id:
+                    del self.state.orders[order_id]
+            del self.state.markets[market.market_id]
+            removed.append(market.market_id)
+        if removed:
+            self.assert_invariants()
+        return removed
+
+    def note_order_posted(
+        self,
+        market: Market,
+        *,
+        exchange_id: str,
+        outcome: str,
+        price: Decimal,
+        size: Decimal,
+        internal_id: str,
+    ) -> None:
+        """Persist an exchange ack. Callable outside ``handle_event``."""
+        pending = list(self._batch)
+        self._batch = []
+        self._emit(
+            kind="order_posted",
+            market=market,
+            order_id=str(exchange_id),
+            outcome=outcome,
+            price=price,
+            size=size,
+            reason="posted",
+            detail=str(internal_id),
+        )
+        self._finish()
+        self._batch = pending
 
     def _quotes_possible(self, market: Market) -> bool:
         for outcome in ("up", "down"):
