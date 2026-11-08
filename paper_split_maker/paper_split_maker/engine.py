@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from paper_split_maker.config import Config
-from paper_split_maker.decimal_utils import ONE, ZERO, money, on_grid, qdown
+from paper_split_maker.decimal_utils import ONE, ZERO, ceil_tick, money, on_grid, qdown
 from paper_split_maker.logs import LogWriter
 from paper_split_maker.models import (
     WORKING_ORDER_STATUSES,
@@ -22,7 +22,7 @@ from paper_split_maker.models import (
     Order,
     State,
 )
-from paper_split_maker.quotes import Proposal, ladder_prices, propose
+from paper_split_maker.quotes import Proposal, ladder_prices, pair_min_price, propose
 from paper_split_maker.risk import (
     assert_ledger_invariants,
     best_case_equity,
@@ -38,9 +38,18 @@ SIZE_REASONS = frozenset({"ok", "below_min_size", "insufficient_inventory"})
 
 
 RECONCILE_GRACE_MS = 15000
-MIN_ORDER_REST_MS = 15000
 CANCEL_CONFIRM_MS = 3000
 REJECT_PAUSE_MS = 5000
+
+
+def is_post_only_cross(message: str) -> bool:
+    text = str(message or "").lower()
+    return (
+        "post-only" in text
+        or "post only" in text
+        or "would cross" in text
+        or "crosses the book" in text
+    )
 
 class Engine:
     def __init__(
@@ -65,6 +74,11 @@ class Engine:
         self._reconcile_first_seen: dict[str, int] = {}
         self._ignored_remote: set[str] = set()
         self.stray_remote_cancels: list[str] = []
+        # After a post-only cross, the next sell on that outcome is one tick
+        # less aggressive until the book no longer requires it.
+        self.sell_floors: dict[tuple[str, str], Decimal] = {}
+        # Recent mids per outcome, used as a short-window volatility estimate.
+        self.mid_samples: dict[tuple[str, str], list[tuple[int, Decimal]]] = {}
         self._skip_once: set[tuple[str, str, str]] = set()
         self.mode = "library"
         self.chain_outbox: list[dict] = []
@@ -483,6 +497,7 @@ class Engine:
         book.ts_ms = stamp
         book.digest = digest
         book.uncertain = False
+        self._record_mid(market, outcome)
         self._note_volatility(market)
         self._emit(kind="book", market=market, outcome=outcome, reason="ok")
 
@@ -765,13 +780,15 @@ class Engine:
         if market.status == "redeemed":
             return
         self._check_kill_switch()
-        if self.state.killed or self.state.mismatch_stop:
-            self._cancel_market(
-                market, "killed" if self.state.killed else "reconcile_mismatch"
-            )
+        if self.state.killed:
+            self._cancel_market(market, "killed")
             self._merge_free(market, "stop")
-            self._skip(market, "killed" if self.state.killed else "reconcile_mismatch")
+            self._skip(market, "killed")
             return
+        # A reconcile disagreement is handled on that market inside
+        # ``_on_reconcile``. It must not flatten the account or end the run.
+        if self.state.mismatch_stop:
+            self.state.mismatch_stop = False
         self._refresh_expiry(market)
         if market.status == "resolved":
             self._cancel_market(market, "resolved")
@@ -812,8 +829,10 @@ class Engine:
         if self._quotes_possible(market) and not self.at_cap():
             self._auto_split(market)
         proposals = [
-            propose(self.state, market, "up", self.config),
-            propose(self.state, market, "down", self.config),
+            self._ease_for_close(market, propose(self.state, market, "up", self.config)),
+            self._ease_for_close(
+                market, propose(self.state, market, "down", self.config)
+            ),
         ]
         proposals.sort(key=lambda item: (0 if item.repair else 1, item.outcome))
         self._sync_working(market, proposals)
@@ -924,8 +943,10 @@ class Engine:
 
     def _sync_working(self, market: Market, proposals: list[Proposal]) -> None:
         desired: dict[str, list[Decimal]] = {}
+        sized: dict[str, Decimal] = {}
         for proposal in proposals:
-            if proposal.price <= 0:
+            sized[proposal.outcome] = proposal.size
+            if proposal.price <= 0 or proposal.reason != "ok":
                 desired[proposal.outcome] = []
                 continue
             bid = market.book(proposal.outcome).best_bid()
@@ -939,48 +960,187 @@ class Engine:
                     bid,
                     inside=self.config.slice_inside_tick,
                 )
+        rest_ms = int(self.config.min_order_rest_seconds) * 1000
+        closing = self._in_close_improve(market)
         for order in list(self.state.orders.values()):
             if (
                 order.market_id != market.market_id
                 or order.status not in WORKING_ORDER_STATUSES
             ):
                 continue
-            prices = desired.get(order.outcome, [])
             start = order.live_ts if order.live_ts is not None else order.submit_ts
-            if self.state.now_ms - start < MIN_ORDER_REST_MS:
-                # Every order rests at least MIN_ORDER_REST_MS before a requote.
+            if self.state.now_ms - start < rest_ms:
+                # Leave a resting sell alone until it has had time to fill.
                 continue
+            prices = desired.get(order.outcome, [])
             if prices:
                 diff = min(abs(order.price - item) for item in prices)
-                if diff == 0:
+                band = self._requote_band(market, order.outcome)
+                price_move = diff > band
+                # The close window intentionally walks the ask down by a tick.
+                if closing and diff >= market.tick_size:
+                    price_move = True
+                wanted = sized.get(order.outcome, order.remaining)
+                size_move = (
+                    abs(order.remaining - wanted) > self.config.requote_size_threshold
+                )
+                if not price_move and not size_move:
                     continue
-                big = diff >= market.tick_size * 2
-                start = order.live_ts if order.live_ts is not None else order.submit_ts
-                rested = self.state.now_ms - start >= MIN_ORDER_REST_MS
-                # Never reprice for a one-tick wiggle before the order has rested.
-                if not big and not rested:
+                if not self._requote_allowed(market):
                     continue
-                if not big and self._price_still_wanted(market, order.price, prices) and self.config.requote_min_ticks > 1:
-                    continue
-            if prices and not self._requote_allowed(market):
-                continue
             self._request_cancel(market, order, "requote")
             market.last_requote_ts = self.state.now_ms
-
-    def _price_still_wanted(
-        self, market: Market, price: Decimal, wanted: list[Decimal]
-    ) -> bool:
-        if not wanted:
-            return False
-        if self.config.requote_min_ticks <= 0:
-            return price in wanted
-        band = market.tick_size * self.config.requote_min_ticks
-        return any(abs(price - item) < band for item in wanted)
 
     def _requote_allowed(self, market: Market) -> bool:
         return (
             self.state.now_ms
             >= market.last_requote_ts + self.config.requote_min_interval_ms
+        )
+
+    def _rested_ms(self, order: Order) -> int:
+        start = order.live_ts if order.live_ts is not None else order.submit_ts
+        return max(0, self.state.now_ms - int(start))
+
+    def _record_mid(self, market: Market, outcome: str) -> None:
+        book = market.book(outcome)
+        bid, ask = book.best_bid(), book.best_ask()
+        if bid is None or ask is None or ask <= bid:
+            return
+        window = int(self.config.requote_vol_window_ms) or 30_000
+        samples = self.mid_samples.setdefault((market.market_id, outcome), [])
+        samples.append((self.state.now_ms, (bid + ask) / 2))
+        cutoff = self.state.now_ms - window
+        drop = 0
+        for ts, _mid in samples:
+            if ts < cutoff:
+                drop += 1
+            else:
+                break
+        if drop:
+            del samples[:drop]
+        if len(samples) > 240:
+            del samples[: len(samples) - 240]
+
+    def _mid_stdev(self, market: Market, outcome: str) -> Decimal:
+        window = int(self.config.requote_vol_window_ms)
+        if window <= 0:
+            return ZERO
+        cutoff = self.state.now_ms - window
+        vals = [
+            px
+            for ts, px in self.mid_samples.get((market.market_id, outcome), [])
+            if ts >= cutoff
+        ]
+        count = len(vals)
+        if count < 2:
+            return ZERO
+        mean = sum(vals, ZERO) / Decimal(count)
+        var = sum((item - mean) ** 2 for item in vals) / Decimal(count)
+        if var <= 0:
+            return ZERO
+        return var.sqrt()
+
+    def _requote_band(self, market: Market, outcome: str) -> Decimal:
+        """Replace only when the target moved more than this far."""
+        band = market.tick_size * 2
+        if self.config.requote_vol_k > 0:
+            widened = self.config.requote_vol_k * self._mid_stdev(market, outcome)
+            if widened > band:
+                band = widened
+        return band
+
+    def _preclose_ms(self, market: Market) -> int:
+        """When this session's quotes are pulled for the close or the next split."""
+        stop = market.end_ts_ms - int(self.config.stop_quoting_before_expiry_ms)
+        lead = int(self.config.pre_split_lead_ms)
+        if lead > 0:
+            lead_stop = market.end_ts_ms - lead
+            if lead_stop < stop:
+                stop = lead_stop
+        return stop
+
+    def _in_close_improve(self, market: Market) -> bool:
+        seconds = int(self.config.close_improve_seconds)
+        if seconds <= 0:
+            return False
+        deadline = self._preclose_ms(market)
+        start = deadline - seconds * 1000
+        return start <= self.state.now_ms < deadline
+
+    def _min_sell_price(
+        self, market: Market, outcome: str, size: Decimal, bid: Decimal
+    ) -> Optional[Decimal]:
+        """Lowest tick that still clears the loss floor for ``size``."""
+        tick = market.tick_size
+        if tick <= 0 or size <= 0:
+            return None
+        low = ceil_tick(max(self.config.min_price, bid + tick), tick)
+        pair = pair_min_price(market, outcome, self.config)
+        if pair is not None:
+            paired = ceil_tick(pair, tick)
+            if paired > low:
+                low = paired
+        high = qdown(self.config.max_price, tick)
+        if high < low or not self._size_ok(market, outcome, high, size, False):
+            return None
+        steps = int((high - low) / tick)
+        left = 0
+        right = steps
+        best = steps
+        while left <= right:
+            mid = (left + right) // 2
+            px = low + tick * mid
+            if self._size_ok(market, outcome, px, size, False):
+                best = mid
+                right = mid - 1
+            else:
+                left = mid + 1
+        return low + tick * best
+
+    def _ease_for_close(self, market: Market, proposal: Proposal) -> Proposal:
+        """Walk a sell toward the bid near the close, never through the loss floor."""
+        if (
+            proposal.reason != "ok"
+            or proposal.price <= 0
+            or not self._in_close_improve(market)
+        ):
+            return proposal
+        bid = market.book(proposal.outcome).best_bid()
+        if bid is None:
+            return proposal
+        tick = market.tick_size
+        aggressive = bid + tick
+        if aggressive >= proposal.price:
+            return proposal
+        deadline = self._preclose_ms(market)
+        window_ms = int(self.config.close_improve_seconds) * 1000
+        if window_ms <= 0:
+            return proposal
+        elapsed = self.state.now_ms - (deadline - window_ms)
+        if elapsed < 0:
+            return proposal
+        if elapsed > window_ms:
+            elapsed = window_ms
+        progress = Decimal(elapsed) / Decimal(window_ms)
+        stepped = ceil_tick(
+            proposal.price - (proposal.price - aggressive) * progress, tick
+        )
+        if stepped < aggressive:
+            stepped = aggressive
+        floor_px = self._min_sell_price(
+            market, proposal.outcome, proposal.size, bid
+        )
+        if floor_px is not None and stepped < floor_px:
+            stepped = floor_px
+        if stepped <= bid or stepped >= 1 or stepped >= proposal.price:
+            return proposal
+        return Proposal(
+            outcome=proposal.outcome,
+            price=stepped,
+            size=proposal.size,
+            fair=proposal.fair,
+            required_edge=proposal.required_edge,
+            repair=proposal.repair,
         )
 
     def _place_proposals(self, market: Market, proposals: list[Proposal]) -> None:
@@ -1021,6 +1181,23 @@ class Engine:
         require_repair: bool,
     ) -> None:
         bid = market.book(proposal.outcome).best_bid()
+        forced = self.sell_floors.get((market.market_id, proposal.outcome))
+        if forced is not None and bid is not None and bid + market.tick_size < forced:
+            self.sell_floors.pop((market.market_id, proposal.outcome), None)
+            forced = None
+        if forced is not None and price < forced:
+            price = forced
+            if price >= 1 or price > self.config.max_price:
+                self._skip(market, "post_only_backoff", proposal.outcome)
+                return
+            proposal = Proposal(
+                outcome=proposal.outcome,
+                price=price,
+                size=proposal.size,
+                fair=proposal.fair,
+                required_edge=proposal.required_edge,
+                repair=proposal.repair,
+            )
         if bid is not None and price <= bid:
             # Post-only SELL must rest above the best bid; never cross.
             price = bid + market.tick_size
@@ -1326,12 +1503,21 @@ class Engine:
             order.cancel_ready_ts = self.state.now_ms + self.state.cancel_latency_ms
         else:
             order.cancel_ready_ts = None
+        rested = self._rested_ms(order)
         self._emit(
             kind="cancel_request",
             market=market,
             order=order,
             size=order.remaining,
             reason=reason,
+        )
+        self._emit(
+            kind="order_cancelled",
+            market=market,
+            order=order,
+            size=order.remaining,
+            reason=reason,
+            detail=f"rested_ms={rested}",
         )
 
     def _working(self, market: Market, outcome: Optional[str] = None) -> list[Order]:
@@ -1471,20 +1657,38 @@ class Engine:
         self.state.seen_trade_ids.add(trade_id)
         self._apply_fill(market, order, size, synthetic=False, source="exchange")
 
-    def reject_live_order(self, order, reason: str) -> None:
+    def note_post_reject(self, order, reason: str) -> None:
+        """Drop a refused order. A post-only cross is retried one tick higher."""
+        text = str(reason or "no order id")
+        if is_post_only_cross(text):
+            market = self.state.markets.get(order.market_id)
+            if market is not None:
+                bumped = order.price + market.tick_size
+                if bumped < 1:
+                    key = (order.market_id, order.outcome)
+                    prev = self.sell_floors.get(key)
+                    if prev is None or bumped > prev:
+                        self.sell_floors[key] = bumped
+            # Do not pause the market: the next tick posts the less aggressive price.
+            self.reject_live_order(order, text, pause=False)
+            return
+        self.reject_live_order(order, text, pause=True)
+
+    def reject_live_order(self, order, reason: str, *, pause: bool = True) -> None:
         """The exchange refused an order: drop it without touching inventory."""
+        text = str(reason or "exchange_rejected")
         order.status = "rejected"
         order.remaining = ZERO
         market = self.state.markets.get(order.market_id)
-        if market is not None:
+        if pause and market is not None:
             # Pause briefly so a refused order is not re-posted in a tight loop.
             market.pause_until_ms = self.state.now_ms + REJECT_PAUSE_MS
         self._emit(
             kind="order_rejected",
-            market=self.state.markets.get(order.market_id),
+            market=market,
             order=order,
-            reason="exchange_rejected",
-            detail=str(reason)[:200],
+            reason="post_only_cross" if is_post_only_cross(text) else "exchange_rejected",
+            detail=f"rested_ms={self._rested_ms(order)}; {text[:160]}",
         )
 
     def _on_reconcile(self, event: dict) -> None:
@@ -1495,6 +1699,14 @@ class Engine:
         # Queued orders are not required on the exchange. A live order missing
         # remotely, or a remote id we never recorded, stops quoting.
         remote_set = {str(item) for item in remote}
+        if self.config.live:
+            # A post that never received an id is not an open order. Drop it
+            # before the diff, or a 4xx looks like a local/remote mismatch.
+            for order in list(self.state.orders.values()):
+                if order.status == "live" and not order.exchange_id:
+                    self.reject_live_order(
+                        order, "no exchange order id", pause=False
+                    )
         known = set()
         local = set()
         owner = {}
@@ -1550,11 +1762,10 @@ class Engine:
                 if kind == "local" and ident in owner:
                     hit.add(owner[ident].market_id)
                 else:
+                    # An unknown remote id is cancelled and forgotten. It does
+                    # not stop quoting on every open market.
                     self._ignored_remote.add(ident)
                     self.stray_remote_cancels.append(ident)
-                    for market in self.state.markets.values():
-                        if market.status not in ("redeemed", "resolved"):
-                            hit.add(market.market_id)
             for market_id in hit:
                 market = self.state.markets.get(market_id)
                 if market is None:

@@ -58,5 +58,10 @@
     "clip_size":  "30",
     "split_clip":  "30",
     "requote_min_ticks":  2,
-    "requote_min_interval_ms":  2000
+    "requote_min_interval_ms":  2000,
+    "min_order_rest_seconds":  20,
+    "requote_vol_k":  "1",
+    "requote_vol_window_ms":  30000,
+    "requote_size_threshold":  "1",
+    "close_improve_seconds":  90
 }

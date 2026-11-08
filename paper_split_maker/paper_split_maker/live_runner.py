@@ -19,6 +19,8 @@ from paper_split_maker.chain_data import (
 )
 from paper_split_maker.config import Config
 from paper_split_maker.credentials import Credentials
+from paper_split_maker.engine import is_post_only_cross
+from paper_split_maker.live_clob import http_status
 from paper_split_maker.feeds import describe_user_subscribe
 from paper_split_maker.logs import write_summary
 from paper_split_maker.session import open_engine
@@ -96,9 +98,13 @@ def run_confirmed_live(
                     "event_id": f"reconcile-{int(now * 1000)}",
                 }
             )
-            if engine.state.mismatch_stop or engine.state.killed:
-                notes.append("stopped on reconcile or kill")
+            if engine.state.killed:
+                notes.append("stopped on kill")
                 break
+            if engine.state.mismatch_stop:
+                # Reconcile and post errors stay on the affected orders.
+                notes.append("reconcile mismatch contained; continuing")
+                engine.state.mismatch_stop = False
             _send_new_quotes(engine, client, post_only_sells, creds, notes)
             _flush_chain(engine, creds, notes)
             time.sleep(min(0.2, max(0.0, deadline - time.time())))
@@ -150,8 +156,17 @@ def _send_new_quotes(engine, client, post_only_sells, creds, notes: list[str]) -
             ],
         )
     except Exception as exc:
-        notes.append(creds.redact(f"post failed: {exc}"))
-        engine.state.mismatch_stop = True
+        message = creds.redact(str(exc))
+        notes.append(f"post failed: {message}")
+        status = http_status(exc)
+        refused = (status is not None and 400 <= status < 500) or is_post_only_cross(
+            str(exc)
+        )
+        if refused:
+            for item in pending:
+                _reject_quote(engine, item["order"], str(exc), creds, notes)
+        else:
+            notes.append("post error was not a 4xx; retrying without stopping")
         return
     if not isinstance(results, list):
         results = [results]
@@ -159,16 +174,20 @@ def _send_new_quotes(engine, client, post_only_sells, creds, notes: list[str]) -
     for item, result in zip(pending, results):
         ident = ""
         error = ""
+        status = None
         if isinstance(result, dict):
             ident = str(result.get("orderID") or result.get("id") or "")
             error = str(result.get("errorMsg") or result.get("error") or "")
+            status = result.get("status") or result.get("status_code")
             if result.get("success") is False and not error:
                 error = "order not accepted"
+        elif result is None:
+            error = "empty post result"
         item["order"].sent = True
-        if error or not ident:
+        client_error = isinstance(status, int) and 400 <= status < 500
+        if error or not ident or client_error:
             # The exchange did not take this order. It must not count as resting.
-            engine.reject_live_order(item["order"], error or "no order id")
-            notes.append(creds.redact(f"order rejected: {error or 'no order id'}"))
+            _reject_quote(engine, item["order"], error or "no order id", creds, notes)
             continue
         item["order"].exchange_id = ident
         market = engine.state.markets[item["order"].market_id]
@@ -194,6 +213,16 @@ def _send_new_quotes(engine, client, post_only_sells, creds, notes: list[str]) -
             reason="order_ack",
             detail=str(ack_ms),
         )
+
+
+def _reject_quote(engine, order, reason: str, creds, notes: list[str]) -> None:
+    # Persist the rejection immediately. The next engine event clears _batch.
+    pending = list(engine._batch)
+    engine._batch = []
+    engine.note_post_reject(order, reason)
+    engine._finish()
+    engine._batch = pending
+    notes.append(creds.redact(f"order rejected: {reason}"))
 
 
 def _send_cancels(engine, client, creds, notes: list[str]) -> None:
@@ -237,6 +266,10 @@ def _poll_public(
     now_s = stamp // 1000
     window = (now_s // 300) * 300
     next_open = window + 300
+    current_slug = f"btc-updown-5m-{window}"
+    if current_slug not in engine.state.markets and _market_by_slug(engine, current_slug) is None:
+        _note_skipped_start(engine, current_slug, notes)
+    _forget_missed_sessions(engine, stamp, notes)
     if stamp >= next_open * 1000 - config.pre_split_lead_ms:
         # Free the ending session before discovery, or the new market is
         # refused by the loss floor while the old sell is still working.
@@ -406,6 +439,10 @@ def _consider_pre_split(
     window = (stamp // 1000 // 300) * 300
     next_open = window + 300
     slug = f"btc-updown-5m-{next_open}"
+    if stamp >= next_open * 1000:
+        # This session has started. Never split it on the way in; the
+        # following window is handled once it is the upcoming one.
+        return
     if stamp >= next_open * 1000 - config.pre_split_lead_ms:
         _flatten_for_rollover(engine, next_open, stamp, lead_ms=config.pre_split_lead_ms)
     existing = _market_by_slug(engine, slug)
@@ -497,6 +534,11 @@ def _consider_pre_split(
     sent.add(slug)
     sent.add(market.market_id)
     engine.split_sent = sent
+    if stamp < next_open * 1000:
+        joined = getattr(engine, "preopen_joined", set())
+        joined.add(slug)
+        joined.add(market.market_id)
+        engine.preopen_joined = joined
     if settled:
         ready = getattr(engine, "split_settled", set())
         ready.add(slug)
@@ -507,23 +549,66 @@ def _consider_pre_split(
     notes.append(f"split submitted for {slug}")
 
 
-def _candidate_slugs(config, now_s: int, max_markets: int) -> list[str]:
-    """Current window plus the next one.
+def _note_skipped_start(engine, slug: str, notes: list[str]) -> None:
+    seen = getattr(engine, "skipped_started", set())
+    if slug in seen:
+        return
+    seen.add(slug)
+    engine.skipped_started = seen
+    notes.append(f"{slug} already started; waiting for the next session")
 
-    A placeholder slug such as ``no-initial-discovery-placeholder`` is ignored
-    so a run can skip an already-started session without disabling discovery.
-    Explicit ``btc-updown-5m-<unix>`` slugs are honored.
+
+def _forget_missed_sessions(engine, stamp: int, notes: list[str]) -> None:
+    """Drop a market whose open passed without a pre-open split.
+
+    A session loaded during its lead is kept. One that is already open when
+    first seen, or that we failed to split before the open, is not quoted.
+    """
+    joined = getattr(engine, "preopen_joined", set())
+    for market in list(engine.state.markets.values()):
+        open_s = _slug_open_s(market.slug)
+        if open_s is None:
+            open_s = _slug_open_s(market.market_id)
+        if open_s is None or stamp < open_s * 1000:
+            continue
+        if market.market_id in joined or (market.slug and market.slug in joined):
+            continue
+        if (
+            market.gross_split > 0
+            or market.pending_split > 0
+            or engine._working(market)
+        ):
+            continue
+        if market.status != "open":
+            continue
+        market.status = "expired_unresolved"
+        market.reserve_active = False
+        _note_skipped_start(engine, market.slug or market.market_id, notes)
+    for market_id in engine.retire_finished():
+        notes.append(f"skipped started session {market_id}")
+
+
+def _candidate_slugs(config, now_s: int, max_markets: int) -> list[str]:
+    """Only the next window, which has not started yet.
+
+    The window containing ``now_s`` is already open. Startup and every
+    rollover wait for the following session and split it during its pre-open
+    lead. A placeholder slug is ignored. Explicit ``btc-updown-5m-<unix>``
+    slugs are honored only while they are still in the future; ``_load_market``
+    drops one that has already started.
     """
     configured = []
+    now_ms = int(now_s) * 1000
     for slug in config.market_slugs:
         text = str(slug)
         tail = text.rsplit("-", 1)[-1]
         if text.startswith("btc-updown-5m-") and tail.isdigit():
-            configured.append(text)
+            if int(tail) * 1000 > now_ms:
+                configured.append(text)
     if configured:
         return configured[: max(max_markets, 1)]
     start = (int(now_s) // 300) * 300
-    return [f"btc-updown-5m-{start}", f"btc-updown-5m-{start + 300}"]
+    return [f"btc-updown-5m-{start + 300}"]
 
 
 def _slug_open_s(slug: str):
@@ -546,7 +631,7 @@ def _market_by_slug(engine, slug: str, condition_id: str = ""):
 def _will_quote(engine, market, stamp: int) -> bool:
     if market is None or market.status != "open":
         return False
-    if market.session_stopped or engine.state.killed or engine.state.mismatch_stop:
+    if market.session_stopped or engine.state.killed:
         return False
     stop_at = market.end_ts_ms - engine.config.stop_quoting_before_expiry_ms
     return stamp < stop_at
@@ -594,6 +679,9 @@ def _load_market(
     if existing is None and open_s is not None:
         open_ms = open_s * 1000
         if not allow_started and stamp >= open_ms:
+            # Started when first seen: do not split or quote it. The next
+            # unstarted window is the one this run may enter.
+            _note_skipped_start(engine, slug, notes)
             return False
         # Do not track a window several minutes early. It is loaded in the
         # pre-split lead, which is also when it can be funded and quoted.
