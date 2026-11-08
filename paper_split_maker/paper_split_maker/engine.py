@@ -22,12 +22,13 @@ from paper_split_maker.models import (
     Order,
     State,
 )
-from paper_split_maker.quotes import Proposal, propose
+from paper_split_maker.quotes import Proposal, ladder_prices, propose
 from paper_split_maker.risk import (
     assert_ledger_invariants,
     best_case_equity,
     net_maker_proceeds,
     reserved,
+    session_loss,
     worst_case_equity,
 )
 from paper_split_maker.store import load_state, save_state
@@ -82,6 +83,18 @@ class Engine:
         """Resume a ledger. Config cannot loosen the locked floor or risk parameters."""
         config.validate()
         state = load_state(state_path)
+        # A restart may tighten these caps. It may not remove or raise them.
+        if state.session_max_loss > 0 and (
+            config.session_max_loss == 0
+            or config.session_max_loss > state.session_max_loss
+        ):
+            pass
+        else:
+            state.session_max_loss = config.session_max_loss
+        if config.max_pair_loss < state.max_pair_loss:
+            state.max_pair_loss = config.max_pair_loss
+        config.max_pair_loss = state.max_pair_loss
+        config.session_max_loss = state.session_max_loss
         engine = cls(state, config, state_path, log_dir, resumed=True)
         engine.assert_invariants()
         return engine
@@ -141,6 +154,14 @@ class Engine:
             "trade": self._on_trade,
             "resolution": self._on_resolution,
             "feed": self._on_feed,
+            "reference": self._on_reference,
+            "user_fill": self._on_user_fill,
+            "reconcile": self._on_reconcile,
+            "kill": self._on_kill,
+            "split_pending": self._on_split_pending,
+            "split_confirmed": self._on_split_confirmed,
+            "split_abandoned": self._on_split_abandoned,
+            "taker_repair": self._on_taker_repair,
             "adverse_fill": self._on_adverse_fill,
             "split": self._on_split,
             "merge": self._on_merge,
@@ -431,6 +452,7 @@ class Engine:
         book.ts_ms = stamp
         book.digest = digest
         book.uncertain = False
+        self._note_volatility(market)
         self._emit(kind="book", market=market, outcome=outcome, reason="ok")
 
     def _on_trade(self, event: dict) -> None:
@@ -565,8 +587,12 @@ class Engine:
         market.net_cash_flow += proceeds
         if order.outcome == "up":
             market.up -= size
+            market.sold_up_shares += size
+            market.sold_up_proceeds += proceeds
         else:
             market.down -= size
+            market.sold_down_shares += size
+            market.sold_down_proceeds += proceeds
         order.remaining -= size
         if order.remaining <= 0:
             order.remaining = ZERO
@@ -688,6 +714,14 @@ class Engine:
     def _decide(self, market: Market) -> None:
         if market.status == "redeemed":
             return
+        self._check_kill_switch()
+        if self.state.killed or self.state.mismatch_stop:
+            self._cancel_market(
+                market, "killed" if self.state.killed else "reconcile_mismatch"
+            )
+            self._merge_free(market, "stop")
+            self._skip(market, "killed" if self.state.killed else "reconcile_mismatch")
+            return
         self._refresh_expiry(market)
         if market.status == "resolved":
             self._cancel_market(market, "resolved")
@@ -707,6 +741,16 @@ class Engine:
             self._cancel_market(market, "near_expiry")
             self._merge_free(market, "near_expiry")
             self._skip(market, "near_expiry")
+            return
+        if market.session_stopped or self._session_capped(market):
+            self._cancel_market(market, "session_max_loss")
+            self._merge_free(market, "session_max_loss")
+            market.session_stopped = True
+            self._skip(market, "session_max_loss")
+            return
+        if self.state.now_ms < market.pause_until_ms:
+            self._cancel_market(market, "vol_pause")
+            self._skip(market, "vol_pause")
             return
         if not market.accepting_orders:
             self._cancel_market(market, "not_accepting")
@@ -765,43 +809,108 @@ class Engine:
         self._split(market, amount, "auto_split")
 
     def _sync_working(self, market: Market, proposals: list[Proposal]) -> None:
-        by_outcome = {item.outcome: item for item in proposals}
+        desired: dict[str, list[Decimal]] = {}
+        for proposal in proposals:
+            if proposal.price <= 0:
+                desired[proposal.outcome] = []
+                continue
+            bid = market.book(proposal.outcome).best_bid()
+            if self.config.slices_per_side <= 1:
+                desired[proposal.outcome] = [proposal.price]
+            else:
+                desired[proposal.outcome] = ladder_prices(
+                    proposal.price,
+                    market.tick_size,
+                    self.config.slices_per_side,
+                    bid,
+                    inside=self.config.slice_inside_tick,
+                )
         for order in list(self.state.orders.values()):
             if (
                 order.market_id != market.market_id
                 or order.status not in WORKING_ORDER_STATUSES
             ):
                 continue
-            proposal = by_outcome.get(order.outcome)
-            if proposal is None or proposal.price <= 0 or proposal.price != order.price:
-                self._request_cancel(market, order, "requote")
+            prices = desired.get(order.outcome, [])
+            if self._price_still_wanted(market, order.price, prices):
+                continue
+            if not self._requote_allowed(market):
+                continue
+            self._request_cancel(market, order, "requote")
+            market.last_requote_ts = self.state.now_ms
+
+    def _price_still_wanted(
+        self, market: Market, price: Decimal, wanted: list[Decimal]
+    ) -> bool:
+        if not wanted:
+            return False
+        if self.config.requote_min_ticks <= 0:
+            return price in wanted
+        band = market.tick_size * self.config.requote_min_ticks
+        return any(abs(price - item) < band for item in wanted)
+
+    def _requote_allowed(self, market: Market) -> bool:
+        return (
+            self.state.now_ms
+            >= market.last_requote_ts + self.config.requote_min_interval_ms
+        )
 
     def _place_proposals(self, market: Market, proposals: list[Proposal]) -> None:
         for proposal in proposals:
             if proposal.reason != "ok":
                 continue
-            if self._working_outcome(market, proposal.outcome):
-                continue
             require_repair = self.at_cap()
-            size = self._largest_size(market, proposal, require_repair)
-            if size is None:
-                free = market.inventory(proposal.outcome) - reserved(
-                    self.state, market, proposal.outcome
-                )
-                minimum = (
-                    market.min_order_size
-                    if market.min_order_size > self.config.min_order_size
-                    else self.config.min_order_size
-                )
-                if free < minimum:
-                    reason = "insufficient_inventory"
-                elif require_repair:
-                    reason = "not_risk_reducing"
-                else:
-                    reason = "risk_floor"
-                self._skip(market, reason, proposal.outcome)
+            if self.config.slices_per_side <= 1:
+                if self._working_outcome(market, proposal.outcome):
+                    continue
+                self._place_one(market, proposal, proposal.price, require_repair)
                 continue
-            self._commit_order(market, proposal, size, risk_reducing=require_repair)
+            bid = market.book(proposal.outcome).best_bid()
+            for price in ladder_prices(
+                proposal.price,
+                market.tick_size,
+                self.config.slices_per_side,
+                bid,
+                inside=self.config.slice_inside_tick,
+            ):
+                if self._working_at(market, proposal.outcome, price):
+                    continue
+                sized = Proposal(
+                    outcome=proposal.outcome,
+                    price=price,
+                    size=proposal.size,
+                    fair=proposal.fair,
+                    required_edge=proposal.required_edge,
+                    repair=proposal.repair,
+                )
+                self._place_one(market, sized, price, require_repair)
+
+    def _place_one(
+        self,
+        market: Market,
+        proposal: Proposal,
+        price: Decimal,
+        require_repair: bool,
+    ) -> None:
+        size = self._largest_size(market, proposal, require_repair)
+        if size is None:
+            free = market.inventory(proposal.outcome) - reserved(
+                self.state, market, proposal.outcome
+            )
+            minimum = (
+                market.min_order_size
+                if market.min_order_size > self.config.min_order_size
+                else self.config.min_order_size
+            )
+            if free < minimum:
+                reason = "insufficient_inventory"
+            elif require_repair:
+                reason = "not_risk_reducing"
+            else:
+                reason = "risk_floor"
+            self._skip(market, reason, proposal.outcome)
+            return
+        self._commit_order(market, proposal, size, risk_reducing=require_repair)
 
     def _largest_size(
         self, market: Market, proposal: Proposal, require_repair: bool
@@ -1100,6 +1209,232 @@ class Engine:
 
     def _in_cooldown(self, market: Market) -> bool:
         return self.state.now_ms < market.last_action_ts + self.config.quote_cooldown_ms
+
+    def _session_capped(self, market: Market) -> bool:
+        cap = self.state.session_max_loss
+        if cap <= 0:
+            return False
+        return session_loss(self.state, market) >= cap
+
+    def _working_at(self, market: Market, outcome: str, price: Decimal) -> bool:
+        return any(
+            order.outcome == outcome and order.price == price
+            for order in self._working(market, outcome)
+        )
+
+    def _check_kill_switch(self) -> None:
+        path = self.config.kill_switch_file
+        if not path or self.state.killed:
+            return
+        if Path(path).exists():
+            self.state.killed = True
+            self._emit(kind="kill", reason="kill_switch_file")
+
+    def _note_volatility(self, market: Market) -> None:
+        book = market.book("up")
+        bid, ask = book.best_bid(), book.best_ask()
+        if bid is None or ask is None:
+            return
+        mid = (bid + ask) / 2
+        move = self.config.vol_pause_move
+        window = self.config.vol_pause_window_ms
+        if (
+            move > 0
+            and window > 0
+            and market.last_mid is not None
+            and self.state.now_ms - market.last_mid_ts <= window
+            and abs(mid - market.last_mid) > move
+        ):
+            market.pause_until_ms = self.state.now_ms + max(
+                self.config.vol_pause_hold_ms, window
+            )
+            self._emit(
+                kind="vol_pause",
+                market=market,
+                reason="outcome_jump",
+                detail=money(mid),
+            )
+        market.last_mid = mid
+        market.last_mid_ts = self.state.now_ms
+
+    def _on_reference(self, event: dict) -> None:
+        try:
+            price = Decimal(str(event["price"]))
+        except (KeyError, ValueError, ArithmeticError):
+            self._emit(kind="reject", reason="bad_reference")
+            return
+        previous = self.state.btc_price
+        self.state.btc_price = price
+        self.state.btc_price_ts = self.state.now_ms
+        threshold = self.config.btc_pause_move
+        if previous is not None and threshold > 0 and abs(price - previous) > threshold:
+            hold = self.config.vol_pause_hold_ms or self.config.vol_pause_window_ms
+            for market in self.state.markets.values():
+                market.pause_until_ms = max(
+                    market.pause_until_ms, self.state.now_ms + hold
+                )
+            self._emit(kind="vol_pause", reason="btc_jump", detail=money(price))
+        else:
+            self._emit(kind="reference", reason="ok", detail=money(price))
+
+    def _on_user_fill(self, event: dict) -> None:
+        trade_id = str(event.get("trade_id") or "")
+        if not trade_id:
+            self._emit(kind="reject", reason="missing_trade_id")
+            return
+        if trade_id in self.state.seen_trade_ids:
+            self._emit(
+                kind="duplicate_trade", reason="duplicate_trade", detail=trade_id
+            )
+            return
+        order = self.state.orders.get(str(event.get("order_id") or ""))
+        if order is None or order.status not in WORKING_ORDER_STATUSES:
+            self.state.seen_trade_ids.add(trade_id)
+            self._emit(kind="trade_ignored", reason="unknown_order", detail=trade_id)
+            return
+        market = self.state.markets[order.market_id]
+        try:
+            size = qdown(Decimal(str(event["size"])), Decimal("0.000001"))
+        except (KeyError, ValueError, ArithmeticError):
+            self._emit(kind="reject", market=market, reason="bad_size")
+            return
+        if size <= 0 or size > order.remaining:
+            self.state.seen_trade_ids.add(trade_id)
+            self._emit(
+                kind="reject", market=market, order=order, size=size, reason="no_short"
+            )
+            return
+        self.state.seen_trade_ids.add(trade_id)
+        self._apply_fill(market, order, size, synthetic=False)
+
+    def _on_reconcile(self, event: dict) -> None:
+        remote = event.get("open_order_ids")
+        if not isinstance(remote, list):
+            self._emit(kind="reject", reason="bad_reconcile")
+            return
+        # Queued orders are not required on the exchange. A live order missing
+        # remotely, or a remote id we never recorded, stops quoting.
+        remote_set = {str(item) for item in remote}
+        known = set()
+        local = set()
+        for order in self.state.orders.values():
+            identity = order.exchange_id or order.order_id
+            known.add(identity)
+            if order.status == "live":
+                local.add(identity)
+        if remote_set - known or local - remote_set:
+            self.state.mismatch_stop = True
+            for market in list(self.state.markets.values()):
+                self._cancel_market(market, "reconcile_mismatch")
+            self._emit(kind="reconcile", reason="mismatch")
+            return
+        self._emit(kind="reconcile", reason="ok")
+
+    def _on_kill(self, event: dict) -> None:
+        self.state.killed = True
+        for market in list(self.state.markets.values()):
+            self._cancel_market(market, "kill")
+            self._merge_free(market, "kill")
+        self._emit(kind="kill", reason=str(event.get("reason") or "kill"))
+
+    def _on_split_pending(self, event: dict) -> None:
+        market = self._market(event)
+        if market is None:
+            return
+        try:
+            amount = qdown(Decimal(str(event["amount"])), Decimal("0.000001"))
+        except (KeyError, ValueError, ArithmeticError):
+            self._emit(kind="reject", market=market, reason="bad_size")
+            return
+        reserved_cash = sum(
+            (item.pending_split for item in self.state.markets.values()), Decimal("0")
+        )
+        if amount + reserved_cash > self.state.cash:
+            self._emit(
+                kind="reject", market=market, size=amount, reason="insufficient_cash"
+            )
+            return
+        if (
+            market.gross_split + market.pending_split + amount
+            > self.state.per_market_budget
+        ):
+            self._emit(
+                kind="quote_reject",
+                market=market,
+                size=amount,
+                reason="per_market_budget",
+            )
+            return
+        market.pending_split += amount
+        self._emit(
+            kind="split_pending", market=market, size=amount, reason="unconfirmed"
+        )
+
+    def _on_split_abandoned(self, event: dict) -> None:
+        market = self._market(event)
+        if market is None:
+            return
+        try:
+            amount = qdown(Decimal(str(event["amount"])), Decimal("0.000001"))
+        except (KeyError, ValueError, ArithmeticError):
+            self._emit(kind="reject", market=market, reason="bad_size")
+            return
+        if amount > market.pending_split:
+            self._emit(
+                kind="reject", market=market, size=amount, reason="unconfirmed_split"
+            )
+            return
+        market.pending_split -= amount
+        self._emit(kind="split_abandoned", market=market, size=amount, reason="timeout")
+
+    def _on_split_confirmed(self, event: dict) -> None:
+        market = self._market(event)
+        if market is None:
+            return
+        try:
+            amount = qdown(Decimal(str(event["amount"])), Decimal("0.000001"))
+        except (KeyError, ValueError, ArithmeticError):
+            self._emit(kind="reject", market=market, reason="bad_size")
+            return
+        if amount > market.pending_split:
+            self._emit(
+                kind="reject", market=market, size=amount, reason="unconfirmed_split"
+            )
+            return
+        market.pending_split -= amount
+        self._split(market, amount, "split_confirmed")
+
+    def _on_taker_repair(self, event: dict) -> None:
+        if not self.config.taker_repair:
+            self._emit(kind="reject", reason="taker_disabled")
+            return
+        market = self._market(event)
+        if market is None:
+            return
+        try:
+            size = qdown(Decimal(str(event["size"])), Decimal("0.000001"))
+            price = Decimal(str(event["price"]))
+        except (KeyError, ValueError, ArithmeticError):
+            self._emit(kind="reject", market=market, reason="bad_size")
+            return
+        if size * price > self.config.taker_repair_max_usdc:
+            self._emit(kind="reject", market=market, size=size, reason="taker_cap")
+            return
+        outcome = str(event.get("outcome") or "")
+        from paper_split_maker.quotes import pair_min_price
+
+        floor = pair_min_price(market, outcome, self.config)
+        if floor is not None and price < floor:
+            self._emit(kind="reject", market=market, price=price, reason="pair_floor")
+            return
+        self._emit(
+            kind="taker_repair",
+            market=market,
+            outcome=outcome,
+            size=size,
+            price=price,
+            reason="capped",
+        )
 
 
 def _jsonable(value):

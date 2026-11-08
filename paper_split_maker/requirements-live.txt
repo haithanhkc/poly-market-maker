@@ -1,0 +1,4 @@
+# Optional. Paper mode does not need these.
+py-clob-client-v2
+web3
+websockets

@@ -1,10 +1,13 @@
 [project]
 name = "paper-split-maker"
 version = "0.1.0"
-description = "Paper-only two-sided sell ledger for Polymarket BTC Up/Down markets"
+description = "Two-sided maker sell bot for Polymarket BTC Up/Down. Paper by default; live is opt-in."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
+
+[project.optional-dependencies]
+live = ["py-clob-client-v2", "web3", "websockets"]
 
 [project.scripts]
 paper-split-maker = "paper_split_maker.cli:main"

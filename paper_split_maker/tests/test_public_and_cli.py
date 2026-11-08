@@ -349,8 +349,19 @@ def test_cli_replay_refuses_unlabeled_scenario(tmp_path):
 
 
 def test_package_source_has_no_live_order_stack():
+    """The paper engine stays free of the trading stack. Live modules may import it."""
+    live_modules = {
+        "live_clob.py",
+        "live_runner.py",
+        "chain_send.py",
+        "credentials.py",
+    }
     banned = ("py_clob_client", "eth_account", "web3", 'method="POST"', "private_key")
     for path in (ROOT / "paper_split_maker").rglob("*.py"):
         text = path.read_text(encoding="utf-8")
+        if path.name in live_modules:
+            assert "print(self.private_key" not in text
+            assert "print(creds.private_key" not in text
+            continue
         for token in banned:
             assert token not in text, f"{path} contains {token}"

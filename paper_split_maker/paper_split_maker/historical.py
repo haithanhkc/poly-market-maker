@@ -889,3 +889,307 @@ def _ceil_tick(price: Decimal, tick: Decimal) -> Decimal:
 
 def _floor_tick(price: Decimal, tick: Decimal) -> Decimal:
     return qfloor(price, tick)
+
+
+def fetch_window(reader: PublicReadClient, window: int) -> Optional[dict]:
+    """One exact BTC 5-minute window. Missing or unresolved markets return None."""
+    slug = f"btc-updown-5m-{window}"
+    try:
+        payload = reader.discover_btc_updown(window, 1, [slug])
+    except PublicDataError:
+        return None
+    if not payload:
+        return None
+    gamma = _trim_gamma(payload[0])
+    condition = str(gamma.get("conditionId") or "")
+    tokens = _token_pair(gamma)
+    if not condition or tokens is None:
+        return None
+    start = window
+    end = window + 300
+    try:
+        prints, seeds = _collect_prints(reader, condition, tokens, start, end)
+        history = {
+            "up": _collect_history(reader, tokens[0], start, end),
+            "down": _collect_history(reader, tokens[1], start, end),
+        }
+        resolution = _trim_resolution(reader.fetch_resolution(condition))
+    except PublicDataError:
+        return None
+    opened = gamma_market_event(gamma, market_id=slug, synthetic=False)
+    if opened is None:
+        return None
+    if (
+        data_api_resolution_event(
+            {
+                "market_id": slug,
+                "condition_id": opened["condition_id"],
+                "up_index": opened["up_index"],
+                "down_index": opened["down_index"],
+            },
+            resolution,
+        )
+        is None
+    ):
+        return None
+    return {
+        "slug": slug,
+        "window_start": start,
+        "window_end": end,
+        "window_start_bkk": _bkk(start),
+        "window_end_bkk": _bkk(end),
+        "gamma": gamma,
+        "prints": prints,
+        "seed_prints": seeds,
+        "price_history": history,
+        "resolution": resolution,
+        "print_count": len(prints),
+        "seed_count": len(seeds),
+    }
+
+
+def session_distribution(pnls: list[Decimal]) -> dict:
+    if not pnls:
+        return {
+            "sessions": 0,
+            "best": "0",
+            "worst": "0",
+            "median": "0",
+            "losing_sessions": 0,
+            "max_session_loss": "0",
+        }
+    ordered = sorted(pnls)
+    count = len(ordered)
+    if count % 2:
+        median = ordered[count // 2]
+    else:
+        median = (ordered[count // 2 - 1] + ordered[count // 2]) / 2
+    worst = ordered[0]
+    return {
+        "sessions": count,
+        "best": money(ordered[-1]),
+        "worst": money(worst),
+        "median": money(median),
+        "losing_sessions": sum(1 for item in pnls if item < 0),
+        "max_session_loss": money(-worst if worst < 0 else Decimal("0")),
+    }
+
+
+def run_compare(
+    old_config: Config,
+    new_config: Config,
+    start_s: int,
+    end_s: int,
+    out_dir: Path,
+    client: Optional[PublicReadClient] = None,
+) -> dict:
+    """Replay every available BTC 5m window through the old and new paper logic.
+
+    Markets are fetched one at a time and not retained. The result is a
+    simulation on reconstructed books, not a live result.
+    """
+    reader = client or PublicReadClient(UrllibTransport(timeout=30))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    old = Engine.create(
+        old_config, out_dir / "old" / "state.json", out_dir / "old" / "logs"
+    )
+    new = Engine.create(
+        new_config, out_dir / "new" / "state.json", out_dir / "new" / "logs"
+    )
+    old.mode = "historical-replay"
+    new.mode = "historical-replay"
+    # The day is hundreds of thousands of events. Persisting the ledger on
+    # each one does not change the decisions and dominates the runtime.
+    for engine in (old, new):
+        engine.persist_each_event = False
+        engine.writer = None
+    rows = []
+    windows = list(range((start_s // 300) * 300, end_s, 300))
+    for window, market in _iter_windows(
+        windows, reader if client is not None else None
+    ):
+        print(f"compare btc-updown-5m-{window}", flush=True)
+        if market is None:
+            print("  skipped", flush=True)
+            continue
+        for event in _market_events(market):
+            old.handle_event(event)
+            new.handle_event(event)
+        old_stats = _market_stats(old, market["slug"])
+        new_stats = _market_stats(new, market["slug"])
+        rows.append(
+            {
+                "slug": market["slug"],
+                "window_start_bkk": market["window_start_bkk"],
+                "print_count": market["print_count"],
+                "old_pnl": old_stats["realized_pnl"],
+                "new_pnl": new_stats["realized_pnl"],
+                "old_splits": old_stats["splits"],
+                "new_splits": new_stats["splits"],
+                "old_fills_up": old_stats["fills_up"],
+                "old_fills_down": old_stats["fills_down"],
+                "new_fills_up": new_stats["fills_up"],
+                "new_fills_down": new_stats["fills_down"],
+                "old_quotes": old_stats["quotes_submitted"],
+                "new_quotes": new_stats["quotes_submitted"],
+                "old_rebate_estimate": old_stats["rebate_estimate_unguaranteed"],
+                "new_rebate_estimate": new_stats["rebate_estimate_unguaranteed"],
+                "old_maker_fills": _maker_fills(old, market["slug"]),
+                "new_maker_fills": _maker_fills(new, market["slug"]),
+            }
+        )
+        _write_compare(out_dir, _compare_report(old, new, rows))
+        _drop_settled_orders(old)
+        _drop_settled_orders(new)
+        print(
+            f"  old {old_stats['realized_pnl']} new {new_stats['realized_pnl']}",
+            flush=True,
+        )
+    report = _compare_report(old, new, rows)
+    _write_compare(out_dir, report)
+    return report
+
+
+def _iter_windows(windows: list[int], reader: Optional[PublicReadClient]):
+    """Yield windows in order. Live fetches overlap; an injected reader stays serial."""
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    if reader is not None:
+        for window in windows:
+            yield window, fetch_window(reader, window)
+        return
+
+    def job(window: int) -> Optional[dict]:
+        local = PublicReadClient(UrllibTransport(timeout=30))
+        try:
+            return fetch_window(local, window)
+        except Exception as exc:
+            print(f"  fetch error {window}: {exc}", flush=True)
+            return None
+
+    ahead = 4
+    with ThreadPoolExecutor(max_workers=ahead) as pool:
+        pending: dict[Future, int] = {}
+        index = 0
+        while index < min(ahead, len(windows)):
+            pending[pool.submit(job, windows[index])] = windows[index]
+            index += 1
+        for window in windows:
+            future = next(item for item, stamp in pending.items() if stamp == window)
+            market = future.result()
+            del pending[future]
+            if index < len(windows):
+                pending[pool.submit(job, windows[index])] = windows[index]
+                index += 1
+            yield window, market
+
+
+def _drop_settled_orders(engine: Engine) -> None:
+    settled = {
+        market.market_id
+        for market in engine.state.markets.values()
+        if market.status == "redeemed"
+    }
+    for order_id, order in list(engine.state.orders.items()):
+        if order.market_id in settled and order.status not in WORKING_ORDER_STATUSES:
+            del engine.state.orders[order_id]
+
+
+def _compare_report(old: Engine, new: Engine, rows: list[dict]) -> dict:
+    def pnl_of(key: str) -> list[Decimal]:
+        return [D(row[key]) for row in rows]
+
+    def fills(prefix: str) -> Decimal:
+        total = Decimal("0")
+        for row in rows:
+            total += D(row[f"{prefix}_fills_up"]) + D(row[f"{prefix}_fills_down"])
+        return total
+
+    def splits(prefix: str) -> Decimal:
+        return sum((D(row[f"{prefix}_splits"]) for row in rows), Decimal("0"))
+
+    old_fills = fills("old")
+    new_fills = fills("new")
+    old_splits = splits("old")
+    new_splits = splits("new")
+    return {
+        "label": "reconstructed-from-public-prints",
+        "simulation": True,
+        "not_evidence_of_live_results": True,
+        "disclaimer": (
+            "Simulation on reconstructed books from public prints for every "
+            "available BTC 5-minute window in the day. Not evidence of live fills, "
+            "rebates, or a guaranteed loss bound."
+        ),
+        "sessions": len(rows),
+        "old": {
+            "net_pnl_usdc": money(old.state.realized_pnl),
+            "rebate_estimate_unguaranteed": money(old.state.rebate_estimate),
+            "fill_shares": money(old_fills),
+            "split_shares": money(old_splits),
+            "fill_rate": _rate(old_fills, old_splits),
+            "maker_fill_orders": sum(
+                int(row.get("old_maker_fills") or 0) for row in rows
+            ),
+            "distribution": session_distribution(pnl_of("old_pnl")),
+        },
+        "new": {
+            "net_pnl_usdc": money(new.state.realized_pnl),
+            "rebate_estimate_unguaranteed": money(new.state.rebate_estimate),
+            "fill_shares": money(new_fills),
+            "split_shares": money(new_splits),
+            "fill_rate": _rate(new_fills, new_splits),
+            "maker_fill_orders": sum(
+                int(row.get("new_maker_fills") or 0) for row in rows
+            ),
+            "logic": "pair floor 0.01, four slices, requote at one tick, session cap 1",
+            "distribution": session_distribution(pnl_of("new_pnl")),
+        },
+        "markets": rows,
+    }
+
+
+def _rate(fills: Decimal, splits: Decimal) -> str:
+    if splits <= 0:
+        return "0"
+    return money(qfloor(fills / (splits * 2), Decimal("0.0001")))
+
+
+def _maker_fills(engine: Engine, slug: str) -> int:
+    return sum(
+        1
+        for order in engine.state.orders.values()
+        if order.market_id == slug and order.remaining < order.size
+    )
+
+
+def _write_compare(out_dir: Path, report: dict) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "compare.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    path = out_dir / "compare.csv"
+    fields = [
+        "slug",
+        "window_start_bkk",
+        "print_count",
+        "old_pnl",
+        "new_pnl",
+        "old_splits",
+        "new_splits",
+        "old_fills_up",
+        "old_fills_down",
+        "new_fills_up",
+        "new_fills_down",
+        "old_quotes",
+        "new_quotes",
+        "old_rebate_estimate",
+        "new_rebate_estimate",
+        "old_maker_fills",
+        "new_maker_fills",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(report["markets"])

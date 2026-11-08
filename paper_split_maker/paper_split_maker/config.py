@@ -74,6 +74,31 @@ class Config:
     paper_max_markets: int = 1
     poll_interval_seconds: float = 2.0
     market_slugs: tuple[str, ...] = ()
+    # Live is off unless this is true AND the CLI flag AND the risk confirmation.
+    live: bool = False
+    # 1 keeps the original one-order-per-side behavior. Live configs raise it.
+    slices_per_side: int = 1
+    slice_inside_tick: bool = False
+    # >= 1 disables the pair floor. The live example sets 0.01.
+    max_pair_loss: Decimal = Decimal("1")
+    # 0 disables the per-session cap. The aggregate floor still applies.
+    session_max_loss: Decimal = Decimal("0")
+    # 0 cancels on any price change. 1 cancels only after a full tick.
+    requote_min_ticks: int = 0
+    requote_min_interval_ms: int = 0
+    # 0 disables the pause. Otherwise pull quotes when the mid jumps.
+    vol_pause_move: Decimal = Decimal("0")
+    vol_pause_window_ms: int = 0
+    vol_pause_hold_ms: int = 0
+    btc_pause_move: Decimal = Decimal("0")
+    pre_split_lead_ms: int = 45_000
+    split_confirm_timeout_ms: int = 30_000
+    taker_repair: bool = False
+    taker_repair_max_usdc: Decimal = Decimal("0")
+    kill_switch_file: str = ""
+    gas_limit: int = 500_000
+    max_fee_gwei: Decimal = Decimal("0")
+    priority_fee_gwei: Decimal = Decimal("0")
 
     def validate(self) -> None:
         if self.initial_capital <= 0:
@@ -132,6 +157,29 @@ class Config:
             raise ConfigError("max_open_markets must be at least 1")
         if self.split_clip <= 0 or self.min_pair_inventory < 0:
             raise ConfigError("split settings are invalid")
+        if self.slices_per_side < 1:
+            raise ConfigError("slices_per_side must be at least 1")
+        if self.max_pair_loss < 0:
+            raise ConfigError("max_pair_loss must be non-negative")
+        if self.session_max_loss < 0:
+            raise ConfigError("session_max_loss must be non-negative")
+        if self.requote_min_ticks < 0 or self.requote_min_interval_ms < 0:
+            raise ConfigError("requote limits must be non-negative")
+        if self.vol_pause_move < 0 or self.btc_pause_move < 0:
+            raise ConfigError("pause thresholds must be non-negative")
+        if (
+            self.vol_pause_window_ms < 0
+            or self.vol_pause_hold_ms < 0
+            or self.pre_split_lead_ms < 0
+            or self.split_confirm_timeout_ms < 0
+        ):
+            raise ConfigError("timing settings must be non-negative")
+        if self.taker_repair_max_usdc < 0:
+            raise ConfigError("taker_repair_max_usdc must be non-negative")
+        if self.gas_limit < 0 or self.max_fee_gwei < 0 or self.priority_fee_gwei < 0:
+            raise ConfigError("gas settings must be non-negative")
+        if self.taker_repair and self.taker_repair_max_usdc <= 0:
+            raise ConfigError("taker repair needs a positive USDC cap")
         if self.paper_duration_seconds <= 0:
             raise ConfigError("paper_duration_seconds must be positive")
         if self.paper_max_markets < 1:
@@ -157,7 +205,7 @@ def q_loss_budget(capital: Decimal, fraction: Decimal) -> Decimal:
 
 def _forbidden(key: str) -> bool:
     lowered = key.strip().lower().replace("-", "_")
-    if lowered in {"live", "sign", "signing"}:
+    if lowered in {"sign", "signing"}:
         return True
     return any(part in lowered for part in _FORBIDDEN_PARTS)
 
@@ -187,6 +235,13 @@ _DECIMAL_FIELDS = {
     "freeze_band",
     "split_clip",
     "min_pair_inventory",
+    "max_pair_loss",
+    "session_max_loss",
+    "vol_pause_move",
+    "btc_pause_move",
+    "taker_repair_max_usdc",
+    "max_fee_gwei",
+    "priority_fee_gwei",
 }
 _INT_FIELDS = {
     "stale_after_ms",
@@ -198,11 +253,22 @@ _INT_FIELDS = {
     "max_open_markets",
     "paper_duration_seconds",
     "paper_max_markets",
+    "slices_per_side",
+    "requote_min_ticks",
+    "requote_min_interval_ms",
+    "vol_pause_window_ms",
+    "vol_pause_hold_ms",
+    "pre_split_lead_ms",
+    "split_confirm_timeout_ms",
+    "gas_limit",
 }
 _BOOL_FIELDS = {
     "trade_through_fills",
     "auto_split",
     "merge_when_idle",
+    "live",
+    "slice_inside_tick",
+    "taker_repair",
 }
 
 
@@ -241,6 +307,10 @@ def config_from_mapping(data: dict) -> Config:
             ):
                 raise ConfigError("market_slugs must be a list of strings")
             kwargs[key] = tuple(value)
+        elif key == "kill_switch_file":
+            if not isinstance(value, str):
+                raise ConfigError("kill_switch_file must be a string")
+            kwargs[key] = value
         else:
             raise ConfigError(f"unhandled config key: {key}")
     cfg = Config(**kwargs)

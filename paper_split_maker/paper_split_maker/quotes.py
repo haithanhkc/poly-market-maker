@@ -29,6 +29,53 @@ class Proposal:
     reason: str = "ok"
 
 
+def pair_min_price(market: Market, outcome: str, config: Config):
+    """Minimum offer for the unfilled side of shares already sold.
+
+    A max_pair_loss of 1 or more turns the floor off. Fees already taken out
+    of sale proceeds lower the average price and raise this floor.
+    """
+    if config.max_pair_loss >= 1:
+        return None
+    if outcome == "down":
+        shares = market.sold_up_shares
+        proceeds = market.sold_up_proceeds
+        other = market.sold_down_shares
+    else:
+        shares = market.sold_down_shares
+        proceeds = market.sold_down_proceeds
+        other = market.sold_up_shares
+    if shares <= 0 or shares <= other:
+        return None
+    average = proceeds / shares
+    floor = Decimal("1") - average - config.max_pair_loss
+    if floor <= 0:
+        return None
+    return floor
+
+
+def ladder_prices(
+    base: Decimal,
+    tick: Decimal,
+    count: int,
+    bid: Decimal | None,
+    *,
+    inside: bool,
+) -> list[Decimal]:
+    """Maker prices: optional one tick inside the spread, then the base and above."""
+    prices: list[Decimal] = []
+    if inside and bid is not None and count > 1:
+        inside_px = bid + tick
+        if bid < inside_px < base and inside_px < 1:
+            prices.append(inside_px)
+    price = base
+    while len(prices) < count and price < 1:
+        if price not in prices and price > (bid or Decimal("0")):
+            prices.append(price)
+        price += tick
+    return prices
+
+
 def _no(reason: str, outcome: str) -> Proposal:
     return Proposal(
         outcome=outcome,
@@ -60,10 +107,16 @@ def propose(state: State, market: Market, outcome: str, config: Config) -> Propo
     fair = (bid + ask) / 2
     raw = ask if ask >= fair + required_edge else fair + required_edge
     price = ceil_tick(raw, market.tick_size)
+    floor = pair_min_price(market, outcome, config)
+    if floor is not None and price < floor:
+        price = ceil_tick(floor, market.tick_size)
     if price < config.min_price or price > config.max_price or price >= 1:
-        return _no("no_edge", outcome)
+        return _no("pair_floor" if floor is not None else "no_edge", outcome)
     if price <= bid:
-        return _no("would_cross", outcome)
+        return _no(
+            "pair_floor" if floor is not None and price <= bid else "would_cross",
+            outcome,
+        )
     repair = self_inv > other_inv
     if adverse > 0:
         size = config.clip_size - config.skew_size_per_share * adverse

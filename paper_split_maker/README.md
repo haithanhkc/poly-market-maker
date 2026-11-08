@@ -103,7 +103,19 @@ Khóa sau được ghi vào `state.json` lúc tạo sổ. Lần chạy sau có t
 
 Chiến thuật mặc định thêm: clip 5, min size 5, tick 0.01, `min_edge` 0.01, `skew_size_per_share` 1, `skew_edge_per_share` 0.002, spread tối đa 0.10, sổ lệnh cũ sau 3000 ms, lệch đồng hồ chấp nhận 5000 ms (`clock_skew_ms`, vì timestamp sàn có thể đi trước máy local), cooldown 500 ms, ngừng chào 20000 ms trước giờ kết thúc, `SPLIT` mỗi lần tối đa 20 khi kho cặp tự do dưới 10. Vòng paper lấy đồng hồ phiên làm mốc sổ cái; timestamp sàn chỉ dùng để biết sổ lệnh và print cũ hay mới.
 
-Rebate maker **không** vào cash, không vào realized PnL, không vào sàn. Ước tính riêng, không được đảm bảo: `rebate_share × size × published_taker_fee_rate × p × (1 − p)` với 0.20 và 0.07. Chương trình rebate thật chia một pool, và kỳ nghỉ phí có thể trả 0. Con số này chỉ để tách biệt, không phải tiền sẽ nhận.
+Rebate maker **không** vào cash, không vào realized PnL, không vào sàn. Ước tính riêng, không được đảm bảo: `rebate_share × size × published_taker_fee_rate × p × (1 − p)` với 0.20 và 0.07. Tài liệu phí và maker rebate hiện tại (crypto) dùng fee rate 0.07, maker fee 0, và hoàn khoảng 20% pool phí cho maker theo trọng số đường cong phí, trả hằng ngày bằng pUSD, ngưỡng trả tối thiểu 1 USDC. Pool thanh khoản crypto theo TWAP của tháng 8 năm 2026 đã kết thúc và không được tính. Ước tính của bot là 20% phí tương đương trên chính lệnh của mình, không phải phần pool thật, nên có thể cao hơn tiền nhận được, và bằng 0 trong kỳ nghỉ phí.
+
+### Sàn giá cặp và lỗ một phiên
+
+Hai khóa này được ghi vào sổ và lần chạy sau chỉ được siết, không được nới.
+
+`max_pair_loss` mặc định trong code là 1, tức tắt, để các bài giấy cũ không đổi. Cấu hình live mẫu đặt 0.01. Khi một phía đã bán với giá trung bình có trọng số (tiền thực nhận, đã trừ phí maker) là `p`, phía còn lại của số share tương ứng không được chào dưới `1 − p − max_pair_loss`. Đặt 0 nghĩa là hòa hoặc lời trên cặp đó. Nếu mức sàn vượt bid hoặc ra ngoài khoảng giá, bot không chào phía đó. Đây là ràng buộc trên giá chào, không phải lệnh mua để gỡ.
+
+`session_max_loss` mặc định 0, tức tắt. Khi lớn hơn 0, lỗ đã ghi sổ của riêng phiên đó chạm ngưỡng thì bot hủy, merge phần cặp chưa giữ chỗ, và không vào lại phiên đó. Cách tính: tiền đã vào sổ cộng số cặp còn cầm; phần lệch một phía được coi là mất nếu phía đó thua. Lệnh chưa khớp không ăn trần này — chúng vẫn nằm trong sàn 3% của cả tài khoản. `0` trên một sổ đã khóa một ngưỡng dương không xóa ngưỡng. Sàn 3% không bị phiên mới xóa.
+
+`requote_min_ticks` (mặc định 0, tức đổi giá là hủy) và `requote_min_interval_ms` giới hạn hủy/đặt lại. `vol_pause_move` tạm dừng chào khi mid Up nhảy quá ngưỡng trong `vol_pause_window_ms`. `btc_pause_move` làm điều tương tự với giá BTC tham chiếu. Tạm dừng chỉ hủy hoặc nới, không bán tháo.
+
+Trước giờ mở, `pre_split_lead_ms` (mặc định 45000) là lúc bot được phép tách kho phiên kế nếu còn trong sàn. Kho chỉ được chào sau khi giao dịch tách đã xác nhận. Quá `split_confirm_timeout_ms` sau giờ mở mà chưa xác nhận thì bỏ phiên đó, không chào từ kho chưa về. Cuối phiên: ngừng chào, hủy, đợi xác nhận hủy, merge cặp còn tự do, giữ phần dư tới khi có payout chính thức rồi redeem. Không có lệnh bán xuyên sổ để xả hàng. `taker_repair` mặc định tắt; bật thì phải có `taker_repair_max_usdc` và giá vẫn phải tôn trọng sàn cặp.
 
 Best-case trong summary là cận trên trong mô hình (khớp phía thua, giữ phía thắng, phí maker cấu hình, không cộng rebate). Nó không phải định giá thị trường.
 
@@ -142,7 +154,7 @@ Kết quả được nhận chỉ khi một trong các điều sau đúng:
 
 Giá 0.99 không phải kết quả. Payout lạ, hai nguồn mâu thuẫn, hoặc fixture gắn vào thị trường public thì không `REDEEM`.
 
-Vòng paper dùng REST có `duration-seconds` và `max-markets`. Không có daemon vô hạn trong CLI. Khung websocket công khai (`book`, `last_trade_price`, `market_resolved`) có bộ chuẩn hóa để replay offline; vòng paper không mở websocket.
+Vòng paper dùng REST có `duration-seconds` và `max-markets`. Không có daemon vô hạn trong CLI. Khung websocket công khai (`book`, `price_change`, `best_bid_ask`) có bộ chuẩn hóa. Phiên live, khi được bật đủ ba cổng, dùng websocket thị trường `wss://ws-subscriptions-clob.polymarket.com/ws/market` và websocket tài khoản `wss://ws-subscriptions-clob.polymarket.com/ws/user`. Nếu gói `websockets` chưa cài, vòng live vẫn hỏi sổ bằng REST và vẫn đọc lệnh mở qua client chính thức. Giá BTC tham chiếu, nếu bật `btc_pause_move`, lấy mid của bookTicker công khai `wss://stream.binance.com:9443/ws/btcusdt@bookTicker`. Đó chỉ là tín hiệu tạm dừng, không phải giá tất toán.
 
 ## Sổ sách và log
 
@@ -203,13 +215,89 @@ Mã thoát 2 là lỗi cấu hình hoặc lỗi đọc file. Phiên paper kết 
 
 Các số sau là quan sát người dùng cung cấp về một ví khác, không phải kết quả của bot này và không phải dữ liệu khớp cho lệnh của chúng ta: 570 lệnh SELL, 27 vòng đã đóng, dòng tiền ròng +3.42914214, 14 vòng dương và 13 vòng âm, tốt nhất +15.12, tệ nhất −14.55, trước chi phí và rebate bên ngoài. Đó là dòng tiền theo vòng, không phải suất sinh lời tài khoản. Trong cửa sổ 7 ngày ví đó chủ yếu maker nhưng có 43 lệnh taker, nên không phải lúc nào cũng maker. Hành vi được dùng làm gợi ý cấu trúc (SPLIT cân, bán clip, MERGE phần chưa đụng, để phần dư tất toán), không phải để suy một công thức fair-value.
 
+## Chạy trên máy của bạn
+
+Python 3.10 trở lên. Cài từ thư mục `paper_split_maker`:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m pip install -r requirements-live.txt
+```
+
+`requirements-live.txt` là tùy chọn: `py-clob-client-v2` (client CLOB V2 chính thức; gói V1 không còn được sàn nhận), `web3`, và `websockets`. Chế độ paper không cần chúng.
+
+Sao chép `.env.example` thành `.env` trên máy bạn và điền giá trị. `.env` đã nằm trong `.gitignore`. Tiến trình chỉ đọc tên biến môi trường sau, và không in khóa:
+
+| Biến | Ý nghĩa |
+| --- | --- |
+| `POLY_PRIVATE_KEY` | khóa ký. Không bao giờ ghi vào log, state, hay zip |
+| `POLY_FUNDER` | địa chỉ đang giữ pUSD và token. Với ví email/Safe/deposit thì đây là ví quỹ, không phải địa chỉ ký |
+| `POLY_SIGNATURE_TYPE` | 0 EOA, 1 POLY_PROXY (Magic/email), 2 GNOSIS_SAFE, 3 POLY_1271 (deposit wallet) |
+| `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_API_PASSPHRASE` | để trống thì client chính thức tự suy ra cred L2 |
+| `RELAYER_API_KEY`, `RELAYER_API_KEY_ADDRESS` | chỉ cho ví không phải EOA, khi bạn tự ký yêu cầu relayer |
+
+Collateral hiện tại là pUSD `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` (6 số lẻ), không còn là USDC.e. Bot chỉ gửi `approve` khi allowance đang thiếu. Thị trường version v1 dùng adapter `0xAdA100Db00Ca00073811820692005400218FcE1f` (NegRisk: `0xadA2005600Dec949baf300f4C6120000bDB6eAab`). Version v2 dùng Router `0x12121212006e4CD160D18e3f00711DA5c3372600`. Gas cấu hình bằng `gas_limit`, `max_fee_gwei`, `priority_fee_gwei`. Để 0 thì phí gas lấy theo node.
+
+Ví EOA được gửi tách/gộp/redeem từ tiến trình này. Ví proxy, Safe và deposit wallet cần chữ ký relayer chính thức (`https://relayer-v2.polymarket.com/submit`, đợi `STATE_CONFIRMED`). Bản này từ chối gửi một body chưa ký, nên với ba loại ví đó bạn chưa nên bật live cho đến khi yêu cầu đã được ký bằng client relayer chính thức.
+
+Ba cổng, thiếu một cổng là tiến trình từ chối và không gửi gì:
+
+1. file cấu hình có `"live": true` (mẫu `config.live.example.json`);
+2. cờ CLI `--live`;
+3. `--yes-i-understand-live-risk`, hoặc gõ đúng câu `I understand live trading can lose money` trên terminal tương tác.
+
+```bash
+# giấy, không đọc khóa, không gửi lệnh
+python3 -m paper_split_maker paper \
+  --config config.example.json --duration-seconds 20 --max-markets 1 --out /tmp/psm-paper
+
+# dry-run: đủ ba cổng, dùng dữ liệu public, chỉ in lệnh và giao dịch SẼ gửi
+python3 -m paper_split_maker live \
+  --config config.live.example.json --out /tmp/psm-dry \
+  --duration-seconds 60 --max-markets 1 \
+  --live --dry-run --yes-i-understand-live-risk
+
+# live thật. Không chạy lệnh này trên máy không phải của bạn.
+python3 -m paper_split_maker live \
+  --config config.live.example.json --out /tmp/psm-live \
+  --duration-seconds 300 --max-markets 1 \
+  --live --yes-i-understand-live-risk
+```
+
+Banner lúc mở in địa chỉ quỹ (công khai), loại chữ ký, sàn lỗ, trần phiên, và sàn cặp. Không in khóa. Lệnh bán là post-only GTC qua `post_order` / `post_orders` (tối đa 15). Heartbeat CLOB khoảng 5 giây; mất heartbeat thì sàn tự hủy lệnh. Thoát hoặc thấy file `kill_switch_file` thì `cancel_all` rồi dừng. Lệch sổ với lệnh đang mở, hoặc đứt feed, cũng hủy hết và ngừng chào. File kill mẫu trong cấu hình live là `kill.switch` ngay thư mục làm việc.
+
+`fill_mode` của cấu hình live mẫu là `none`: khớp live chỉ đến từ kênh user hoặc `size_matched` của lệnh mình, không lấy tape công khai làm khớp của mình. Log có dòng `latency` cho thời gian ack đặt và ack hủy.
+
+### Việc nên làm trước khi bật live
+
+- Chạy paper, rồi dry-run, với cùng cấu hình rủi ro.
+- Bắt đầu bằng vốn nhỏ. Sàn 3% và trần phiên là mô hình worst-case, không phải bảo hiểm.
+- Để `taker_repair` tắt.
+- Kiểm tra pUSD, allowance, và loại ví. Không chạy chung một tài khoản với bot khác: lệnh mở lạ bị coi là lệch sổ và bị hủy.
+- Biết cách tạo file kill switch trước khi vào lệnh.
+- Đọc banner và đối chiếu địa chỉ quỹ.
+
+So sánh logic cũ và mới trên cả ngày (mô phỏng, không phải live):
+
+```bash
+python3 -m paper_split_maker historical-compare \
+  --old-config config.historical200.json \
+  --new-config config.historical200.sliced.json \
+  --out /tmp/psm-compare
+```
+
+Logic cũ là một lệnh mỗi phía, tách 5, không sàn cặp. Logic mới tách 20, bốn clip, sàn cặp 0.01, trần phiên 1 USDC, requote khi giá đi ít nhất một tick. Cùng vốn 200 và sàn 194. Size tối thiểu của các thị trường này là 5, nên "nhiều clip" cần kho lớn hơn 5.
+
 ## Hạn chế đã biết
 
-- Không mô phỏng drawdown mark-to-market, trượt giá ngoài print, gas, reorg, hay oracle sai.
+- Không mô phỏng drawdown mark-to-market, trượt giá ngoài print, reorg, hay oracle sai. Gas live là phí thật trên Polygon, không nằm trong sàn 3%.
+- Độ trễ mạng, websocket và thời gian vào block không bị mô hình chặn. `ack_latency_ms` 250 là giả định giấy, không phải số đo trên máy bạn.
+- Sàn 3% của vốn đầu và trần lỗ từng phiên là cận worst-case trong sổ. Chúng không được hợp đồng hay sàn cưỡng chế, và không bảo hiểm oracle, gas, hay lệnh đã khớp ngoài mô hình.
+- Ước tính hàng chờ không phải vị trí thật trong sổ.
 - Hàng chờ giấy là giả định (khối đang thấy tại mức giá, cộng một lượng cấu hình). Tape công khai không cho biết vị trí thật của một lệnh chưa từng được gửi.
-- Chỉ một lệnh bán hiệu lực mỗi phía. Không có lưới nhiều mức.
+- Mặc định vẫn một lệnh bán mỗi phía (`slices_per_side` = 1) để các phiên giấy cũ không đổi. Đặt lớn hơn 1 thì mỗi phía được cắt thành nhiều clip, cách nhau một tick, có thể thêm một tick bên trong spread nếu `slice_inside_tick` là true và post-only còn đứng được. Không có clip nhỏ hơn `min_order_size` của thị trường.
 - Sổ 5 phút thường rất rộng; khi spread vượt 0.10 bot đứng ngoài. Đó là cố ý.
-- `MERGE` và `SPLIT` là bút toán. Không có giao dịch on-chain.
+- Ở chế độ paper, `MERGE` và `SPLIT` là bút toán. Ở chế độ live, ví EOA gửi giao dịch on-chain; ví proxy, Safe và deposit wallet không được gửi yêu cầu relayer chưa ký.
 - Làm tròn size và cash về 0.000001. Size lệnh mặc định về bước 0.01.
 - Rebate là ước tính thô, có thể cao hoặc thấp hơn tiền thật, và có thể bằng không.
 - Sửa tay `state.json` làm hỏng sổ. Chương trình từ chối chạy nếu worst-case đã dưới sàn.
@@ -217,4 +305,4 @@ Các số sau là quan sát người dùng cung cấp về một ví khác, khô
 
 ## Kiểm thử
 
-`python3 -m pytest -q` trong thư mục này. Bộ test offline gồm thị trường đối xứng, sổ 0.99/0.01 rồi đảo chiều, khớp một phía, khớp treo đồng thời, trễ hủy, lỗ realized cộng dồn, trần nhiều thị trường, phí và dự phòng, MERGE đụng hàng đang giữ chỗ, feed cũ, nối lại kèm sự kiện trùng, khởi động lại, hết hạn chưa có kết quả, và một vòng hành động ngẫu nhiên có hạt. Không bài nào trong số đó chứng minh lỗ live ≤ 3%.
+`python3 -m pytest -q` trong thư mục này. Bộ test offline gồm thị trường đối xứng, sổ 0.99/0.01 rồi đảo chiều, khớp một phía, khớp treo đồng thời, trễ hủy, lỗ realized cộng dồn, trần nhiều thị trường, phí và dự phòng, MERGE đụng hàng đang giữ chỗ, feed cũ, nối lại kèm sự kiện trùng, khởi động lại, hết hạn chưa có kết quả, một vòng hành động ngẫu nhiên có hạt, cộng thêm sàn giá cặp, cắt clip theo min size và tick, trần lỗ một phiên, tách kho chưa xác nhận, lệch đối soát, ngắt kết nối và kill switch, khớp trong lúc hủy, khớp user trùng hoặc lệch thứ tự, và ba cổng bật live. Không bài nào chứng minh lỗ live ≤ 3% hay ≤ trần phiên.

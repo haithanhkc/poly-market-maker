@@ -100,6 +100,23 @@ def market_contribution(
     return value
 
 
+def session_loss(state: State, market: Market) -> Decimal:
+    """Loss already booked in one market, ignoring orders that have not filled.
+
+    A fresh split is zero because the two sides still pair. After a sale, the
+    paired remainder is still worth one USDC per share and the unpaired
+    remainder is worth nothing if its side loses. Unfilled quotes stay under
+    the account floor; they do not spend this per-session budget.
+    """
+    if market.status == "redeemed":
+        return -market.net_cash_flow if market.net_cash_flow < 0 else ZERO
+    paired = market.up if market.up < market.down else market.down
+    terminal = market.net_cash_flow + paired
+    if terminal >= 0:
+        return ZERO
+    return -terminal
+
+
 def worst_case_equity(
     state: State, extra: list[Order] | None = None, cash_delta: Decimal = ZERO
 ) -> Decimal:

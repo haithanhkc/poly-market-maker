@@ -34,6 +34,7 @@ class Transport(Protocol):
 class UrllibTransport:
     def __init__(self, timeout: float = 8.0):
         self.timeout = timeout
+        self._opener = urllib.request.build_opener()
 
     def get_json(self, url: str) -> object:
         return self._read(url, parse_float=None)
@@ -51,7 +52,7 @@ class UrllibTransport:
             method="GET",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self._opener.open(request, timeout=self.timeout) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             raise PublicDataError(
