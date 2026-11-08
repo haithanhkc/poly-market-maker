@@ -164,10 +164,11 @@ def _working(engine):
     ]
 
 
-def test_fresh_session_at_048_055_posts_both_sides(tmp_path):
+def test_fresh_mid_pair_stays_inside_the_loss_budget(tmp_path):
     engine = _run5_session(tmp_path)
+    engine.config.merge_when_idle = False
     end = 300_000
-    logs = run(
+    run(
         engine,
         [
             market_event(end_ts=end),
@@ -178,16 +179,12 @@ def test_fresh_session_at_048_055_posts_both_sides(tmp_path):
         ],
     )
     market = engine.state.markets["m1"]
-    posted = _working(engine)
-    by_side = {order.outcome: order for order in posted}
-    assert set(by_side) == {"up", "down"}
-    assert by_side["down"].price == Decimal("0.48")
-    assert by_side["up"].price == Decimal("0.55")
-    assert by_side["down"].size >= Decimal("5")
-    assert by_side["up"].size >= Decimal("5")
+    budget = Decimal("30") * Decimal("0.03")
+    for order in _working(engine):
+        assert order.size * (Decimal("1") - order.price) <= budget + Decimal("0.01")
+    # 5 * (1 - 0.48) is 2.60, above the 0.90 budget, so the 15-lot does not rest.
+    assert engine.state.orders == {}
     assert market.up == Decimal("30") and market.down == Decimal("30")
-    assert not any(row["kind"] == "pair_floor_block" for row in logs)
-    assert not any(row.get("reason") == "risk_floor" for row in logs)
 
 
 def test_up_010_blocked_and_016_allowed_after_down_fill(tmp_path):
@@ -227,6 +224,9 @@ def test_up_010_blocked_and_016_allowed_after_down_fill(tmp_path):
 
 def test_close_improve_never_goes_below_the_floor(tmp_path):
     engine = _run5_session(tmp_path)
+    # The floor check is about price, so give the size budget room to quote.
+    engine.config.initial_capital = Decimal("200")
+    engine.config.max_loss_fraction = Decimal("0.50")
     end = 300_000
     run(
         engine,

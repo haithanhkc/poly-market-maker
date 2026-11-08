@@ -207,11 +207,9 @@ def best_case_equity(state: State) -> Decimal:
 
 
 def assert_ledger_invariants(state: State) -> None:
-    worst = worst_case_equity(state)
-    if worst < state.loss_floor:
-        raise InvariantError(
-            f"worst-case equity {worst} is below the locked floor {state.loss_floor}"
-        )
+    # A fill can leave worst-case equity under the floor. That blocks new
+    # splits and buys. It must not raise inside a tick, or the bot freezes
+    # and cannot sell, cancel, requote, merge, or redeem what it already holds.
     if state.cash < 0:
         raise InvariantError("cash is negative")
     if state.loss_floor > state.initial_capital:

@@ -179,20 +179,14 @@ def binding_sell_floor(
 
 
 def unpaired_sell_room(
-    market: Market,
-    outcome: str,
-    price: Decimal,
-    config: Config,
-    *,
-    paired: bool = False,
+    market: Market, outcome: str, price: Decimal, config: Config
 ):
     """How many shares of ``outcome`` may still be sold.
 
-    Shares that catch up to the other side are always allowed. Extra one-sided
-    size is capped by ``max_unpaired_fraction`` of the split and by the loss
-    budget ``initial_capital * max_loss_fraction``. A planned pair that already
-    clears ``pair_min_edge`` is not charged that budget: the other side is not
-    worth zero. The fraction cap still applies.
+    Fresh one-sided size is capped by ``max_unpaired_fraction`` of the split
+    and by ``initial_capital * max_loss_fraction``. A planned pair does not
+    waive that budget: one filled leg can be the winner. Shares that catch up
+    to the other side's fills complete that leg and stay allowed.
     """
     split = market.gross_split
     if split <= 0:
@@ -233,7 +227,7 @@ def unpaired_sell_room(
             existing = ZERO
     remain = budget - existing
     loss_per = Decimal("1") - price
-    if paired or loss_per <= 0:
+    if loss_per <= 0:
         loss_room = fraction_room
     elif remain <= 0:
         loss_room = ZERO
@@ -348,13 +342,7 @@ def propose(state: State, market: Market, outcome: str, config: Config) -> Propo
     free = self_inv - reserved(state, market, outcome)
     if size > free:
         size = free
-    room = unpaired_sell_room(
-        market,
-        outcome,
-        price,
-        config,
-        paired=pair_plan_covers(state, market, outcome, price, config),
-    )
+    room = unpaired_sell_room(market, outcome, price, config)
     if room is not None and size > room:
         size = room
     size = qdown(size, config.order_size_quantum)

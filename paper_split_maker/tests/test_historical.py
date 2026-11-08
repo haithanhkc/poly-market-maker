@@ -168,14 +168,15 @@ def test_historical_replay_queue_fill_floor_and_decline(tmp_path: Path):
     assert report["counterfactual"] is True
     by_slug = {row["slug"]: row for row in report["markets"]}
     assert by_slug["m1"]["fills_up"] == "2"
-    assert by_slug["m1"]["fills_down"] == "0"
+    # The unfilled side is sold within the leg window instead of held to resolution.
+    assert by_slug["m1"]["fills_down"] == "2"
     assert by_slug["m1"]["splits"] == "5"
     assert by_slug["m1"]["declined_to_trade"] is False
-    assert Decimal(by_slug["m1"]["realized_pnl"]) == Decimal("-0.9")
+    assert Decimal(by_slug["m1"]["realized_pnl"]) == Decimal("-0.02")
     assert by_slug["m2"]["declined_to_trade"] is True
     assert by_slug["m2"]["splits"] == "0"
     assert report["markets_declined"] == 1
-    assert Decimal(report["net_pnl_usdc"]) == Decimal("-0.9")
+    assert Decimal(report["net_pnl_usdc"]) == Decimal("-0.02")
     assert Decimal(report["worst_case_equity_minimum"]) >= Decimal("194")
     assert Decimal(report["rebate_estimate_unguaranteed"]) > 0
     assert report["rebate_included_in_pnl"] is False

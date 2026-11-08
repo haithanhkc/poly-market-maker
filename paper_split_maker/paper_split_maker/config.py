@@ -110,6 +110,12 @@ class Config:
     max_runtime_seconds: int = 2400
     # Give up on a redeem after this many attempts and leave it for redeem-pending.
     redeem_max_attempts: int = 5
+    # split_sell quotes both outcomes after a split. buy_pair_arb buys both
+    # asks only when they sum to 1 - pair_min_edge, then merges.
+    entry_mode: str = "split_sell"
+    # After one sell leg fills, this many seconds to work the other leg at
+    # the bid before crossing it or merging the matched remainder.
+    leg_unwind_seconds: int = 5
     # 0 disables the pause. Otherwise pull quotes when the mid jumps.
     vol_pause_move: Decimal = Decimal("0")
     vol_pause_window_ms: int = 0
@@ -209,6 +215,10 @@ class Config:
             raise ConfigError("max_runtime_seconds must be positive")
         if self.redeem_max_attempts < 1:
             raise ConfigError("redeem_max_attempts must be at least 1")
+        if self.entry_mode not in ("split_sell", "buy_pair_arb"):
+            raise ConfigError("entry_mode must be split_sell or buy_pair_arb")
+        if self.leg_unwind_seconds < 0:
+            raise ConfigError("leg_unwind_seconds must be non-negative")
         if self.requote_vol_window_ms < 0:
             raise ConfigError("requote_vol_window_ms must be non-negative")
         if self.vol_pause_move < 0 or self.btc_pause_move < 0:
@@ -314,6 +324,7 @@ _INT_FIELDS = {
     "split_lead_seconds",
     "max_runtime_seconds",
     "redeem_max_attempts",
+    "leg_unwind_seconds",
     "vol_pause_window_ms",
     "vol_pause_hold_ms",
     "pre_split_lead_ms",
@@ -356,6 +367,8 @@ def config_from_mapping(data: dict) -> Config:
                 raise ConfigError(f"{key} is not a boolean")
             kwargs[key] = value
         elif key == "fill_mode":
+            kwargs[key] = str(value)
+        elif key == "entry_mode":
             kwargs[key] = str(value)
         elif key == "poll_interval_seconds":
             kwargs[key] = float(value)

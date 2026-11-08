@@ -70,5 +70,7 @@
     "stale_feed_seconds":  10,
     "split_lead_seconds":  45,
     "max_runtime_seconds":  2400,
-    "redeem_max_attempts":  5
+    "redeem_max_attempts":  5,
+    "entry_mode":  "split_sell",
+    "leg_unwind_seconds":  5
 }

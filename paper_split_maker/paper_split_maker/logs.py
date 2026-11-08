@@ -101,8 +101,8 @@ def build_summary(
     return {
         "mode": mode,
         "resumed": resumed,
-        "live_orders": False,
-        "paper_only": True,
+        "live_orders": mode == "live",
+        "paper_only": mode != "live",
         "synthetic_data_present": any(
             market.synthetic for market in state.markets.values()
         ),

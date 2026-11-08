@@ -153,7 +153,60 @@ def post_only_sells(client, orders: list[dict]) -> list[dict]:
 
 
 def cancel_all(client) -> None:
-    client.cancel_all()
+    fn = getattr(client, "cancel_all", None)
+    if fn is None:
+        raise RuntimeError("client has no cancel_all")
+    fn()
+
+
+def post_taker_sells(client, orders: list[dict]) -> list[dict]:
+    """Sell at the bid. Used only to finish a leg that the other side already filled."""
+    return _post_orders(client, orders, side_name="SELL", taker=True)
+
+
+def post_fok_buys(client, orders: list[dict]) -> list[dict]:
+    """Buy both asks as fill-or-kill. A miss does not rest."""
+    return _post_orders(client, orders, side_name="BUY", taker=True)
+
+
+def _post_orders(client, orders: list[dict], *, side_name: str, taker: bool) -> list[dict]:
+    from py_clob_client_v2 import (
+        OrderArgs,
+        OrderType,
+        PartialCreateOrderOptions,
+        Side,
+    )
+
+    order_type = OrderType.GTC
+    if taker:
+        order_type = getattr(OrderType, "FAK", None) or getattr(OrderType, "FOK", order_type)
+    side = Side.BUY if side_name == "BUY" else Side.SELL
+    out = []
+    for order in orders:
+        try:
+            args = OrderArgs(
+                token_id=str(order["token_id"]),
+                price=float(order["price"]),
+                size=float(order["size"]),
+                side=side,
+            )
+            options = PartialCreateOrderOptions(
+                tick_size=str(order.get("tick_size") or "0.01")
+            )
+            signed = client.create_order(args, options)
+            if taker:
+                out.append(client.post_order(signed, order_type))
+            else:
+                out.append(client.post_order(signed, order_type, post_only=True))
+        except Exception as exc:
+            out.append(
+                {
+                    "success": False,
+                    "errorMsg": str(exc),
+                    "status": http_status(exc) or "",
+                }
+            )
+    return out
 
 
 def heartbeat(client, heartbeat_id: str | None):

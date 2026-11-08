@@ -26,11 +26,14 @@ from paper_split_maker.quotes import (
     Proposal,
     binding_sell_floor,
     ladder_prices,
+    maker_sell_price,
+    pair_edge_floor,
     propose,
 )
 from paper_split_maker.risk import (
     assert_ledger_invariants,
     best_case_equity,
+    conservative_fee,
     net_maker_proceeds,
     reserved,
     session_loss,
@@ -87,6 +90,10 @@ class Engine:
         self._skip_once: set[tuple[str, str, str]] = set()
         self.mode = "library"
         self.chain_outbox: list[dict] = []
+        self.buy_outbox: list[dict] = []
+        self.marketable_ids: set[str] = set()
+        self.leg_since: dict[str, int] = {}
+        self.buy_fail_outcome: str = ""
         # Long replays flush the ledger once at the end. Live paper mode keeps
         # the default and writes state after every event.
         self.persist_each_event = True
@@ -342,6 +349,7 @@ class Engine:
         if market_id and str(market_id) not in self.state.markets:
             self._emit(kind="reject", reason="unknown_market", detail=str(market_id))
             return
+        self._check_realized_loss()
         for market in markets:
             self._decide(market)
 
@@ -393,12 +401,12 @@ class Engine:
                 kind="reject", market=existing, reason="market_identity_conflict"
             )
             return
-        # Ended markets can no longer be quoted, so they do not hold a slot.
+        # A finished flat session, including one whose merge is still on chain,
+        # does not hold a slot. An open window we have not traded yet does.
         open_count = sum(
             1
             for item in self.state.markets.values()
-            if item.status != "redeemed"
-            and item.status not in ("expired_unresolved", "resolved")
+            if self._holds_slot(item)
         )
         if open_count >= self.config.max_open_markets:
             self._emit(
@@ -407,15 +415,8 @@ class Engine:
             return
         for item in self.state.markets.values():
             finished = item.status in ("expired_unresolved", "resolved")
-            flat_after_split = (
-                item.gross_split > 0
-                and item.up == 0
-                and item.down == 0
-                and item.pending_split <= 0
-                and not self._working(item)
-            )
-            if (finished or flat_after_split) and not self._working(item):
-                # A finished session must not keep a reserve that blocks the next one.
+            if finished or self._idle_flat(item):
+                # A finished or flat session must not keep a reserve that blocks the next one.
                 item.reserve_active = False
         market.reserve_active = True
         market.operational_reserve_amount = self.state.operational_reserve
@@ -676,6 +677,7 @@ class Engine:
             )
             self.state.rebate_estimate += qdown(raw, Decimal("0.00000001"))
         market.last_action_ts = self.state.now_ms
+        self._note_leg_gap(market)
         self._emit(
             kind="fill",
             market=market,
@@ -788,10 +790,13 @@ class Engine:
         if market.status == "redeemed":
             return
         self._check_kill_switch()
+        self._check_realized_loss()
         if self.state.killed:
-            self._cancel_market(market, "killed")
-            self._merge_free(market, "stop")
-            self._skip(market, "killed")
+            # Still sell a naked leg. Then merge whatever pair is left.
+            if not self._complete_leg(market):
+                self._cancel_market(market, "killed")
+                self._merge_free(market, "stop")
+                self._skip(market, "killed")
             return
         # A reconcile disagreement is handled on that market inside
         # ``_on_reconcile``. It must not flatten the account or end the run.
@@ -830,6 +835,12 @@ class Engine:
         if not market.accepting_orders:
             self._cancel_market(market, "not_accepting")
             self._skip(market, "not_accepting")
+            return
+        if self._complete_leg(market):
+            return
+        if self.config.entry_mode == "buy_pair_arb":
+            if not self.at_cap() and not self.state.killed:
+                self._try_buy_pair(market)
             return
         if self._in_cooldown(market):
             self._skip(market, "cooldown")
@@ -1234,6 +1245,9 @@ class Engine:
         proposal: Proposal,
         price: Decimal,
         require_repair: bool,
+        *,
+        marketable: bool = False,
+        ignore_floor: bool = False,
     ) -> None:
         bid = market.book(proposal.outcome).best_bid()
         forced = self.sell_floors.get((market.market_id, proposal.outcome))
@@ -1253,7 +1267,7 @@ class Engine:
                 required_edge=proposal.required_edge,
                 repair=proposal.repair,
             )
-        if bid is not None and price <= bid:
+        if not marketable and bid is not None and price <= bid:
             # Post-only SELL must rest above the best bid; never cross.
             price = bid + market.tick_size
             if price >= 1 or self._working_at(market, proposal.outcome, price):
@@ -1267,7 +1281,13 @@ class Engine:
                 required_edge=proposal.required_edge,
                 repair=proposal.repair,
             )
-        size = self._largest_size(market, proposal, require_repair)
+        size = self._largest_size(
+            market,
+            proposal,
+            require_repair,
+            ignore_floor=ignore_floor,
+            allow_small=ignore_floor,
+        )
         if size is None:
             free = market.inventory(proposal.outcome) - reserved(
                 self.state, market, proposal.outcome
@@ -1285,10 +1305,20 @@ class Engine:
                 reason = "risk_floor"
             self._skip(market, reason, proposal.outcome)
             return
-        self._commit_order(market, proposal, size, risk_reducing=require_repair)
+        order = self._commit_order(
+            market, proposal, size, risk_reducing=require_repair or ignore_floor
+        )
+        if marketable and order is not None:
+            self.marketable_ids.add(order.order_id)
 
     def _largest_size(
-        self, market: Market, proposal: Proposal, require_repair: bool
+        self,
+        market: Market,
+        proposal: Proposal,
+        require_repair: bool,
+        *,
+        ignore_floor: bool = False,
+        allow_small: bool = False,
     ) -> Optional[Decimal]:
         quantum = self.config.order_size_quantum
         minimum = (
@@ -1297,14 +1327,28 @@ class Engine:
             else self.config.min_order_size
         )
         desired = qdown(proposal.size, quantum)
-        if desired < minimum:
+        if desired <= 0:
+            return None
+        if desired < minimum and not allow_small:
             return None
         if self._size_ok(
-            market, proposal.outcome, proposal.price, desired, require_repair
+            market,
+            proposal.outcome,
+            proposal.price,
+            desired,
+            require_repair,
+            ignore_floor=ignore_floor,
         ):
             return desired
+        if desired < minimum:
+            return None
         if not self._size_ok(
-            market, proposal.outcome, proposal.price, minimum, require_repair
+            market,
+            proposal.outcome,
+            proposal.price,
+            minimum,
+            require_repair,
+            ignore_floor=ignore_floor,
         ):
             return None
         span = int((desired - minimum) / quantum)
@@ -1315,7 +1359,12 @@ class Engine:
             mid = (lo + hi) // 2
             size = minimum + quantum * mid
             if self._size_ok(
-                market, proposal.outcome, proposal.price, size, require_repair
+                market,
+                proposal.outcome,
+                proposal.price,
+                size,
+                require_repair,
+                ignore_floor=ignore_floor,
             ):
                 best = size
                 lo = mid + 1
@@ -1330,6 +1379,8 @@ class Engine:
         price: Decimal,
         size: Decimal,
         require_repair: bool,
+        *,
+        ignore_floor: bool = False,
     ) -> bool:
         free = market.inventory(outcome) - reserved(self.state, market, outcome)
         if size <= 0 or size > free:
@@ -1346,7 +1397,7 @@ class Engine:
             submit_ts=self.state.now_ms,
         )
         projected = worst_case_equity(self.state, extra=[virtual])
-        if projected < self.state.loss_floor:
+        if projected < self.state.loss_floor and not ignore_floor:
             return False
         if require_repair:
             current = worst_case_equity(self.state)
@@ -1362,7 +1413,7 @@ class Engine:
 
     def _commit_order(
         self, market: Market, proposal: Proposal, size: Decimal, *, risk_reducing: bool
-    ) -> None:
+    ) -> Order:
         book = market.book(proposal.outcome)
         best_ask = book.best_ask()
         if best_ask is not None and proposal.price < best_ask:
@@ -1398,6 +1449,305 @@ class Engine:
             reason="repair" if proposal.repair else "paired",
             detail=f"fair={money(proposal.fair)} edge={money(proposal.required_edge)}",
         )
+        return order
+
+    def _idle_flat(self, market: Market) -> bool:
+        return (
+            market.up == 0
+            and market.down == 0
+            and market.pending_split <= 0
+            and not self._working(market)
+        )
+
+    def _holds_slot(self, market: Market) -> bool:
+        if market.status == "redeemed" or market.status in (
+            "expired_unresolved",
+            "resolved",
+        ):
+            return False
+        if market.end_ts_ms and self.state.now_ms >= market.end_ts_ms:
+            return False
+        # Traded and flat: a chain merge can still be pending. That must not
+        # keep the next session out. An untraded open window still holds one.
+        if self._idle_flat(market) and market.gross_split > 0:
+            return False
+        return True
+
+    def _note_leg_gap(self, market: Market) -> None:
+        gap = market.sold_down_shares - market.sold_up_shares
+        if gap == 0:
+            self.leg_since.pop(market.market_id, None)
+            return
+        self.leg_since.setdefault(market.market_id, self.state.now_ms)
+
+    def _naked_leg(self, market: Market) -> Optional[tuple[str, Decimal]]:
+        gap = market.sold_down_shares - market.sold_up_shares
+        if gap > 0 and market.up > 0:
+            return "up", gap if gap < market.up else market.up
+        if gap < 0 and market.down > 0:
+            size = -gap
+            return "down", size if size < market.down else market.down
+        if gap == 0:
+            self.leg_since.pop(market.market_id, None)
+        return None
+
+    def _complete_leg(self, market: Market) -> bool:
+        """Work the unfilled side of a one-legged sell, then flatten.
+
+        For ``leg_unwind_seconds`` the leftover inventory is requoted at
+        bid + 1 tick. After that it is sold at the bid and any still-matched
+        pair is merged. A partial fill uses the same gap.
+        """
+        naked = self._naked_leg(market)
+        if naked is None:
+            return False
+        outcome, gap = naked
+        started = self.leg_since.setdefault(market.market_id, self.state.now_ms)
+        book = market.book(outcome)
+        bid = book.best_bid()
+        if bid is None:
+            return True
+        tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
+        elapsed = self.state.now_ms - started
+        marketable = elapsed >= int(self.config.leg_unwind_seconds) * 1000
+        if marketable:
+            price = bid
+        else:
+            # Walk toward the bid, but keep the pair floor and do not undercut
+            # a maker price the book already supports.
+            price = bid + tick
+            floor = pair_edge_floor(market, outcome, self.config)
+            if floor is not None and floor > price:
+                price = floor
+            natural = maker_sell_price(market, outcome, self.config)
+            if natural is not None and natural > price:
+                price = natural
+        if price >= 1:
+            price = bid
+            marketable = True
+        if price <= 0:
+            return True
+        for order in list(self._working(market, outcome)):
+            if order.price != price:
+                self._request_cancel(market, order, "leg_unwind")
+        if not self.config.live:
+            self._promote()
+        free = market.inventory(outcome) - reserved(self.state, market, outcome)
+        size = gap if gap < free else free
+        size = qdown(size, self.config.order_size_quantum)
+        resting = [
+            order
+            for order in self._working(market, outcome)
+            if order.price == price
+        ]
+        if size > 0 and not resting:
+            self._place_one(
+                market,
+                Proposal(
+                    outcome=outcome,
+                    price=price,
+                    size=size,
+                    fair=price,
+                    required_edge=ZERO,
+                    repair=True,
+                ),
+                price,
+                False,
+                marketable=marketable,
+                ignore_floor=True,
+            )
+            resting = [
+                order
+                for order in self._working(market, outcome)
+                if order.price == price
+            ]
+        if marketable and not self.config.live:
+            for order in resting:
+                if order.remaining <= 0 or bid < order.price:
+                    continue
+                fill = order.remaining if order.remaining < gap else gap
+                fill = qdown(fill, Decimal("0.000001"))
+                if fill > 0:
+                    self._apply_fill(
+                        market, order, fill, synthetic=True, source="leg_unwind"
+                    )
+                    gap -= fill
+        if marketable:
+            for order in list(self._working(market)):
+                if order.outcome != outcome:
+                    self._request_cancel(market, order, "leg_unwind")
+            if not self.config.live:
+                self._promote()
+            self._merge_free(market, "leg_unwind")
+        return True
+
+    def _buy_plan(self, market: Market) -> Optional[dict]:
+        """Both asks, or nothing. One tick of edge after taker fees."""
+        if market.status != "open" or market.up > 0 or market.down > 0:
+            return None
+        if market.pending_split > 0 or market.gross_split > 0:
+            return None
+        up = market.book("up")
+        down = market.book("down")
+        ask_up, ask_down = up.best_ask(), down.best_ask()
+        bid_up, bid_down = up.best_bid(), down.best_bid()
+        if (
+            ask_up is None
+            or ask_down is None
+            or bid_up is None
+            or bid_down is None
+            or ask_up <= bid_up
+            or ask_down <= bid_down
+        ):
+            return None
+        fee = conservative_fee(ONE, ask_up, self.state.risk_fee_rate) + conservative_fee(
+            ONE, ask_down, self.state.risk_fee_rate
+        )
+        if ask_up + ask_down + fee > ONE - self.config.pair_min_edge:
+            return None
+        slip = ask_up - bid_up
+        other = ask_down - bid_down
+        if other > slip:
+            slip = other
+        if slip <= 0:
+            slip = market.tick_size if market.tick_size > 0 else Decimal("0.01")
+        budget = self.config.initial_capital * self.config.max_loss_fraction
+        if self.state.realized_pnl < 0:
+            budget += self.state.realized_pnl
+        if budget <= 0:
+            return None
+        size = budget / slip
+        cost = ask_up + ask_down + fee
+        if cost <= 0:
+            return None
+        affordable = self.state.cash / cost
+        if affordable < size:
+            size = affordable
+        if self.config.clip_size < size:
+            size = self.config.clip_size
+        have_up = up.ask_size_at(ask_up)
+        have_down = down.ask_size_at(ask_down)
+        if have_up < size:
+            size = have_up
+        if have_down < size:
+            size = have_down
+        size = qdown(size, self.config.order_size_quantum)
+        minimum = (
+            market.min_order_size
+            if market.min_order_size > self.config.min_order_size
+            else self.config.min_order_size
+        )
+        if size < minimum:
+            return None
+        return {
+            "market_id": market.market_id,
+            "up_price": ask_up,
+            "down_price": ask_down,
+            "size": size,
+            "up_token": market.up_token_id,
+            "down_token": market.down_token_id,
+            "tick_size": market.tick_size,
+        }
+
+    def _try_buy_pair(self, market: Market) -> None:
+        plan = self._buy_plan(market)
+        if plan is None:
+            return
+        if self.mode == "live":
+            self.buy_outbox.append(plan)
+            return
+        fail = self.buy_fail_outcome
+        up_size = ZERO if fail == "up" else plan["size"]
+        down_size = ZERO if fail == "down" else plan["size"]
+        self.apply_buy_fills(
+            market,
+            up_price=plan["up_price"],
+            down_price=plan["down_price"],
+            up_size=up_size,
+            down_size=down_size,
+        )
+
+    def apply_buy_fills(
+        self,
+        market: Market,
+        *,
+        up_price: Decimal,
+        down_price: Decimal,
+        up_size: Decimal,
+        down_size: Decimal,
+    ) -> None:
+        """Take the filled buy legs, merge a pair, and sell a lone leg now."""
+        paid = ZERO
+        if up_size > 0:
+            paid += up_size * up_price + conservative_fee(
+                up_size, up_price, self.state.risk_fee_rate
+            )
+            market.up += up_size
+        if down_size > 0:
+            paid += down_size * down_price + conservative_fee(
+                down_size, down_price, self.state.risk_fee_rate
+            )
+            market.down += down_size
+        if paid > self.state.cash:
+            market.up -= up_size
+            market.down -= down_size
+            self._emit(kind="quote_reject", market=market, reason="insufficient_cash")
+            return
+        self.state.cash -= paid
+        market.net_cash_flow -= paid
+        self._emit(
+            kind="buy_pair",
+            market=market,
+            size=up_size if up_size > down_size else down_size,
+            price=up_price + down_price,
+            reason="buy_pair_arb",
+        )
+        paired = up_size if up_size < down_size else down_size
+        if paired > 0:
+            self._merge(market, paired, "buy_pair")
+        lone = "up" if market.up > market.down else "down"
+        if market.up == market.down:
+            return
+        book = market.book(lone)
+        bid = book.best_bid()
+        held = market.inventory(lone)
+        if bid is None or held <= 0:
+            return
+        self._place_one(
+            market,
+            Proposal(
+                outcome=lone,
+                price=bid,
+                size=held,
+                fair=bid,
+                required_edge=ZERO,
+                repair=True,
+            ),
+            bid,
+            False,
+            marketable=True,
+            ignore_floor=True,
+        )
+        if self.config.live:
+            return
+        for order in list(self._working(market, lone)):
+            if order.price == bid and order.remaining > 0:
+                self._apply_fill(
+                    market,
+                    order,
+                    order.remaining,
+                    synthetic=True,
+                    source="leg_unwind",
+                )
+
+    def _check_realized_loss(self) -> None:
+        budget = self.state.initial_capital * self.state.max_loss_fraction
+        if budget <= 0 or self.state.realized_pnl > -budget:
+            return
+        if self.state.killed:
+            return
+        self.state.killed = True
+        self._emit(kind="kill", reason="realized_loss")
 
     def _split(self, market: Market, amount: Decimal, reason: str) -> bool:
         if (
@@ -1407,7 +1757,7 @@ class Engine:
         ):
             self._emit(kind="reject", market=market, size=amount, reason="near_expiry")
             return False
-        if self.at_cap():
+        if self.state.killed or self.at_cap():
             self._emit(
                 kind="quote_reject",
                 market=market,
@@ -1462,16 +1812,6 @@ class Engine:
             return False
         market.up -= amount
         market.down -= amount
-        projected = worst_case_equity(self.state, cash_delta=amount)
-        market.up += amount
-        market.down += amount
-        if projected < self.state.loss_floor:
-            self._emit(
-                kind="quote_reject", market=market, size=amount, reason="risk_floor"
-            )
-            return False
-        market.up -= amount
-        market.down -= amount
         self.state.cash += amount
         market.net_cash_flow += amount
         self._emit(kind="merge", market=market, size=amount, reason=reason)
@@ -1514,6 +1854,7 @@ class Engine:
         if not market.realized_recorded:
             self.state.realized_pnl += market.net_cash_flow
             market.realized_recorded = True
+            self._check_realized_loss()
         self._emit(
             kind="redeem", market=market, size=payout, reason=market.winner or ""
         )
