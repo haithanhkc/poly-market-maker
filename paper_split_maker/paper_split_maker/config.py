@@ -95,6 +95,9 @@ class Config:
     requote_size_threshold: Decimal = Decimal("1")
     # Seconds before the pre-close cancel during which asks step toward the bid.
     close_improve_seconds: int = 90
+    # After the open, give posts this long before unwinding a session whose
+    # sells are failing. Floor-blocked quotes are left until the normal close.
+    sell_ready_timeout_seconds: int = 30
     # 0 disables the pause. Otherwise pull quotes when the mid jumps.
     vol_pause_move: Decimal = Decimal("0")
     vol_pause_window_ms: int = 0
@@ -174,7 +177,11 @@ class Config:
             raise ConfigError("session_max_loss must be non-negative")
         if self.requote_min_ticks < 0 or self.requote_min_interval_ms < 0:
             raise ConfigError("requote limits must be non-negative")
-        if self.min_order_rest_seconds < 0 or self.close_improve_seconds < 0:
+        if (
+            self.min_order_rest_seconds < 0
+            or self.close_improve_seconds < 0
+            or self.sell_ready_timeout_seconds < 0
+        ):
             raise ConfigError("rest and close windows must be non-negative")
         if self.requote_vol_k < 0 or self.requote_size_threshold < 0:
             raise ConfigError("requote volatility settings must be non-negative")
@@ -276,6 +283,7 @@ _INT_FIELDS = {
     "min_order_rest_seconds",
     "requote_vol_window_ms",
     "close_improve_seconds",
+    "sell_ready_timeout_seconds",
     "vol_pause_window_ms",
     "vol_pause_hold_ms",
     "pre_split_lead_ms",

@@ -30,6 +30,154 @@ def quoting_allowed(confirmed: bool) -> bool:
     return confirmed
 
 
+def _ensure_live_state(engine) -> None:
+    if getattr(engine, "_live_ready", False):
+        return
+    engine._live_ready = True
+    engine.call_failures = {}
+    engine.call_ready_at = {}
+    engine.heartbeat_ok = False
+    engine.orders_ok = False
+    engine.heartbeat_id = None
+    engine.next_heartbeat_at = 0.0
+    engine.open_orders_cache = None
+    engine.post_failures = {}
+    engine.sell_accepted = set()
+    engine.early_merged = set()
+    engine.skipped_unready = set()
+    engine.sessions_finished = set()
+    engine.exchange_ready = False
+    engine.require_exchange_ready = False
+    engine.clock_now = 0.0
+
+
+def _backoff_delay(failures: int) -> float:
+    return min(30.0, 0.5 * (2 ** min(max(failures - 1, 0), 6)))
+
+
+def _call_is_waiting(engine, label: str, now: float) -> bool:
+    ready = getattr(engine, "call_ready_at", None)
+    if not isinstance(ready, dict):
+        return False
+    return now < ready.get(label, 0.0)
+
+
+def _record_call_ok(engine, label: str) -> None:
+    failures = getattr(engine, "call_failures", None)
+    if isinstance(failures, dict):
+        failures[label] = 0
+    ready = getattr(engine, "call_ready_at", None)
+    if isinstance(ready, dict):
+        ready.pop(label, None)
+
+
+def _record_call_failure(engine, label: str, now: float, notes: list[str], text: str) -> None:
+    """Log one failed exchange call and wait before the next attempt."""
+    _ensure_live_state(engine)
+    fails = int(engine.call_failures.get(label, 0)) + 1
+    engine.call_failures[label] = fails
+    engine.call_ready_at[label] = now + _backoff_delay(fails)
+    notes.append(text)
+    _log_exchange_error(engine, label.split(":", 1)[0][:80], text)
+
+
+def _log_exchange_error(engine, label: str, message: str) -> None:
+    """Append one log row without letting a logging failure escape."""
+    try:
+        pending = list(engine._batch)
+        engine._batch = []
+        engine._emit(
+            kind="exchange_error",
+            reason=str(label)[:80],
+            detail=str(message)[:300],
+        )
+        engine._finish()
+        engine._batch = pending
+    except Exception:
+        return
+
+
+def _safe_call(engine, creds, notes: list[str], label: str, fn, *args, now: float):
+    """Call ``fn``. On any exception, log it and wait until a later tick.
+
+    The second value is True on success, False on failure, and None when the
+    call is skipped because the previous failure is still backing off.
+    """
+    _ensure_live_state(engine)
+    ready_at = engine.call_ready_at.get(label, 0.0)
+    if now < ready_at:
+        return None, None
+    try:
+        value = fn(*args)
+    except Exception as exc:
+        fails = int(engine.call_failures.get(label, 0)) + 1
+        engine.call_failures[label] = fails
+        engine.call_ready_at[label] = now + _backoff_delay(fails)
+        text = creds.redact(f"{label} failed: {exc}")
+        notes.append(text)
+        print(text, flush=True)
+        _log_exchange_error(engine, label, text)
+        return None, False
+    engine.call_failures[label] = 0
+    engine.call_ready_at.pop(label, None)
+    return value, True
+
+
+def _refresh_readiness(engine, client, creds, notes: list[str], now: float) -> bool:
+    """Heartbeat and the authenticated open-orders call must both succeed."""
+    from paper_split_maker.live_clob import heartbeat
+
+    _ensure_live_state(engine)
+    if client is None:
+        engine.exchange_ready = False
+        return False
+    if now >= engine.next_heartbeat_at or not engine.heartbeat_ok:
+        def _beat():
+            new_id, err = heartbeat(client, engine.heartbeat_id)
+            if err is not None:
+                raise err
+            engine.heartbeat_id = new_id
+            return new_id
+
+        _value, status = _safe_call(engine, creds, notes, "heartbeat", _beat, now=now)
+        if status is True:
+            engine.heartbeat_ok = True
+            engine.next_heartbeat_at = now + 5
+        elif status is False:
+            engine.heartbeat_ok = False
+    _orders, status = _safe_call(
+        engine, creds, notes, "open_orders", client.get_open_orders, now=now
+    )
+    if status is True:
+        engine.orders_ok = isinstance(_orders, list)
+        engine.open_orders_cache = _orders if engine.orders_ok else None
+        if not engine.orders_ok:
+            notes.append("open orders payload was not a list")
+            engine.orders_ok = False
+    elif status is False:
+        engine.orders_ok = False
+        engine.open_orders_cache = None
+    engine.exchange_ready = bool(engine.heartbeat_ok and engine.orders_ok)
+    return engine.exchange_ready
+
+
+def _sessions_are_done(engine, max_markets: int) -> bool:
+    done = getattr(engine, "sessions_finished", set())
+    return max_markets > 0 and len(done) >= max_markets
+
+
+def _note_session_done(engine, market) -> None:
+    joined = getattr(engine, "preopen_joined", set())
+    if market.market_id not in joined and market.slug not in joined:
+        return
+    if market.pending_split > 0 or market.up > 0 or market.down > 0:
+        return
+    if engine._working(market):
+        return
+    _ensure_live_state(engine)
+    engine.sessions_finished.add(market.market_id)
+
+
 def run_confirmed_live(
     config: Config,
     creds: Credentials,
@@ -37,90 +185,199 @@ def run_confirmed_live(
     *,
     duration_seconds: int,
     max_markets: int,
+    client=None,
+    reader=None,
+    now_s=None,
+    sleep=None,
+    poster=None,
 ) -> dict:
     from paper_split_maker.live_clob import (
         build_client,
         cancel_all,
-        heartbeat,
         post_only_sells,
     )
 
+    post_fn = poster or post_only_sells
+
     if duration_seconds <= 0:
         raise RuntimeError("duration_seconds must be positive")
-    client = build_client(creds)
+    clock = now_s or time.time
+    sleeper = sleep or time.sleep
     engine = open_engine(config, out_dir)
     engine.mode = "live"
-    from paper_split_maker.public_client import PublicDataError, PublicReadClient
+    _ensure_live_state(engine)
+    engine.require_exchange_ready = True
+    if reader is None:
+        from paper_split_maker.public_client import PublicReadClient
 
-    reader = PublicReadClient()
+        reader = PublicReadClient()
     ws_queue: queue.Queue = queue.Queue()
     ws_stop = threading.Event()
     ws_assets: list[str] = []
-    ws_thread = _start_market_ws(ws_assets, ws_queue, ws_stop)
+    ws_thread = None if client is not None else _start_market_ws(ws_assets, ws_queue, ws_stop)
     notes = [
         "Live session on the configured funder. Orders are post-only sells.",
         describe_user_subscribe(creds.funder, max_markets),
         "Unconfirmed splits are not quoted.",
-        "Shutdown sends cancel-all.",
+        "Shutdown sends cancel-all and merges held pairs.",
+        "A single exchange error is retried on a later tick.",
         "Market websocket is on."
         if ws_thread is not None
         else "Market websocket package is missing; books come from REST.",
     ]
     print(describe_user_subscribe(creds.funder, max_markets))
-    heartbeat_id = None
-    next_heartbeat = 0.0
-    deadline = time.time() + duration_seconds
+    deadline = clock() + duration_seconds
     try:
-        while time.time() < deadline:
+        while clock() < deadline:
             if config.kill_switch_file and Path(config.kill_switch_file).exists():
                 notes.append("kill switch file seen")
                 break
-            now = time.time()
-            _remember_assets(engine, ws_assets)
-            drain_market_ws(engine, ws_queue, int(now * 1000))
-            _poll_public(engine, reader, config, int(now * 1000), max_markets, notes)
-            _confirm_splits(engine, creds, int(now * 1000), notes)
-            _consider_pre_split(engine, reader, config, creds, int(now * 1000), notes)
-            _ingest_matched(engine, client, creds, notes)
-            if now >= next_heartbeat:
-                heartbeat_id = heartbeat(client, heartbeat_id)
-                next_heartbeat = now + 5
-            _send_cancels(engine, client, creds, notes)
-            remote = client.get_open_orders()
-            remote_ids = [
-                str(item.get("id")) for item in remote if isinstance(item, dict)
-            ]
-            engine.handle_event(
-                {
-                    "type": "reconcile",
-                    "open_order_ids": remote_ids,
-                    "ts": int(now * 1000),
-                    "event_id": f"reconcile-{int(now * 1000)}",
-                }
-            )
             if engine.state.killed:
                 notes.append("stopped on kill")
                 break
-            if engine.state.mismatch_stop:
-                # Reconcile and post errors stay on the affected orders.
-                notes.append("reconcile mismatch contained; continuing")
-                engine.state.mismatch_stop = False
-            _send_new_quotes(engine, client, post_only_sells, creds, notes)
-            _flush_chain(engine, creds, notes)
-            time.sleep(min(0.2, max(0.0, deadline - time.time())))
+            if _sessions_are_done(engine, max_markets):
+                notes.append(f"finished {max_markets} sessions")
+                break
+            now = clock()
+            engine.clock_now = now
+            try:
+                if client is None:
+                    client, started = _safe_call(
+                        engine,
+                        creds,
+                        notes,
+                        "api_key",
+                        build_client,
+                        creds,
+                        now=now,
+                    )
+                    if started is not True:
+                        _pause(sleeper, deadline, clock, 1.0)
+                        continue
+                _live_tick(
+                    engine,
+                    client,
+                    reader,
+                    config,
+                    creds,
+                    notes,
+                    now,
+                    max_markets,
+                    ws_assets,
+                    ws_queue,
+                    post_fn,
+                )
+            except Exception as exc:
+                text = creds.redact(f"tick failed: {exc}")
+                notes.append(text)
+                print(text, flush=True)
+                _log_exchange_error(engine, "tick", text)
+            if engine.state.killed:
+                notes.append("stopped on kill")
+                break
+            if _sessions_are_done(engine, max_markets):
+                notes.append(f"finished {max_markets} sessions")
+                break
+            _pause(sleeper, deadline, clock, 0.2)
     finally:
         ws_stop.set()
-        try:
-            cancel_all(client)
-            notes.append("cancel-all sent")
-        except Exception as exc:
-            notes.append(creds.redact(f"cancel-all failed: {exc}"))
+        _shutdown_live(engine, client, creds, notes, cancel_all)
     summary = engine.summary(notes=notes)
     summary["mode"] = "live"
     summary["funder"] = creds.funder
     summary["signature_type"] = creds.signature_type
     write_summary(out_dir, summary)
     return summary
+
+
+def _pause(sleeper, deadline: float, clock, delay: float) -> None:
+    remaining = deadline - clock()
+    if remaining <= 0:
+        return
+    sleeper(min(delay, remaining))
+
+
+def _live_tick(
+    engine,
+    client,
+    reader,
+    config,
+    creds,
+    notes,
+    now: float,
+    max_markets: int,
+    ws_assets,
+    ws_queue,
+    post_only_sells,
+) -> None:
+    stamp = int(now * 1000)
+    _remember_assets(engine, ws_assets)
+    drain_market_ws(engine, ws_queue, stamp, creds, notes)
+    _refresh_readiness(engine, client, creds, notes, now)
+    _poll_public(engine, reader, config, stamp, max_markets, notes)
+    confirmed = _confirm_splits(engine, creds, stamp, notes)
+    if confirmed:
+        # Quote and post in this same tick. Do not wait for the next pass.
+        engine.handle_event(
+            {
+                "type": "heartbeat",
+                "ts": stamp,
+                "event_id": f"hb-after-split-{stamp}",
+            }
+        )
+        _send_new_quotes(engine, client, post_only_sells, creds, notes)
+    _consider_pre_split(engine, reader, config, creds, stamp, notes)
+    _ingest_matched(engine, client, creds, notes)
+    _send_cancels(engine, client, creds, notes, now)
+    if engine.orders_ok and isinstance(engine.open_orders_cache, list):
+        remote_ids = [
+            str(item.get("id"))
+            for item in engine.open_orders_cache
+            if isinstance(item, dict)
+        ]
+        engine.handle_event(
+            {
+                "type": "reconcile",
+                "open_order_ids": remote_ids,
+                "ts": stamp,
+                "event_id": f"reconcile-{stamp}",
+            }
+        )
+    else:
+        notes.append("reconcile skipped; open orders were not readable")
+    if engine.state.mismatch_stop:
+        notes.append("reconcile mismatch contained; continuing")
+        engine.state.mismatch_stop = False
+    _send_new_quotes(engine, client, post_only_sells, creds, notes)
+    _unwind_failed_posts(engine, stamp, notes)
+    _flush_chain(engine, creds, notes)
+    for market in list(engine.state.markets.values()):
+        _note_session_done(engine, market)
+
+
+def _shutdown_live(engine, client, creds, notes: list[str], cancel_all) -> None:
+    """Best-effort cancel and merge. Used on duration, kill, and crashes."""
+    cancel_ok = False
+    if client is not None:
+        try:
+            cancel_all(client)
+            notes.append("cancel-all sent")
+            cancel_ok = True
+        except Exception as exc:
+            text = creds.redact(f"cancel-all failed: {exc}")
+            notes.append(text)
+            _log_exchange_error(engine, "cancel_all", text)
+    stamp = int(getattr(engine, "clock_now", 0) * 1000) or engine.state.now_ms or 0
+    for market in list(engine.state.markets.values()):
+        try:
+            _release_orders(engine, market, cancel_ok=cancel_ok)
+            _merge_flat(engine, market, stamp, "shutdown")
+        except Exception as exc:
+            notes.append(creds.redact(f"shutdown merge failed: {exc}"))
+    try:
+        _flush_chain(engine, creds, notes)
+    except Exception as exc:
+        notes.append(creds.redact(f"shutdown chain failed: {exc}"))
 
 
 def _send_new_quotes(engine, client, post_only_sells, creds, notes: list[str]) -> None:
@@ -162,6 +419,8 @@ def _send_new_quotes(engine, client, post_only_sells, creds, notes: list[str]) -
         refused = (status is not None and 400 <= status < 500) or is_post_only_cross(
             str(exc)
         )
+        for item in pending:
+            _mark_post_failure(engine, item["order"])
         if refused:
             for item in pending:
                 _reject_quote(engine, item["order"], str(exc), creds, notes)
@@ -187,9 +446,11 @@ def _send_new_quotes(engine, client, post_only_sells, creds, notes: list[str]) -
         client_error = isinstance(status, int) and 400 <= status < 500
         if error or not ident or client_error:
             # The exchange did not take this order. It must not count as resting.
+            _mark_post_failure(engine, item["order"])
             _reject_quote(engine, item["order"], error or "no order id", creds, notes)
             continue
         item["order"].exchange_id = ident
+        _mark_sell_accepted(engine, item["order"])
         market = engine.state.markets[item["order"].market_id]
         engine.note_order_posted(
             market,
@@ -225,7 +486,18 @@ def _reject_quote(engine, order, reason: str, creds, notes: list[str]) -> None:
     notes.append(creds.redact(f"order rejected: {reason}"))
 
 
-def _send_cancels(engine, client, creds, notes: list[str]) -> None:
+def _mark_post_failure(engine, order) -> None:
+    _ensure_live_state(engine)
+    market_id = order.market_id
+    engine.post_failures[market_id] = int(engine.post_failures.get(market_id, 0)) + 1
+
+
+def _mark_sell_accepted(engine, order) -> None:
+    _ensure_live_state(engine)
+    engine.sell_accepted.add(order.market_id)
+
+
+def _send_cancels(engine, client, creds, notes: list[str], now: float = 0.0) -> None:
     ids = []
     for order in engine.state.orders.values():
         if (
@@ -242,11 +514,17 @@ def _send_cancels(engine, client, creds, notes: list[str]) -> None:
     if not ids:
         return
     started = time.time()
-    try:
+
+    def _cancel():
         client.cancel_orders(ids)
-    except Exception as exc:
-        notes.append(creds.redact(f"cancel failed: {exc}"))
-        engine.state.mismatch_stop = True
+
+    _value, status = _safe_call(
+        engine, creds, notes, "cancel", _cancel, now=now or time.time()
+    )
+    if status is not True:
+        for order in engine.state.orders.values():
+            if order.exchange_id in ids:
+                order.cancel_sent = False
         return
     ack_ms = int((time.time() - started) * 1000)
     engine._emit(kind="latency", reason="cancel_ack", detail=str(ack_ms))
@@ -261,7 +539,6 @@ def _poll_public(
     failure used to mark the whole feed down so later sessions never quoted.
     """
     from paper_split_maker.normalize import clob_book_event
-    from paper_split_maker.public_client import PublicDataError
 
     now_s = stamp // 1000
     window = (now_s // 300) * 300
@@ -277,12 +554,19 @@ def _poll_public(
             engine, next_open, stamp, lead_ms=config.pre_split_lead_ms
         )
     slugs = _candidate_slugs(config, now_s, max_markets)
-    if slugs:
+    poll_now = stamp / 1000
+    if slugs and _call_is_waiting(engine, "discovery", poll_now):
+        payloads = []
+    elif slugs:
         try:
             payloads = reader.discover_btc_updown(now_s, len(slugs), slugs)
-        except PublicDataError as exc:
-            notes.append(f"discovery failed: {exc}")
+        except Exception as exc:
             payloads = []
+            _record_call_failure(
+                engine, "discovery", poll_now, notes, f"discovery failed: {exc}"
+            )
+        else:
+            _record_call_ok(engine, "discovery")
         for payload in payloads:
             _load_market(
                 engine,
@@ -299,6 +583,10 @@ def _poll_public(
     ]
     failed = 0
     for market in open_markets:
+        book_label = f"book:{market.market_id}"
+        if _call_is_waiting(engine, book_label, poll_now):
+            # Keep the last book. A retry wait is not a dead feed.
+            continue
         market_ok = True
         try:
             for outcome, token in (
@@ -318,9 +606,17 @@ def _poll_public(
                 event["book_ts"] = event["ts"]
                 event["ts"] = stamp
                 engine.handle_event(event)
-        except PublicDataError as exc:
+        except Exception as exc:
             market_ok = False
-            notes.append(f"book poll failed for {market.market_id}: {exc}")
+            _record_call_failure(
+                engine,
+                book_label,
+                poll_now,
+                notes,
+                f"book poll failed for {market.market_id}: {exc}",
+            )
+        else:
+            _record_call_ok(engine, book_label)
         if not market_ok:
             failed += 1
     _poll_resolutions(engine, reader, stamp, notes)
@@ -343,14 +639,25 @@ def _ingest_matched(engine, client, creds, notes: list[str]) -> None:
     from paper_split_maker.feeds import user_fill_deltas
 
     matched: dict = {}
+    now = float(getattr(engine, "clock_now", 0) or time.time())
+    if _call_is_waiting(engine, "order_read", now):
+        return
     for order in list(engine.state.orders.values()):
         if not order.exchange_id or order.status not in {"live", "cancel_requested"}:
             continue
         try:
             payload = client.get_order(order.exchange_id)
         except Exception as exc:
-            notes.append(creds.redact(f"order read failed: {exc}"))
-            continue
+            now = float(getattr(engine, "clock_now", 0) or time.time())
+            _record_call_failure(
+                engine,
+                "order_read",
+                now,
+                notes,
+                creds.redact(f"order read failed: {exc}"),
+            )
+            return
+        _record_call_ok(engine, "order_read")
         if not isinstance(payload, dict):
             continue
         payload = dict(payload)
@@ -369,10 +676,11 @@ def _ingest_matched(engine, client, creds, notes: list[str]) -> None:
             )
 
 
-def _confirm_splits(engine, creds, stamp: int, notes: list[str]) -> None:
+def _confirm_splits(engine, creds, stamp: int, notes: list[str]) -> list[str]:
     txs = getattr(engine, "split_tx", {})
+    confirmed: list[str] = []
     if not txs:
-        return
+        return confirmed
     from paper_split_maker.chain_send import eoa_confirmed, split_tokens_present
 
     for slug, ident in list(txs.items()):
@@ -422,6 +730,8 @@ def _confirm_splits(engine, creds, stamp: int, notes: list[str]) -> None:
                 f"{slug} split confirmed too late to quote; inventory is not quoted"
             )
         txs.pop(slug, None)
+        confirmed.append(market.market_id)
+    return confirmed
 
 
 def _consider_pre_split(
@@ -434,7 +744,6 @@ def _consider_pre_split(
     bankroll equal to one split can fund the next one.
     """
     from paper_split_maker.live_session import should_pre_split
-    from paper_split_maker.public_client import PublicDataError
 
     window = (stamp // 1000 // 300) * 300
     next_open = window + 300
@@ -449,6 +758,21 @@ def _consider_pre_split(
     if existing is not None and existing.gross_split > 0:
         return
     pending = existing is not None and existing.pending_split > 0
+    skipped = getattr(engine, "skipped_unready", set())
+    if slug in skipped:
+        return
+    in_lead = next_open * 1000 - config.pre_split_lead_ms <= stamp < next_open * 1000
+    if (
+        in_lead
+        and not pending
+        and getattr(engine, "require_exchange_ready", False)
+        and not getattr(engine, "exchange_ready", False)
+    ):
+        # Heartbeat or the order endpoint is down. Do not split this window.
+        skipped.add(slug)
+        engine.skipped_unready = skipped
+        notes.append(f"{slug} skipped; exchange not ready to sell")
+        return
     if not should_pre_split(
         stamp,
         next_open * 1000,
@@ -470,11 +794,17 @@ def _consider_pre_split(
                 f"{slug} split was not confirmed before quoting ended; not quoting it"
             )
         return
+    lookup_now = float(getattr(engine, "clock_now", 0) or (stamp / 1000))
+    if _call_is_waiting(engine, "discovery", lookup_now):
+        return
     try:
         found = reader.discover_btc_updown(next_open, 1, [slug])
-    except PublicDataError as exc:
-        notes.append(f"next market lookup failed: {exc}")
+    except Exception as exc:
+        _record_call_failure(
+            engine, "discovery", lookup_now, notes, f"next market lookup failed: {exc}"
+        )
         return
+    _record_call_ok(engine, "discovery")
     if not found:
         return
     payload = dict(found[0])
@@ -492,6 +822,9 @@ def _consider_pre_split(
     amount = _affordable_split(engine, market, config)
     if amount is None:
         notes.append(f"{slug} not split; cash is below the minimum order")
+        return
+    split_now = float(getattr(engine, "clock_now", 0) or (stamp / 1000))
+    if _call_is_waiting(engine, "split", split_now):
         return
     engine.handle_event(
         {
@@ -519,7 +852,13 @@ def _consider_pre_split(
             str(config.priority_fee_gwei),
         )
     except Exception as exc:
-        notes.append(creds.redact(f"split submit failed: {exc}"))
+        _record_call_failure(
+            engine,
+            "split",
+            split_now,
+            notes,
+            creds.redact(f"split submit failed: {exc}"),
+        )
         engine.handle_event(
             {
                 "type": "split_abandoned",
@@ -530,6 +869,7 @@ def _consider_pre_split(
             }
         )
         return
+    _record_call_ok(engine, "split")
     sent = getattr(engine, "split_sent", set())
     sent.add(slug)
     sent.add(market.market_id)
@@ -713,6 +1053,84 @@ def _load_market(
     return True
 
 
+def _release_orders(engine, market, *, cancel_ok: bool) -> None:
+    """Drop local reservations for orders the exchange does not have."""
+    from paper_split_maker.models import WORKING_ORDER_STATUSES
+
+    for order in list(engine.state.orders.values()):
+        if order.market_id != market.market_id:
+            continue
+        if order.status not in WORKING_ORDER_STATUSES:
+            continue
+        if order.exchange_id and not cancel_ok:
+            continue
+        order.status = "cancelled"
+
+
+def _merge_flat(engine, market, stamp: int, reason: str) -> bool:
+    from paper_split_maker.decimal_utils import qdown
+    from paper_split_maker.risk import reserved
+
+    if engine._working(market) or market.pending_split > 0:
+        return False
+    free_up = market.up - reserved(engine.state, market, "up")
+    free_down = market.down - reserved(engine.state, market, "down")
+    amount = free_up if free_up < free_down else free_down
+    amount = qdown(amount, engine.config.order_size_quantum)
+    if amount <= 0:
+        market.reserve_active = market.up > 0 or market.down > 0
+        return market.up == 0 and market.down == 0
+    seq = getattr(engine, "_rollover_seq", 0) + 1
+    engine._rollover_seq = seq
+    engine.handle_event(
+        {
+            "type": "merge",
+            "market_id": market.market_id,
+            "amount": format(amount, "f"),
+            "ts": stamp,
+            "event_id": f"{reason}-merge:{market.market_id}:{seq}:{format(amount, 'f')}",
+        }
+    )
+    if market.up == 0 and market.down == 0:
+        market.reserve_active = False
+        market.session_stopped = True
+        return True
+    return False
+
+
+def _unwind_failed_posts(engine, stamp: int, notes: list[str]) -> None:
+    """Merge a pair whose sells keep failing after the open.
+
+    If the loss floor is what blocks the quote, there is no post error and
+    the pair stays until the normal close.
+    """
+    timeout_s = int(getattr(engine.config, "sell_ready_timeout_seconds", 30) or 0)
+    if timeout_s <= 0:
+        return
+    _ensure_live_state(engine)
+    for market in list(engine.state.markets.values()):
+        if market.gross_split <= 0 or market.status != "open":
+            continue
+        open_s = _slug_open_s(market.slug) or _slug_open_s(market.market_id)
+        if open_s is None or stamp < open_s * 1000 + timeout_s * 1000:
+            continue
+        if market.market_id in engine.sell_accepted:
+            continue
+        if market.market_id in engine.early_merged:
+            continue
+        if int(engine.post_failures.get(market.market_id, 0)) < 1:
+            continue
+        _release_orders(engine, market, cancel_ok=False)
+        merged = _merge_flat(engine, market, stamp, "post_failures")
+        if merged:
+            engine.early_merged.add(market.market_id)
+            notes.append(
+                f"early merge {market.slug or market.market_id}: "
+                f"posts failed for {timeout_s}s"
+            )
+            _note_session_done(engine, market)
+
+
 def _flatten_for_rollover(engine, next_open_s: int, stamp: int, *, lead_ms: int) -> None:
     """Cancel and merge the session that ends as the next one opens.
 
@@ -776,7 +1194,6 @@ def _flatten_for_rollover(engine, next_open_s: int, stamp: int, *, lead_ms: int)
 
 def _poll_resolutions(engine, reader, stamp: int, notes: list[str]) -> None:
     from paper_split_maker.normalize import data_api_resolution_event
-    from paper_split_maker.public_client import PublicDataError
 
     fetch = getattr(reader, "fetch_resolution", None)
     if fetch is None:
@@ -784,11 +1201,18 @@ def _poll_resolutions(engine, reader, stamp: int, notes: list[str]) -> None:
     for market in list(engine.state.markets.values()):
         if market.status in {"open", "redeemed"}:
             continue
+        label = f"resolution:{market.market_id}"
+        poll_now = stamp / 1000
+        if _call_is_waiting(engine, label, poll_now):
+            continue
         try:
             payload = fetch(market.condition_id)
-        except PublicDataError as exc:
-            notes.append(f"resolution poll failed: {exc}")
+        except Exception as exc:
+            _record_call_failure(
+                engine, label, poll_now, notes, f"resolution poll failed: {exc}"
+            )
             continue
+        _record_call_ok(engine, label)
         event = data_api_resolution_event(
             {
                 "market_id": market.market_id,
@@ -839,6 +1263,10 @@ def _remember_assets(engine, asset_ids: list[str]) -> None:
 
 
 def _flush_chain(engine, creds, notes: list[str]) -> None:
+    _ensure_live_state(engine)
+    now = float(getattr(engine, "clock_now", 0) or time.time())
+    if now < engine.call_ready_at.get("chain", 0):
+        return
     items = list(engine.chain_outbox)
     engine.chain_outbox.clear()
     if not items:
@@ -846,7 +1274,7 @@ def _flush_chain(engine, creds, notes: list[str]) -> None:
     from paper_split_maker.chain_send import submit_position
 
     routes = getattr(engine, "market_routes", {})
-    for item in items:
+    for index, item in enumerate(items):
         route = routes.get(item["market_id"], {"version": "v1", "neg_risk": False})
         try:
             submit_position(
@@ -862,12 +1290,17 @@ def _flush_chain(engine, creds, notes: list[str]) -> None:
             )
             notes.append(f"{item['action']} submitted for {item['market_id']}")
         except Exception as exc:
-            notes.append(creds.redact(f"{item['action']} failed: {exc}"))
-            engine.state.mismatch_stop = True
+            text = creds.redact(f"{item['action']} failed: {exc}")
+            notes.append(text)
+            _log_exchange_error(engine, "chain", text)
+            fails = int(engine.call_failures.get("chain", 0)) + 1
+            engine.call_failures["chain"] = fails
+            engine.call_ready_at["chain"] = now + _backoff_delay(fails)
+            engine.chain_outbox.extend(items[index:])
             return
 
 
-def drain_market_ws(engine, ws_queue, stamp: int) -> int:
+def drain_market_ws(engine, ws_queue, stamp: int, creds=None, notes: list[str] | None = None) -> int:
     """Apply queued public book frames, then let the quote logic run."""
     applied = 0
     seq = 0
@@ -877,6 +1310,12 @@ def drain_market_ws(engine, ws_queue, stamp: int) -> int:
         except queue.Empty:
             break
         seq += 1
+        if isinstance(raw, dict) and raw.get("__ws_error__"):
+            text = f"market websocket failed: {raw.get('__ws_error__')}"
+            if notes is not None:
+                notes.append(text)
+            _log_exchange_error(engine, "websocket", text)
+            continue
         payload = raw
         if isinstance(raw, str):
             try:
@@ -970,9 +1409,13 @@ def _start_market_ws(asset_ids: list[str], out_queue, stop) -> threading.Thread 
                             if raw in {"PING", "PONG"}:
                                 continue
                             out_queue.put(raw)
-                except Exception:
+                except Exception as exc:
                     if stop.is_set():
                         return
+                    try:
+                        out_queue.put({"__ws_error__": str(exc)})
+                    except Exception:
+                        pass
                     await asyncio.sleep(1)
 
         asyncio.run(loop())

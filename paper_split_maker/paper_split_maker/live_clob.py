@@ -128,17 +128,17 @@ def post_only_sells(client, orders: list[dict]) -> list[dict]:
 
     out = []
     for order in orders:
-        args = OrderArgs(
-            token_id=str(order["token_id"]),
-            price=float(order["price"]),
-            size=float(order["size"]),
-            side=Side.SELL,
-        )
-        options = PartialCreateOrderOptions(
-            tick_size=str(order.get("tick_size") or "0.01")
-        )
-        signed = client.create_order(args, options)
         try:
+            args = OrderArgs(
+                token_id=str(order["token_id"]),
+                price=float(order["price"]),
+                size=float(order["size"]),
+                side=Side.SELL,
+            )
+            options = PartialCreateOrderOptions(
+                tick_size=str(order.get("tick_size") or "0.01")
+            )
+            signed = client.create_order(args, options)
             out.append(client.post_order(signed, OrderType.GTC, post_only=True))
         except Exception as exc:
             # A client error is this order's refusal, not a failed batch.
@@ -156,8 +156,17 @@ def cancel_all(client) -> None:
     client.cancel_all()
 
 
-def heartbeat(client, heartbeat_id: str | None) -> str | None:
-    result = client.post_heartbeat(heartbeat_id)
+def heartbeat(client, heartbeat_id: str | None):
+    """Send one heartbeat.
+
+    Returns ``(heartbeat_id, error)``. Network failures, including
+    ``PolyApiException`` with ``status_code`` None, come back as ``error``
+    instead of escaping. The caller retries on a later tick.
+    """
+    try:
+        result = client.post_heartbeat(heartbeat_id)
+    except Exception as exc:
+        return heartbeat_id, exc
     if isinstance(result, dict):
-        return result.get("heartbeat_id") or heartbeat_id
-    return heartbeat_id
+        return result.get("heartbeat_id") or heartbeat_id, None
+    return heartbeat_id, None

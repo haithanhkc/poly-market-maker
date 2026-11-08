@@ -63,5 +63,6 @@
     "requote_vol_k":  "1",
     "requote_vol_window_ms":  30000,
     "requote_size_threshold":  "1",
-    "close_improve_seconds":  90
+    "close_improve_seconds":  90,
+    "sell_ready_timeout_seconds":  30
 }
