@@ -6,6 +6,9 @@ file does the same. Inventory is quoted only after a split confirmation.
 
 from __future__ import annotations
 
+import json
+import queue
+import threading
 import time
 from pathlib import Path
 
@@ -48,11 +51,18 @@ def run_confirmed_live(
     from paper_split_maker.public_client import PublicDataError, PublicReadClient
 
     reader = PublicReadClient()
+    ws_queue: queue.Queue = queue.Queue()
+    ws_stop = threading.Event()
+    ws_assets: list[str] = []
+    ws_thread = _start_market_ws(ws_assets, ws_queue, ws_stop)
     notes = [
         "Live session on the configured funder. Orders are post-only sells.",
         describe_user_subscribe(creds.funder, max_markets),
         "Unconfirmed splits are not quoted.",
         "Shutdown sends cancel-all.",
+        "Market websocket is on."
+        if ws_thread is not None
+        else "Market websocket package is missing; books come from REST.",
     ]
     print(describe_user_subscribe(creds.funder, max_markets))
     heartbeat_id = None
@@ -64,6 +74,8 @@ def run_confirmed_live(
                 notes.append("kill switch file seen")
                 break
             now = time.time()
+            _remember_assets(engine, ws_assets)
+            drain_market_ws(engine, ws_queue, int(now * 1000))
             _poll_public(engine, reader, config, int(now * 1000), max_markets, notes)
             _confirm_splits(engine, creds, int(now * 1000), notes)
             _consider_pre_split(engine, reader, config, creds, int(now * 1000), notes)
@@ -88,8 +100,10 @@ def run_confirmed_live(
                 notes.append("stopped on reconcile or kill")
                 break
             _send_new_quotes(engine, client, post_only_sells, creds, notes)
+            _flush_chain(engine, creds, notes)
             time.sleep(min(0.2, max(0.0, deadline - time.time())))
     finally:
+        ws_stop.set()
         try:
             cancel_all(client)
             notes.append("cancel-all sent")
@@ -209,6 +223,7 @@ def _poll_public(
             event["event_id"] = f"open:{event['condition_id']}"
             event["ts"] = stamp
             engine.handle_event(event)
+            _remember_route(engine, event["market_id"], payload, event["condition_id"])
     failed = False
     for market in list(engine.state.markets.values()):
         if market.status == "redeemed":
@@ -287,8 +302,9 @@ def _confirm_splits(engine, creds, stamp: int, notes: list[str]) -> None:
         if market is None or market.pending_split <= 0:
             txs.pop(slug, None)
             continue
+        settled = slug in getattr(engine, "split_settled", set())
         try:
-            ok = eoa_confirmed(ident) if creds.signature_type == 0 else False
+            ok = settled or (creds.signature_type == 0 and eoa_confirmed(ident))
         except Exception as exc:
             notes.append(creds.redact(f"split receipt failed: {exc}"))
             ok = False
@@ -377,24 +393,25 @@ def _consider_pre_split(
         }
     )
     version = str(found[0].get("version") or "v1")
-    plan = split_plan(
-        version, event["condition_id"], str(amount), bool(found[0].get("negRisk"))
-    )
+    _remember_route(engine, slug, found[0], event["condition_id"])
     try:
-        from paper_split_maker.chain_send import send_eoa
+        from paper_split_maker.chain_send import submit_position
 
-        if creds.signature_type != 0:
-            raise RuntimeError(
-                "POLY_PROXY, GNOSIS_SAFE, and POLY_1271 splits must be signed "
-                "for the official relayer. This process will not submit an unsigned request."
-            )
-        ident = send_eoa(
-            plan,
+        ident, settled = submit_position(
             creds,
+            "split",
+            event["condition_id"],
+            str(amount),
+            version,
+            bool(found[0].get("negRisk")),
             config.gas_limit,
             str(config.max_fee_gwei),
             str(config.priority_fee_gwei),
         )
+        if settled:
+            ready = getattr(engine, "split_settled", set())
+            ready.add(slug)
+            engine.split_settled = ready
     except Exception as exc:
         notes.append(creds.redact(f"split submit failed: {exc}"))
         engine.handle_event(
@@ -413,6 +430,170 @@ def _consider_pre_split(
     engine.split_tx = getattr(engine, "split_tx", {})
     engine.split_tx[slug] = ident
     notes.append(f"split submitted for {slug}")
+
+
+def _remember_route(engine, market_id: str, payload: dict, condition_id: str) -> None:
+    routes = getattr(engine, "market_routes", {})
+    routes[market_id] = {
+        "version": str(payload.get("version") or "v1"),
+        "neg_risk": bool(payload.get("negRisk")),
+        "condition_id": condition_id,
+    }
+    engine.market_routes = routes
+
+
+def _remember_assets(engine, asset_ids: list[str]) -> None:
+    wanted = []
+    for market in engine.state.markets.values():
+        for token in (market.up_token_id, market.down_token_id):
+            if token and token not in wanted:
+                wanted.append(token)
+    if wanted != list(asset_ids):
+        asset_ids[:] = wanted
+
+
+def _flush_chain(engine, creds, notes: list[str]) -> None:
+    items = list(engine.chain_outbox)
+    engine.chain_outbox.clear()
+    if not items:
+        return
+    from paper_split_maker.chain_send import submit_position
+
+    routes = getattr(engine, "market_routes", {})
+    for item in items:
+        route = routes.get(item["market_id"], {"version": "v1", "neg_risk": False})
+        try:
+            submit_position(
+                creds,
+                item["action"],
+                item["condition_id"],
+                item["amount"],
+                route["version"],
+                bool(route.get("neg_risk")),
+                engine.config.gas_limit,
+                str(engine.config.max_fee_gwei),
+                str(engine.config.priority_fee_gwei),
+            )
+            notes.append(f"{item['action']} submitted for {item['market_id']}")
+        except Exception as exc:
+            notes.append(creds.redact(f"{item['action']} failed: {exc}"))
+            engine.state.mismatch_stop = True
+            return
+
+
+def drain_market_ws(engine, ws_queue, stamp: int) -> int:
+    """Apply queued public book frames, then let the quote logic run."""
+    applied = 0
+    seq = 0
+    while True:
+        try:
+            raw = ws_queue.get_nowait()
+        except queue.Empty:
+            break
+        seq += 1
+        payload = raw
+        if isinstance(raw, str):
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+        applied += apply_market_frame(engine, payload, stamp, seq)
+    if applied:
+        engine.handle_event(
+            {
+                "type": "heartbeat",
+                "ts": stamp,
+                "event_id": f"ws-hb-{stamp}-{seq}",
+            }
+        )
+    return applied
+
+
+def apply_market_frame(engine, frame, stamp: int, seq: int = 0) -> int:
+    from paper_split_maker.normalize import clob_book_event
+
+    frames = frame if isinstance(frame, list) else [frame]
+    applied = 0
+    for item in frames:
+        if not isinstance(item, dict):
+            continue
+        asset = str(item.get("asset_id") or "")
+        market = None
+        outcome = ""
+        for candidate in engine.state.markets.values():
+            if asset == candidate.up_token_id:
+                market, outcome = candidate, "up"
+            elif asset == candidate.down_token_id:
+                market, outcome = candidate, "down"
+        if market is None:
+            continue
+        payload = dict(item)
+        if "bids" not in payload and item.get("event_type") == "best_bid_ask":
+            payload = {
+                "bids": [{"price": item.get("best_bid"), "size": "1"}],
+                "asks": [{"price": item.get("best_ask"), "size": "1"}],
+                "timestamp": item.get("timestamp") or stamp,
+                "hash": item.get("hash") or f"bba-{asset}-{stamp}-{seq}",
+                "asset_id": asset,
+            }
+        event = clob_book_event(
+            market.market_id,
+            outcome,
+            payload,
+            event_id=f"ws:{market.market_id}:{outcome}:{payload.get('hash')}:{stamp}:{seq}:{applied}",
+        )
+        if event is None:
+            continue
+        event["book_ts"] = event["ts"]
+        event["ts"] = stamp
+        engine.handle_event(event)
+        applied += 1
+    return applied
+
+
+def _start_market_ws(asset_ids: list[str], out_queue, stop) -> threading.Thread | None:
+    try:
+        import websockets
+    except ImportError:
+        return None
+
+    def _run() -> None:
+        import asyncio
+
+        from paper_split_maker.feeds import MARKET_WS, market_subscribe
+
+        async def loop() -> None:
+            while not stop.is_set():
+                current = list(asset_ids)
+                if not current:
+                    await asyncio.sleep(0.2)
+                    continue
+                try:
+                    async with websockets.connect(MARKET_WS, ping_interval=None) as ws:
+                        await ws.send(json.dumps(market_subscribe(current)))
+                        subscribed = list(current)
+                        next_ping = time.time() + 10
+                        while not stop.is_set() and list(asset_ids) == subscribed:
+                            if time.time() >= next_ping:
+                                await ws.send("PING")
+                                next_ping = time.time() + 10
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=1)
+                            except asyncio.TimeoutError:
+                                continue
+                            if raw in {"PING", "PONG"}:
+                                continue
+                            out_queue.put(raw)
+                except Exception:
+                    if stop.is_set():
+                        return
+                    await asyncio.sleep(1)
+
+        asyncio.run(loop())
+
+    thread = threading.Thread(target=_run, name="polymarket-market-ws", daemon=True)
+    thread.start()
+    return thread
 
 
 def split_plan(

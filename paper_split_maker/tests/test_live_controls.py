@@ -14,11 +14,16 @@ from paper_split_maker.chain_data import (
     encode_split,
     position_target,
 )
-from paper_split_maker.chain_send import approval_needed, relayer_body
+from paper_split_maker.chain_send import (
+    approval_needed,
+    official_position_call,
+    relayer_body,
+)
 from paper_split_maker.cli import main
 from paper_split_maker.config import Config, load_config
 from paper_split_maker.credentials import load_credentials
 from paper_split_maker.engine import Engine
+from paper_split_maker.risk import reserved, worst_case_equity
 from paper_split_maker.feeds import (
     describe_user_subscribe,
     market_subscribe,
@@ -27,7 +32,11 @@ from paper_split_maker.feeds import (
 )
 from paper_split_maker.historical import session_distribution
 from paper_split_maker.live_gate import live_gates
-from paper_split_maker.live_runner import quoting_allowed, split_plan
+from paper_split_maker.live_runner import (
+    apply_market_frame,
+    quoting_allowed,
+    split_plan,
+)
 from paper_split_maker.live_session import (
     LiveController,
     RecordingGateway,
@@ -509,6 +518,192 @@ def test_taker_repair_is_off_and_calldata_is_labeled():
     fills = user_fill_deltas(payload, {})
     assert fills[0]["trade_id"] == "trade-1"
     assert fills[0]["size"] == "2"
+
+
+def _quote_rows(engine):
+    return sorted(
+        (order.outcome, order.price, order.size)
+        for order in engine.state.orders.values()
+        if order.status in {"queued", "live"}
+    )
+
+
+def test_live_old200_quotes_like_the_historical_config(tmp_path):
+    live = load_config(ROOT / "config.live.old200.json")
+    old = load_config(ROOT / "config.historical200.json")
+    assert live.live is True
+    assert live.loss_floor() == Decimal("194")
+    assert old.loss_floor() == Decimal("194")
+    for name in (
+        "initial_capital",
+        "max_loss_fraction",
+        "per_market_budget",
+        "clip_size",
+        "min_edge",
+        "skew_edge_per_share",
+        "skew_size_per_share",
+        "split_clip",
+        "min_pair_inventory",
+        "quote_cooldown_ms",
+        "stop_quoting_before_expiry_ms",
+        "cancel_latency_ms",
+    ):
+        assert getattr(live, name) == getattr(old, name)
+    assert live.slices_per_side == 1
+    assert live.slice_inside_tick is False
+    assert live.max_pair_loss == Decimal("1")
+    assert live.session_max_loss == Decimal("0")
+    assert live.max_open_markets == 1
+    assert live.requote_min_ticks == 1
+    assert live.requote_min_interval_ms == live.quote_cooldown_ms
+    assert live.taker_repair is False
+    assert live.kill_switch_file == "kill.switch"
+    assert live.auto_split is False
+    assert live.fill_mode == "none"
+
+    def opened(config, path):
+        engine = Engine.create(config, path / "state.json", path / "logs")
+        run(
+            engine,
+            [
+                market_event(end_ts=1_000_000),
+                {
+                    "type": "split",
+                    "event_id": "split-5",
+                    "ts": 1,
+                    "market_id": "m1",
+                    "amount": "5",
+                },
+                *both_books("m1", "0.40", "0.50", 1_000),
+                {"type": "heartbeat", "event_id": "h1", "ts": 1_000},
+                {"type": "heartbeat", "event_id": "h2", "ts": 1_001},
+            ],
+        )
+        return engine
+
+    live_engine = opened(live, tmp_path / "live")
+    old_engine = opened(old, tmp_path / "old")
+    assert _quote_rows(live_engine) == _quote_rows(old_engine)
+    assert _quote_rows(live_engine) == [
+        ("down", Decimal("0.50"), Decimal("5")),
+        ("up", Decimal("0.50"), Decimal("5")),
+    ]
+    market = live_engine.state.markets["m1"]
+    assert reserved(live_engine.state, market, "up") == Decimal("5")
+    assert worst_case_equity(live_engine.state) >= live_engine.state.loss_floor
+    rejected = run(
+        live_engine,
+        [
+            {
+                "type": "merge",
+                "event_id": "merge-reserved",
+                "ts": 1_100,
+                "market_id": "m1",
+                "amount": "5",
+            }
+        ],
+    )
+    assert any(row["reason"] == "reserved_inventory" for row in rejected)
+    assert market.up == Decimal("5")
+    blocked = run(
+        live_engine,
+        [market_event(market_id="m2", end_ts=1_000_000, ts=1_200)],
+    )
+    assert any(row["reason"] == "max_open_markets" for row in blocked)
+    assert "m2" not in live_engine.state.markets
+
+    apply_market_frame(
+        live_engine,
+        {
+            "event_type": "book",
+            "asset_id": "m1-up",
+            "bids": [{"price": "0.41", "size": "100"}],
+            "asks": [{"price": "0.51", "size": "10"}],
+            "timestamp": 2,
+            "hash": "up-51",
+        },
+        2_000,
+    )
+    apply_market_frame(
+        live_engine,
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "m1-down",
+            "best_bid": "0.41",
+            "best_ask": "0.51",
+            "timestamp": 2,
+        },
+        2_000,
+        seq=1,
+    )
+    run(
+        live_engine,
+        [
+            {"type": "heartbeat", "event_id": "rq1", "ts": 2_000},
+            {"type": "heartbeat", "event_id": "rq2", "ts": 2_600},
+        ],
+    )
+    working = [
+        order
+        for order in live_engine.state.orders.values()
+        if order.status in {"queued", "live"}
+    ]
+    assert {order.price for order in working} == {Decimal("0.51")}
+    assert worst_case_equity(live_engine.state) >= live_engine.state.loss_floor
+    assert live_engine.chain_outbox == []
+
+
+class _Handle:
+    def __init__(self, action, condition_id, amount):
+        self.action = action
+        self.condition_id = condition_id
+        self.amount = amount
+
+    def wait(self):
+        return {"transaction_hash": f"0x{self.action}", "transaction_id": "tid"}
+
+
+class _Official:
+    def __init__(self):
+        self.calls = []
+
+    def split_position(self, condition_id, amount):
+        self.calls.append(("split", condition_id, amount))
+        return _Handle("split", condition_id, amount)
+
+    def merge_positions(self, condition_id, amount):
+        self.calls.append(("merge", condition_id, amount))
+        return _Handle("merge", condition_id, amount)
+
+    def redeem_positions(self, condition_id):
+        self.calls.append(("redeem", condition_id, None))
+        return _Handle("redeem", condition_id, None)
+
+
+def test_official_client_signs_proxy_split_merge_redeem():
+    creds = load_credentials(
+        {
+            "POLY_PRIVATE_KEY": SECRET,
+            "POLY_FUNDER": "0xabc",
+            "POLY_SIGNATURE_TYPE": "1",
+            "RELAYER_API_KEY": "relayer-key",
+            "RELAYER_API_KEY_ADDRESS": "0xsigner",
+        }
+    )
+    client = _Official()
+    condition = "0x" + "11" * 32
+    assert official_position_call(
+        creds, "split", condition, 5_000_000, client=client
+    ) == ("0xsplit")
+    assert official_position_call(
+        creds, "merge", condition, 5_000_000, client=client
+    ) == ("0xmerge")
+    assert (
+        official_position_call(creds, "redeem", condition, 0, client=client)
+        == "0xredeem"
+    )
+    assert [item[0] for item in client.calls] == ["split", "merge", "redeem"]
+    assert SECRET not in json.dumps(client.calls)
 
 
 def test_session_distribution_reports_the_losing_tail():

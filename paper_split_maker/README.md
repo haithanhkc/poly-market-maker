@@ -224,7 +224,7 @@ python3 -m pip install -r requirements-dev.txt
 python3 -m pip install -r requirements-live.txt
 ```
 
-`requirements-live.txt` là tùy chọn: `py-clob-client-v2` (client CLOB V2 chính thức; gói V1 không còn được sàn nhận), `web3`, và `websockets`. Chế độ paper không cần chúng.
+`requirements-live.txt` là tùy chọn: `py-clob-client-v2` (client CLOB V2 chính thức; gói V1 không còn được sàn nhận), `web3`, `websockets`, và `polymarket` (tách/gộp/redeem cho ví không phải EOA). Chế độ paper không cần chúng.
 
 Sao chép `.env.example` thành `.env` trên máy bạn và điền giá trị. `.env` đã nằm trong `.gitignore`. Tiến trình chỉ đọc tên biến môi trường sau, và không in khóa:
 
@@ -238,7 +238,7 @@ Sao chép `.env.example` thành `.env` trên máy bạn và điền giá trị. 
 
 Collateral hiện tại là pUSD `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` (6 số lẻ), không còn là USDC.e. Bot chỉ gửi `approve` khi allowance đang thiếu. Thị trường version v1 dùng adapter `0xAdA100Db00Ca00073811820692005400218FcE1f` (NegRisk: `0xadA2005600Dec949baf300f4C6120000bDB6eAab`). Version v2 dùng Router `0x12121212006e4CD160D18e3f00711DA5c3372600`. Gas cấu hình bằng `gas_limit`, `max_fee_gwei`, `priority_fee_gwei`. Để 0 thì phí gas lấy theo node.
 
-Ví EOA được gửi tách/gộp/redeem từ tiến trình này. Ví proxy, Safe và deposit wallet cần chữ ký relayer chính thức (`https://relayer-v2.polymarket.com/submit`, đợi `STATE_CONFIRMED`). Bản này từ chối gửi một body chưa ký, nên với ba loại ví đó bạn chưa nên bật live cho đến khi yêu cầu đã được ký bằng client relayer chính thức.
+Lệnh đặt và hủy đi qua client CLOB cho cả bốn loại ví. Tách, gộp và redeem của ví EOA là giao dịch Polygon. Proxy, Safe và deposit wallet dùng `SecureClient` của gói chính thức `polymarket` (`split_position`, `merge_positions`, `redeem_positions`), có ký và đợi relayer xác nhận. Thiếu `RELAYER_API_KEY` thì tiến trình không gửi yêu cầu chưa ký. Cách đối chiếu loại ví và lệnh chạy bằng logic cũ nằm trong `docs/CHAY_THAT.md`.
 
 Ba cổng, thiếu một cổng là tiến trình từ chối và không gửi gì:
 
@@ -297,7 +297,7 @@ Logic cũ là một lệnh mỗi phía, tách 5, không sàn cặp. Logic mới 
 - Hàng chờ giấy là giả định (khối đang thấy tại mức giá, cộng một lượng cấu hình). Tape công khai không cho biết vị trí thật của một lệnh chưa từng được gửi.
 - Mặc định vẫn một lệnh bán mỗi phía (`slices_per_side` = 1) để các phiên giấy cũ không đổi. Đặt lớn hơn 1 thì mỗi phía được cắt thành nhiều clip, cách nhau một tick, có thể thêm một tick bên trong spread nếu `slice_inside_tick` là true và post-only còn đứng được. Không có clip nhỏ hơn `min_order_size` của thị trường.
 - Sổ 5 phút thường rất rộng; khi spread vượt 0.10 bot đứng ngoài. Đó là cố ý.
-- Ở chế độ paper, `MERGE` và `SPLIT` là bút toán. Ở chế độ live, ví EOA gửi giao dịch on-chain; ví proxy, Safe và deposit wallet không được gửi yêu cầu relayer chưa ký.
+- Ở chế độ paper, `MERGE` và `SPLIT` là bút toán. Ở chế độ live, ví EOA gửi giao dịch Polygon; ví proxy, Safe và deposit wallet gửi qua `SecureClient` chính thức khi đã có khóa relayer.
 - Làm tròn size và cash về 0.000001. Size lệnh mặc định về bước 0.01.
 - Rebate là ước tính thô, có thể cao hoặc thấp hơn tiền thật, và có thể bằng không.
 - Sửa tay `state.json` làm hỏng sổ. Chương trình từ chối chạy nếu worst-case đã dưới sàn.

@@ -55,6 +55,7 @@ class Engine:
         self._batch: list[dict] = []
         self._skip_once: set[tuple[str, str, str]] = set()
         self.mode = "library"
+        self.chain_outbox: list[dict] = []
         # Long replays flush the ledger once at the end. Live paper mode keeps
         # the default and writes state after every event.
         self.persist_each_event = True
@@ -1100,6 +1101,15 @@ class Engine:
         self.state.cash += amount
         market.net_cash_flow += amount
         self._emit(kind="merge", market=market, size=amount, reason=reason)
+        if self.mode == "live":
+            self.chain_outbox.append(
+                {
+                    "action": "merge",
+                    "market_id": market.market_id,
+                    "condition_id": market.condition_id,
+                    "amount": format(amount, "f"),
+                }
+            )
         return True
 
     def _merge_free(self, market: Market, reason: str) -> None:
@@ -1133,6 +1143,15 @@ class Engine:
         self._emit(
             kind="redeem", market=market, size=payout, reason=market.winner or ""
         )
+        if self.mode == "live" and payout > 0:
+            self.chain_outbox.append(
+                {
+                    "action": "redeem",
+                    "market_id": market.market_id,
+                    "condition_id": market.condition_id,
+                    "amount": format(payout, "f"),
+                }
+            )
         return True
 
     def _refresh_expiry(self, market: Market) -> None:

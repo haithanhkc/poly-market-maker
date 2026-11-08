@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-live = ["py-clob-client-v2", "web3", "websockets"]
+live = ["py-clob-client-v2", "web3", "websockets", "polymarket"]
 
 [project.scripts]
 paper-split-maker = "paper_split_maker.cli:main"
