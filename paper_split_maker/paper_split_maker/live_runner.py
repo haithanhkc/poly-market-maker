@@ -158,10 +158,19 @@ def _send_new_quotes(engine, client, post_only_sells, creds, notes: list[str]) -
     ack_ms = int((time.time() - started) * 1000)
     for item, result in zip(pending, results):
         ident = ""
+        error = ""
         if isinstance(result, dict):
             ident = str(result.get("orderID") or result.get("id") or "")
-        item["order"].exchange_id = ident
+            error = str(result.get("errorMsg") or result.get("error") or "")
+            if result.get("success") is False and not error:
+                error = "order not accepted"
         item["order"].sent = True
+        if error or not ident:
+            # The exchange did not take this order. It must not count as resting.
+            engine.reject_live_order(item["order"], error or "no order id")
+            notes.append(creds.redact(f"order rejected: {error or 'no order id'}"))
+            continue
+        item["order"].exchange_id = ident
         engine._emit(
             kind="latency",
             market=engine.state.markets[item["order"].market_id],
@@ -181,6 +190,10 @@ def _send_cancels(engine, client, creds, notes: list[str]) -> None:
         ):
             ids.append(order.exchange_id)
             order.cancel_sent = True
+    stray = getattr(engine, "stray_remote_cancels", None)
+    if stray:
+        ids.extend(stray)
+        stray.clear()
     if not ids:
         return
     started = time.time()
@@ -295,7 +308,7 @@ def _confirm_splits(engine, creds, stamp: int, notes: list[str]) -> None:
     txs = getattr(engine, "split_tx", {})
     if not txs:
         return
-    from paper_split_maker.chain_send import eoa_confirmed
+    from paper_split_maker.chain_send import eoa_confirmed, split_tokens_present
 
     for slug, ident in list(txs.items()):
         market = engine.state.markets.get(slug)
@@ -307,6 +320,20 @@ def _confirm_splits(engine, creds, stamp: int, notes: list[str]) -> None:
             ok = settled or (creds.signature_type == 0 and eoa_confirmed(ident))
         except Exception as exc:
             notes.append(creds.redact(f"split receipt failed: {exc}"))
+            ok = False
+        if not ok:
+            continue
+        # A settled relayer call or a receipt is not enough: confirm only when
+        # the funder really holds both outcome tokens on chain.
+        try:
+            ok = split_tokens_present(
+                creds.funder,
+                market.up_token_id,
+                market.down_token_id,
+                market.pending_split,
+            )
+        except Exception as exc:
+            notes.append(creds.redact(f"split balance check failed: {exc}"))
             ok = False
         if not ok:
             continue
@@ -382,6 +409,10 @@ def _consider_pre_split(
     event["ts"] = stamp
     event["event_id"] = f"open:{slug}"
     engine.handle_event(event)
+    if slug not in engine.state.markets:
+        # The engine refused the market: never split on-chain for it.
+        notes.append(f"{slug} not accepted by engine; no split")
+        return
     amount = config.split_clip
     engine.handle_event(
         {

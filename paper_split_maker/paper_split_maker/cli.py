@@ -279,7 +279,23 @@ def _print_summary(summary: dict) -> None:
         ),
         "markets_declined": (summary.get("historical") or {}).get("markets_declined"),
     }
-    print(json.dumps(brief, ensure_ascii=False, indent=2, sort_keys=True))
+    text = json.dumps(brief, ensure_ascii=False, indent=2, sort_keys=True)
+    _safe_print(text)
+
+
+def _safe_print(text: str) -> None:
+    """Print without crashing on consoles such as Windows gbk/cp1252."""
+    import sys
+
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        stream = getattr(sys.stdout, "buffer", None)
+        if stream is not None:
+            stream.write(text.encode("utf-8", "replace") + b"\n")
+            stream.flush()
+        else:
+            print(text.encode("ascii", "backslashreplace").decode("ascii"))
 
 
 if __name__ == "__main__":

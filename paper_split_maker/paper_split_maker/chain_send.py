@@ -89,6 +89,67 @@ def eoa_confirmed(tx_hash: str) -> bool:
     return int(receipt["status"]) == 1
 
 
+BALANCE_RPCS = ("https://polygon.drpc.org", "https://polygon-bor-rpc.publicnode.com")
+
+
+def erc1155_balance(owner: str, token_id: str, rpc_call=None) -> int:
+    """CTF balanceOf(owner, id) in base units, read from a public RPC."""
+    from paper_split_maker.chain_data import CTF
+
+    data = (
+        "0x00fdd58e"
+        + owner.lower().replace("0x", "").rjust(64, "0")
+        + format(int(str(token_id)), "x").rjust(64, "0")
+    )
+    if rpc_call is None:
+        rpc_call = _rpc_eth_call
+    return int(str(rpc_call(CTF, data)), 16)
+
+
+def _rpc_eth_call(to: str, data: str) -> str:
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [{"to": to, "data": data}, "latest"],
+        }
+    ).encode("utf-8")
+    last: Exception | None = None
+    for url in BALANCE_RPCS:
+        try:
+            request = urllib.request.Request(
+                url,
+                data=body,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "paper-split-maker/1.0",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                parsed = json.loads(response.read().decode("utf-8"))
+            if parsed.get("result"):
+                return parsed["result"]
+            last = RuntimeError(str(parsed.get("error") or "empty eth_call result"))
+        except Exception as exc:  # try the next RPC
+            last = exc
+    raise RuntimeError(f"balance read failed: {last}")
+
+
+def split_tokens_present(
+    owner: str, up_token: str, down_token: str, amount_shares, rpc_call=None
+) -> bool:
+    """True only when the funder holds at least amount of BOTH outcome tokens."""
+    from paper_split_maker.chain_data import shares_to_base_units
+
+    need = shares_to_base_units(str(amount_shares))
+    return all(
+        erc1155_balance(owner, token, rpc_call) >= need
+        for token in (up_token, down_token)
+    )
+
+
 def submit_position(
     creds: Credentials,
     action: str,

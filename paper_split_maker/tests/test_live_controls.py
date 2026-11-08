@@ -353,7 +353,23 @@ def test_reconcile_mismatch_stops_quoting(tmp_path):
             }
         ],
     )
-    assert engine.state.mismatch_stop is True
+    # A brief lag on the open-orders endpoint is tolerated.
+    assert engine.state.mismatch_stop is False
+    assert any(row["reason"] == "pending" for row in logs)
+    logs = run(
+        engine,
+        [
+            {
+                "type": "reconcile",
+                "event_id": "r3",
+                "ts": 5 + 15000,
+                "open_order_ids": [],
+            }
+        ],
+    )
+    # A persistent mismatch stops only the affected market, not the run.
+    assert engine.state.mismatch_stop is False
+    assert engine.state.markets["m1"].session_stopped is True
     assert any(row["reason"] == "mismatch" for row in logs)
     before = len(engine.state.orders)
     run(
@@ -648,7 +664,8 @@ def test_live_old200_quotes_like_the_historical_config(tmp_path):
         for order in live_engine.state.orders.values()
         if order.status in {"queued", "live"}
     ]
-    assert {order.price for order in working} == {Decimal("0.51")}
+    # A one-tick move does not reprice before the 15 s minimum rest.
+    assert {order.price for order in working} == {Decimal("0.50")}
     assert worst_case_equity(live_engine.state) >= live_engine.state.loss_floor
     assert live_engine.chain_outbox == []
 
@@ -715,3 +732,30 @@ def test_session_distribution_reports_the_losing_tail():
     assert report["worst"] == "-1.5"
     assert report["losing_sessions"] == 2
     assert report["max_session_loss"] == "1.5"
+
+
+def test_reconcile_lag_clears_without_stopping(tmp_path):
+    engine = make_engine(tmp_path)
+    run(
+        engine,
+        [
+            market_event(),
+            *both_books("m1", "0.40", "0.50", 1),
+            {"type": "heartbeat", "event_id": "h1", "ts": 2},
+            {"type": "heartbeat", "event_id": "h2", "ts": 3},
+        ],
+    )
+    live_ids = [
+        order.order_id
+        for order in engine.state.orders.values()
+        if order.status == "live"
+    ]
+    assert live_ids
+    run(engine, [{"type": "reconcile", "event_id": "a1", "ts": 4, "open_order_ids": []}])
+    logs = run(
+        engine,
+        [{"type": "reconcile", "event_id": "a2", "ts": 3000, "open_order_ids": live_ids}],
+    )
+    assert any(row["reason"] == "ok" for row in logs)
+    run(engine, [{"type": "reconcile", "event_id": "a3", "ts": 20000, "open_order_ids": live_ids}])
+    assert engine.state.mismatch_stop is False

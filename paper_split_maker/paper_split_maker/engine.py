@@ -36,6 +36,12 @@ from paper_split_maker.store import load_state, save_state
 SIZE_REASONS = frozenset({"ok", "below_min_size", "insufficient_inventory"})
 
 
+
+RECONCILE_GRACE_MS = 15000
+MIN_ORDER_REST_MS = 15000
+CANCEL_CONFIRM_MS = 3000
+REJECT_PAUSE_MS = 5000
+
 class Engine:
     def __init__(
         self,
@@ -53,6 +59,12 @@ class Engine:
         self.resumed = resumed
         self.writer = LogWriter(self.log_dir) if self.log_dir else None
         self._batch: list[dict] = []
+        # The open-orders endpoint lags a just-posted order by a few seconds.
+        # Remember when each disagreement was first seen so only a persistent
+        # one stops the bot.
+        self._reconcile_first_seen: dict[str, int] = {}
+        self._ignored_remote: set[str] = set()
+        self.stray_remote_cancels: list[str] = []
         self._skip_once: set[tuple[str, str, str]] = set()
         self.mode = "library"
         self.chain_outbox: list[dict] = []
@@ -283,6 +295,7 @@ class Engine:
                 )
             if (
                 order.status == "cancel_requested"
+                and not self.config.live
                 and order.cancel_ready_ts is not None
                 and self.state.feed_up
                 and self.state.now_ms >= order.cancel_ready_ts
@@ -361,17 +374,25 @@ class Engine:
                 kind="reject", market=existing, reason="market_identity_conflict"
             )
             return
+        # Ended markets can no longer be quoted, so they do not hold a slot.
         open_count = sum(
-            1 for item in self.state.markets.values() if item.status != "redeemed"
+            1
+            for item in self.state.markets.values()
+            if item.status != "redeemed"
+            and item.status not in ("expired_unresolved", "resolved")
         )
         if open_count >= self.config.max_open_markets:
             self._emit(
                 kind="reject", reason="max_open_markets", detail=market.market_id
             )
             return
+        for item in self.state.markets.values():
+            if item.status in ("expired_unresolved", "resolved") and not self._working(item):
+                item.reserve_active = False
         market.reserve_active = True
         market.operational_reserve_amount = self.state.operational_reserve
         self.state.markets[market.market_id] = market
+        # Ended markets with no working orders no longer need a reserve.
         if worst_case_equity(self.state) < self.state.loss_floor:
             del self.state.markets[market.market_id]
             self._emit(
@@ -474,6 +495,15 @@ class Engine:
             )
             return
         self.state.seen_trade_ids.add(trade_id)
+        if self.mode == "live":
+            # Live fills come only from the exchange (user_fill).
+            self._emit(
+                kind="trade_ignored",
+                market=market,
+                reason="live_mode_no_model_fill",
+                detail=trade_id,
+            )
+            return
         if self.state.fill_mode != "queue":
             self._emit(
                 kind="trade_ignored",
@@ -581,7 +611,13 @@ class Engine:
         self._apply_fill(market, order, size, synthetic=True)
 
     def _apply_fill(
-        self, market: Market, order: Order, size: Decimal, *, synthetic: bool
+        self,
+        market: Market,
+        order: Order,
+        size: Decimal,
+        *,
+        synthetic: bool,
+        source: str = "model",
     ) -> None:
         proceeds = net_maker_proceeds(size, order.price, self.state.maker_fee_rate)
         self.state.cash += proceeds
@@ -614,7 +650,11 @@ class Engine:
             order=order,
             size=size,
             price=order.price,
-            reason="synthetic_adverse_fill" if synthetic else "queue_model_fill",
+            reason=(
+                "synthetic_adverse_fill"
+                if synthetic
+                else ("exchange_fill" if source == "exchange" else "queue_model_fill")
+            ),
         )
 
     def _on_resolution(self, event: dict) -> None:
@@ -833,9 +873,23 @@ class Engine:
             ):
                 continue
             prices = desired.get(order.outcome, [])
-            if self._price_still_wanted(market, order.price, prices):
+            start = order.live_ts if order.live_ts is not None else order.submit_ts
+            if self.state.now_ms - start < MIN_ORDER_REST_MS:
+                # Every order rests at least MIN_ORDER_REST_MS before a requote.
                 continue
-            if not self._requote_allowed(market):
+            if prices:
+                diff = min(abs(order.price - item) for item in prices)
+                if diff == 0:
+                    continue
+                big = diff >= market.tick_size * 2
+                start = order.live_ts if order.live_ts is not None else order.submit_ts
+                rested = self.state.now_ms - start >= MIN_ORDER_REST_MS
+                # Never reprice for a one-tick wiggle before the order has rested.
+                if not big and not rested:
+                    continue
+                if not big and self._price_still_wanted(market, order.price, prices) and self.config.requote_min_ticks > 1:
+                    continue
+            if prices and not self._requote_allowed(market):
                 continue
             self._request_cancel(market, order, "requote")
             market.last_requote_ts = self.state.now_ms
@@ -893,6 +947,21 @@ class Engine:
         price: Decimal,
         require_repair: bool,
     ) -> None:
+        bid = market.book(proposal.outcome).best_bid()
+        if bid is not None and price <= bid:
+            # Post-only SELL must rest above the best bid; never cross.
+            price = bid + market.tick_size
+            if price >= 1 or self._working_at(market, proposal.outcome, price):
+                self._skip(market, "would_cross", proposal.outcome)
+                return
+            proposal = Proposal(
+                outcome=proposal.outcome,
+                price=price,
+                size=proposal.size,
+                fair=proposal.fair,
+                required_edge=proposal.required_edge,
+                repair=proposal.repair,
+            )
         size = self._largest_size(market, proposal, require_repair)
         if size is None:
             free = market.inventory(proposal.outcome) - reserved(
@@ -1307,7 +1376,10 @@ class Engine:
             )
             return
         order = self.state.orders.get(str(event.get("order_id") or ""))
-        if order is None or order.status not in WORKING_ORDER_STATUSES:
+        # A late fill on an order we already consider cancelled is still real.
+        if order is None or (
+            order.status not in WORKING_ORDER_STATUSES and order.status != "cancelled"
+        ):
             self.state.seen_trade_ids.add(trade_id)
             self._emit(kind="trade_ignored", reason="unknown_order", detail=trade_id)
             return
@@ -1324,7 +1396,23 @@ class Engine:
             )
             return
         self.state.seen_trade_ids.add(trade_id)
-        self._apply_fill(market, order, size, synthetic=False)
+        self._apply_fill(market, order, size, synthetic=False, source="exchange")
+
+    def reject_live_order(self, order, reason: str) -> None:
+        """The exchange refused an order: drop it without touching inventory."""
+        order.status = "rejected"
+        order.remaining = ZERO
+        market = self.state.markets.get(order.market_id)
+        if market is not None:
+            # Pause briefly so a refused order is not re-posted in a tight loop.
+            market.pause_until_ms = self.state.now_ms + REJECT_PAUSE_MS
+        self._emit(
+            kind="order_rejected",
+            market=self.state.markets.get(order.market_id),
+            order=order,
+            reason="exchange_rejected",
+            detail=str(reason)[:200],
+        )
 
     def _on_reconcile(self, event: dict) -> None:
         remote = event.get("open_order_ids")
@@ -1336,16 +1424,75 @@ class Engine:
         remote_set = {str(item) for item in remote}
         known = set()
         local = set()
+        owner = {}
         for order in self.state.orders.values():
             identity = order.exchange_id or order.order_id
             known.add(identity)
+            owner[identity] = order
             if order.status == "live":
                 local.add(identity)
-        if remote_set - known or local - remote_set:
-            self.state.mismatch_stop = True
-            for market in list(self.state.markets.values()):
+        known |= self._ignored_remote
+        ts = int(event.get("ts") or 0)
+        # Live: a cancel is only confirmed once the exchange no longer lists the
+        # order, and a few seconds have passed for any late fill to arrive.
+        # Until then it still counts as fully fillable exposure.
+        for order in list(self.state.orders.values()):
+            if (
+                order.status == "cancel_requested"
+                and self.config.live
+                and order.exchange_id
+                and order.exchange_id not in remote_set
+                and ts - (order.cancel_request_ts or 0) >= CANCEL_CONFIRM_MS
+            ):
+                order.status = "cancelled"
+                self._emit(
+                    kind="cancel_confirm",
+                    market=self.state.markets.get(order.market_id),
+                    order=order,
+                    size=order.remaining,
+                    reason="exchange_confirmed",
+                )
+        diffs = {f"remote:{item}" for item in remote_set - known} | {
+            f"local:{item}" for item in local - remote_set
+        }
+        for key in list(self._reconcile_first_seen):
+            if key not in diffs:
+                del self._reconcile_first_seen[key]
+        for key in diffs:
+            self._reconcile_first_seen.setdefault(key, ts)
+        grace = RECONCILE_GRACE_MS
+        persistent = [
+            key for key in diffs if ts - self._reconcile_first_seen[key] >= grace
+        ]
+        if diffs and not persistent:
+            self._emit(kind="reconcile", reason="pending", detail=",".join(sorted(diffs))[:200])
+            return
+        if persistent:
+            # Contain the damage to the affected market(s): cancel, stop quoting
+            # there, merge, and keep the run going for later sessions.
+            hit = set()
+            for key in persistent:
+                kind, ident = key.split(":", 1)
+                self._reconcile_first_seen.pop(key, None)
+                if kind == "local" and ident in owner:
+                    hit.add(owner[ident].market_id)
+                else:
+                    self._ignored_remote.add(ident)
+                    self.stray_remote_cancels.append(ident)
+                    for market in self.state.markets.values():
+                        if market.status not in ("redeemed", "resolved"):
+                            hit.add(market.market_id)
+            for market_id in hit:
+                market = self.state.markets.get(market_id)
+                if market is None:
+                    continue
+                market.session_stopped = True
                 self._cancel_market(market, "reconcile_mismatch")
-            self._emit(kind="reconcile", reason="mismatch")
+                for order in self.state.orders.values():
+                    ident = order.exchange_id or order.order_id
+                    if order.market_id == market_id and f"local:{ident}" in persistent:
+                        order.status = "cancelled"
+            self._emit(kind="reconcile", reason="mismatch", detail=",".join(sorted(persistent))[:200])
             return
         self._emit(kind="reconcile", reason="ok")
 
