@@ -26,8 +26,6 @@ from paper_split_maker.quotes import (
     Proposal,
     binding_sell_floor,
     ladder_prices,
-    maker_sell_price,
-    pair_edge_floor,
     propose,
 )
 from paper_split_maker.risk import (
@@ -55,7 +53,8 @@ def is_post_only_cross(message: str) -> bool:
     return (
         "post-only" in text
         or "post only" in text
-        or "would cross" in text
+        or         "would cross" in text
+        or "crosses book" in text
         or "crosses the book" in text
     )
 
@@ -93,6 +92,8 @@ class Engine:
         self.buy_outbox: list[dict] = []
         self.marketable_ids: set[str] = set()
         self.leg_since: dict[str, int] = {}
+        self.leg_cross: set[tuple[str, str]] = set()
+        self._leg_log_key: dict[str, tuple] = {}
         self.buy_fail_outcome: str = ""
         # Long replays flush the ledger once at the end. Live paper mode keeps
         # the default and writes state after every event.
@@ -509,6 +510,11 @@ class Engine:
         self._record_mid(market, outcome)
         self._note_volatility(market)
         self._emit(kind="book", market=market, outcome=outcome, reason="ok")
+        # Reprice when the leftover leg's own book moves. The other side's
+        # book does not change this bid.
+        naked = self._naked_leg(market)
+        if naked is not None and naked[0] == outcome:
+            self._complete_leg(market)
 
     def _on_trade(self, event: dict) -> None:
         market = self._market(event)
@@ -817,16 +823,20 @@ class Engine:
             self._cancel_market(market, reason)
             self._skip(market, reason)
             return
-        if self._in_stop_window(market):
-            self._cancel_market(market, "near_expiry")
-            self._merge_free(market, "near_expiry")
-            self._skip(market, "near_expiry")
-            return
         if market.session_stopped or self._session_capped(market):
             self._cancel_market(market, "session_max_loss")
             self._merge_free(market, "session_max_loss")
             market.session_stopped = True
             self._skip(market, "session_max_loss")
+            return
+        # The leftover leg is managed through the close window. A stop-window
+        # cancel must not pull it before it can be sold at breakeven.
+        if self._complete_leg(market):
+            return
+        if self._in_stop_window(market):
+            self._cancel_market(market, "near_expiry")
+            self._merge_free(market, "near_expiry")
+            self._skip(market, "near_expiry")
             return
         if self.state.now_ms < market.pause_until_ms:
             self._cancel_market(market, "vol_pause")
@@ -835,8 +845,6 @@ class Engine:
         if not market.accepting_orders:
             self._cancel_market(market, "not_accepting")
             self._skip(market, "not_accepting")
-            return
-        if self._complete_leg(market):
             return
         if self.config.entry_mode == "buy_pair_arb":
             if not self.at_cap() and not self.state.killed:
@@ -1491,56 +1499,211 @@ class Engine:
             self.leg_since.pop(market.market_id, None)
         return None
 
-    def _complete_leg(self, market: Market) -> bool:
-        """Work the unfilled side of a one-legged sell, then flatten.
+    def _leg_fill_price(self, market: Market, outcome: str) -> Optional[Decimal]:
+        """Average price already sold on the other side. ``outcome`` is still held."""
+        if outcome == "up":
+            sold, proceeds = market.sold_down_shares, market.sold_down_proceeds
+        else:
+            sold, proceeds = market.sold_up_shares, market.sold_up_proceeds
+        if sold <= 0:
+            return None
+        return proceeds / sold
 
-        For ``leg_unwind_seconds`` the leftover inventory is requoted at
-        bid + 1 tick. After that it is sold at the bid and any still-matched
-        pair is merged. A partial fill uses the same gap.
+    def _leg_floor(self, market: Market, outcome: str, size: Decimal) -> Decimal:
+        """Breakeven for the unsold leg: ``1 - P``, lifted by the taker fee when asked."""
+        tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
+        avg = self._leg_fill_price(market, outcome)
+        if avg is None:
+            return ceil_tick(self.config.min_price, tick)
+        raw = ONE - avg
+        if raw < self.config.min_price:
+            raw = self.config.min_price
+        price = ceil_tick(raw, tick)
+        if (
+            self.config.leg_fee_buffer
+            and self.state.risk_fee_rate > 0
+            and size > 0
+            and price < 1
+        ):
+            need = size * (ONE - avg)
+            for _ in range(50):
+                net = size * price - conservative_fee(
+                    size, price, self.state.risk_fee_rate
+                )
+                if net >= need or price + tick >= 1:
+                    break
+                price += tick
+        if price >= 1:
+            price = ONE - tick
+        if price < self.config.min_price:
+            price = ceil_tick(self.config.min_price, tick)
+        return price
+
+    def _log_leg(
+        self,
+        market: Market,
+        outcome: str,
+        reason: str,
+        *,
+        price: Optional[Decimal],
+        bid: Optional[Decimal],
+        floor: Decimal,
+        size: Decimal,
+    ) -> None:
+        key = (reason, money(price) if price is not None else "", money(size))
+        if self._leg_log_key.get(market.market_id) == key:
+            return
+        self._leg_log_key[market.market_id] = key
+        bid_txt = money(bid) if bid is not None else "none"
+        price_txt = money(price) if price is not None else "none"
+        detail = f"bid={bid_txt} floor={money(floor)} price={price_txt} size={money(size)}"
+        self._emit(
+            kind="leg_unwind",
+            market=market,
+            outcome=outcome,
+            price=price,
+            size=size,
+            reason=reason,
+            detail=detail,
+        )
+        print(
+            f"leg_unwind {market.slug or market.market_id} {outcome} {reason} {detail}",
+            flush=True,
+        )
+
+    def _complete_leg(self, market: Market) -> bool:
+        """Sell the unsold leg of a split at breakeven or better.
+
+        Floor is ``1 - P`` for the filled price P. When the best bid is at
+        least that floor, sell the filled size as a taker at the bid. Otherwise
+        rest a post-only sell at ``max(floor, best_ask - tick)``. After
+        ``leg_unwind_seconds`` the same bid check is repeated. Below the floor,
+        a taker is used only near expiry when ``allow_loss_unwind`` permits it.
+        A partial fill sells the same gap, not the whole inventory.
         """
         naked = self._naked_leg(market)
         if naked is None:
+            self.leg_cross.discard((market.market_id, "up"))
+            self.leg_cross.discard((market.market_id, "down"))
+            self._leg_log_key.pop(market.market_id, None)
             return False
         outcome, gap = naked
-        started = self.leg_since.setdefault(market.market_id, self.state.now_ms)
+        self.leg_since.setdefault(market.market_id, self.state.now_ms)
         book = market.book(outcome)
         bid = book.best_bid()
-        if bid is None:
-            return True
+        ask = book.best_ask()
         tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
-        elapsed = self.state.now_ms - started
-        marketable = elapsed >= int(self.config.leg_unwind_seconds) * 1000
-        if marketable:
-            price = bid
-        else:
-            # Walk toward the bid, but keep the pair floor and do not undercut
-            # a maker price the book already supports.
-            price = bid + tick
-            floor = pair_edge_floor(market, outcome, self.config)
-            if floor is not None and floor > price:
-                price = floor
-            natural = maker_sell_price(market, outcome, self.config)
-            if natural is not None and natural > price:
-                price = natural
-        if price >= 1:
-            price = bid
-            marketable = True
-        if price <= 0:
+        floor = self._leg_floor(market, outcome, gap)
+        if bid is None:
+            self._log_leg(
+                market, outcome, "no_bid", price=None, bid=None, floor=floor, size=gap
+            )
             return True
+        started = self.leg_since.get(market.market_id, self.state.now_ms)
+        elapsed = self.state.now_ms - started
+        timed_out = elapsed >= int(self.config.leg_unwind_seconds) * 1000
+        left_ms = market.end_ts_ms - self.state.now_ms
+        near_expiry = 0 <= left_ms <= int(
+            self.config.unwind_loss_before_expiry_seconds
+        ) * 1000
+        take_px = qdown(bid, tick)
+        if take_px <= 0:
+            take_px = bid
+        shortfall = (floor - take_px) * gap if take_px < floor else ZERO
+        loss_ok = (
+            self.config.allow_loss_unwind
+            and near_expiry
+            and shortfall > 0
+            and shortfall <= self.config.max_unwind_loss
+        )
+        crossed = (market.market_id, outcome) in self.leg_cross
+        taker = False
+        reason = "rest_floor"
+        if take_px >= floor:
+            taker = True
+            price = take_px
+            reason = "taker_timeout" if timed_out else "taker_breakeven"
+        elif loss_ok:
+            taker = True
+            price = take_px
+            reason = "taker_loss_cap"
+        elif crossed:
+            price = bid + tick
+            price = ceil_tick(price, tick)
+            reason = "cross_retry_maker"
+        else:
+            price = floor
+            if ask is not None and ask - tick > price:
+                price = ask - tick
+            price = ceil_tick(price, tick)
+            if price <= bid:
+                price = ceil_tick(bid + tick, tick)
+                reason = "rest_above_bid"
+        if price >= 1:
+            price = ONE - tick
+            if not taker and price <= bid:
+                taker = take_px >= floor
+                price = take_px if taker else price
+        if price <= 0:
+            self._log_leg(
+                market, outcome, "bad_price", price=price, bid=bid, floor=floor, size=gap
+            )
+            return True
+        if crossed and taker:
+            reason = "cross_retry_taker"
+        self.leg_cross.discard((market.market_id, outcome))
+        self.sell_floors.pop((market.market_id, outcome), None)
+        want_marketable = taker
         for order in list(self._working(market, outcome)):
-            if order.price != price:
-                self._request_cancel(market, order, "leg_unwind")
+            same = order.price == price and (
+                (order.order_id in self.marketable_ids) == want_marketable
+            )
+            if same:
+                continue
+            # Never posted, so the exchange is not holding the shares.
+            if order.status == "queued" and not order.exchange_id:
+                order.status = "cancelled"
+                self._emit(
+                    kind="order_cancelled",
+                    market=market,
+                    order=order,
+                    size=order.remaining,
+                    reason="leg_unwind",
+                    detail="unsent",
+                )
+                continue
+            self._request_cancel(market, order, "leg_unwind")
         if not self.config.live:
             self._promote()
         free = market.inventory(outcome) - reserved(self.state, market, outcome)
         size = gap if gap < free else free
         size = qdown(size, self.config.order_size_quantum)
+        minimum = (
+            market.min_order_size
+            if market.min_order_size > self.config.min_order_size
+            else self.config.min_order_size
+        )
+        if size < minimum:
+            self._log_leg(
+                market,
+                outcome,
+                "below_min",
+                price=price,
+                bid=bid,
+                floor=floor,
+                size=size,
+            )
+            return True
         resting = [
             order
             for order in self._working(market, outcome)
             if order.price == price
+            and (order.order_id in self.marketable_ids) == want_marketable
         ]
-        if size > 0 and not resting:
+        if not resting:
+            self._log_leg(
+                market, outcome, reason, price=price, bid=bid, floor=floor, size=size
+            )
             self._place_one(
                 market,
                 Proposal(
@@ -1553,17 +1716,28 @@ class Engine:
                 ),
                 price,
                 False,
-                marketable=marketable,
+                marketable=want_marketable,
                 ignore_floor=True,
             )
             resting = [
                 order
                 for order in self._working(market, outcome)
                 if order.price == price
+                and (order.order_id in self.marketable_ids) == want_marketable
             ]
-        if marketable and not self.config.live:
+        else:
+            self._log_leg(
+                market,
+                outcome,
+                reason + "_keep",
+                price=price,
+                bid=bid,
+                floor=floor,
+                size=size,
+            )
+        if want_marketable and not self.config.live:
             for order in resting:
-                if order.remaining <= 0 or bid < order.price:
+                if order.remaining <= 0 or take_px < order.price:
                     continue
                 fill = order.remaining if order.remaining < gap else gap
                 fill = qdown(fill, Decimal("0.000001"))
@@ -1572,13 +1746,9 @@ class Engine:
                         market, order, fill, synthetic=True, source="leg_unwind"
                     )
                     gap -= fill
-        if marketable:
-            for order in list(self._working(market)):
-                if order.outcome != outcome:
-                    self._request_cancel(market, order, "leg_unwind")
-            if not self.config.live:
-                self._promote()
-            self._merge_free(market, "leg_unwind")
+        # Matched shares merge. The other side's resting sell keeps its own
+        # reservation, so a partial fill does not pull the remainder.
+        self._merge_free(market, "leg_unwind")
         return True
 
     def _buy_plan(self, market: Market) -> Optional[dict]:
@@ -2106,6 +2276,14 @@ class Engine:
         text = str(reason or "no order id")
         if is_post_only_cross(text):
             market = self.state.markets.get(order.market_id)
+            naked = self._naked_leg(market) if market is not None else None
+            if market is not None and naked is not None and naked[0] == order.outcome:
+                # The book moved through the post-only price. Retry as a taker
+                # when the bid still clears breakeven, otherwise one tick up.
+                self.leg_cross.add((order.market_id, order.outcome))
+                self.reject_live_order(order, text, pause=False)
+                self._complete_leg(market)
+                return
             if market is not None:
                 bumped = order.price + market.tick_size
                 if bumped < 1:

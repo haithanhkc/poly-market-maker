@@ -113,9 +113,18 @@ class Config:
     # split_sell quotes both outcomes after a split. buy_pair_arb buys both
     # asks only when they sum to 1 - pair_min_edge, then merges.
     entry_mode: str = "split_sell"
-    # After one sell leg fills, this many seconds to work the other leg at
-    # the bid before crossing it or merging the matched remainder.
+    # After one sell leg fills, keep checking the other leg for this long.
+    # A bid at or above 1 - fill_price is taken immediately; this is the
+    # backstop that repeats that check and then allows a capped loss.
     leg_unwind_seconds: int = 5
+    # Lift 1 - P so a taker fee at risk_fee_rate still nets a breakeven pair.
+    leg_fee_buffer: bool = False
+    # Near expiry, sell below 1 - P rather than carry the leftover to zero.
+    allow_loss_unwind: bool = False
+    # Most USDC the naked size may give up below the breakeven floor.
+    max_unwind_loss: Decimal = Decimal("0")
+    # The loss unwind is allowed only in this many seconds before expiry.
+    unwind_loss_before_expiry_seconds: int = 30
     # 0 disables the pause. Otherwise pull quotes when the mid jumps.
     vol_pause_move: Decimal = Decimal("0")
     vol_pause_window_ms: int = 0
@@ -219,6 +228,10 @@ class Config:
             raise ConfigError("entry_mode must be split_sell or buy_pair_arb")
         if self.leg_unwind_seconds < 0:
             raise ConfigError("leg_unwind_seconds must be non-negative")
+        if self.max_unwind_loss < 0:
+            raise ConfigError("max_unwind_loss must be non-negative")
+        if self.unwind_loss_before_expiry_seconds < 0:
+            raise ConfigError("unwind_loss_before_expiry_seconds must be non-negative")
         if self.requote_vol_window_ms < 0:
             raise ConfigError("requote_vol_window_ms must be non-negative")
         if self.vol_pause_move < 0 or self.btc_pause_move < 0:
@@ -299,6 +312,7 @@ _DECIMAL_FIELDS = {
     "requote_size_threshold",
     "pair_min_edge",
     "max_unpaired_fraction",
+    "max_unwind_loss",
     "taker_repair_max_usdc",
     "max_fee_gwei",
     "priority_fee_gwei",
@@ -325,6 +339,7 @@ _INT_FIELDS = {
     "max_runtime_seconds",
     "redeem_max_attempts",
     "leg_unwind_seconds",
+    "unwind_loss_before_expiry_seconds",
     "vol_pause_window_ms",
     "vol_pause_hold_ms",
     "pre_split_lead_ms",
@@ -338,6 +353,8 @@ _BOOL_FIELDS = {
     "live",
     "slice_inside_tick",
     "taker_repair",
+    "leg_fee_buffer",
+    "allow_loss_unwind",
 }
 
 

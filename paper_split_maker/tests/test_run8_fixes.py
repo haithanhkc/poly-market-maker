@@ -86,7 +86,8 @@ def test_pair_floor_holds_the_cheap_side(tmp_path):
         if order.outcome == "up" and order.status in {"queued", "live"}
     ]
     assert posted
-    assert all(order.price >= Decimal("0.15") for order in posted)
+    # Breakeven is 1 - 0.86. The bid is under it, so the leftover rests there.
+    assert all(order.price >= Decimal("0.14") for order in posted)
     assert any(row["kind"] != "pair_floor_block" for row in logs)
 
 
@@ -213,13 +214,9 @@ def test_up_010_blocked_and_016_allowed_after_down_fill(tmp_path):
             {"type": "heartbeat", "event_id": "hb", "ts": 2},
         ],
     )
-    allowed = propose(engine.state, market, "up", engine.config)
-    assert allowed.reason == "ok"
-    assert allowed.price >= Decimal("0.16")
-    assert allowed.size >= Decimal("5")
-    posted = [order for order in _working(engine) if order.outcome == "up"]
-    assert posted
-    assert all(order.price >= Decimal("0.16") for order in posted)
+    # Bid 0.14 is 1 - 0.86, so the filled size is taken instead of left to expire.
+    assert market.sold_up_shares == Decimal("5")
+    assert market.up == market.down
 
 
 def test_close_improve_never_goes_below_the_floor(tmp_path):
@@ -248,13 +245,11 @@ def test_close_improve_never_goes_below_the_floor(tmp_path):
     assert eased.price >= market.book("up").best_bid() + market.tick_size
 
     _sell_down(engine, market, "5", "0.86")
-    run(
-        engine,
-        [
-            book_event("m1", "down", "0.84", "0.86", ts=3),
-            book_event("m1", "up", "0.08", "0.16", ts=3),
-        ],
-    )
+    # Set the book without an event. A book event would sell the leftover leg.
+    market.book("down").bids = [(Decimal("0.84"), Decimal("100"))]
+    market.book("down").asks = [(Decimal("0.86"), Decimal("10"))]
+    market.book("up").bids = [(Decimal("0.08"), Decimal("100"))]
+    market.book("up").asks = [(Decimal("0.16"), Decimal("10"))]
     matched = propose(engine.state, market, "up", engine.config)
     assert matched.reason == "ok"
     assert matched.price >= Decimal("0.16")

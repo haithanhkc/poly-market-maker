@@ -441,7 +441,9 @@ def _shutdown_live(engine, client, creds, notes: list[str], cancel_all) -> None:
         notes.append(creds.redact(f"shutdown chain failed: {exc}"))
 
 
-def _send_new_quotes(engine, client, post_only_sells, creds, notes: list[str]) -> None:
+def _send_new_quotes(
+    engine, client, post_only_sells, creds, notes: list[str], *, _retry: bool = True
+) -> None:
     pending = []
     for order in engine.state.orders.values():
         if order.status != "queued" or getattr(order, "sent", False):
@@ -475,6 +477,16 @@ def _send_new_quotes(engine, client, post_only_sells, creds, notes: list[str]) -
         if not batch:
             continue
         _post_quote_batch(engine, client, sender, batch, creds, notes)
+    # A crosses-book reject queues a taker (or a one-tick reprice) immediately.
+    retry = [
+        order
+        for order in engine.state.orders.values()
+        if order.status == "queued" and not getattr(order, "sent", False)
+    ]
+    if retry and _retry:
+        _send_new_quotes(
+            engine, client, post_only_sells, creds, notes, _retry=False
+        )
 
 
 def _post_quote_batch(engine, client, sender, pending, creds, notes: list[str]) -> None:
