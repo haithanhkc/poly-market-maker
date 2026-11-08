@@ -67,6 +67,50 @@ def reserved(state: State, market: Market, outcome: str) -> Decimal:
     return total
 
 
+# Defaults of pair_min_edge and max_spread. A sell is a planned pair when its
+# price plus the other side's posted ask, or the ask on a quotable book, clears
+# the pair edge. A wide book is not a quote.
+_PAIR_PLAN_EDGE = Decimal("0.01")
+_PLAN_MAX_SPREAD = Decimal("0.10")
+
+
+def _planned_opposite_price(state: State, market: Market, order: Order) -> Decimal:
+    """Price we are posting or would post on the other side.
+
+    A book wider than the quote spread is not a plan. Only a real posted ask
+    counts then, so a one-tick bid on a broken book cannot waive the loss.
+    """
+    other = "down" if order.outcome == "up" else "up"
+    book = market.book(other)
+    bid = book.best_bid()
+    ask = book.best_ask()
+    tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
+    quotable = (
+        bid is not None
+        and ask is not None
+        and ask > bid
+        and ask - bid <= _PLAN_MAX_SPREAD
+    )
+    planned = (bid + tick) if quotable else ZERO
+    if quotable and ask is not None and ask > planned:
+        planned = ask
+    for existing in working_orders(state, market.market_id):
+        if (
+            existing.order_id != order.order_id
+            and existing.outcome == other
+            and existing.price > planned
+        ):
+            planned = existing.price
+    return planned
+
+
+def _pair_planned(state: State, market: Market, order: Order) -> bool:
+    if order.price <= 0:
+        return False
+    planned = _planned_opposite_price(state, market, order)
+    return order.price + planned >= Decimal("1") + _PAIR_PLAN_EDGE
+
+
 def market_contribution(
     state: State, market: Market, extra: list[Order] | None = None
 ) -> Decimal:
@@ -74,8 +118,12 @@ def market_contribution(
         return ZERO
     up_terms = ZERO
     down_terms = ZERO
-    for order in working_orders(state, market.market_id, extra):
-        term = sell_worst_term(order.remaining, order.price, state.risk_fee_rate)
+    orders = working_orders(state, market.market_id, extra)
+    for order in orders:
+        # The other side's planned ask covers this price, so resolution still
+        # pays about 1 for the pair. Do not value those shares as a total loss.
+        size = ZERO if _pair_planned(state, market, order) else order.remaining
+        term = sell_worst_term(size, order.price, state.risk_fee_rate)
         if order.outcome == "up":
             up_terms += term
         elif order.outcome == "down":

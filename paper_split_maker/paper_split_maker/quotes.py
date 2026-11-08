@@ -13,9 +13,8 @@ from decimal import Decimal
 
 from paper_split_maker.config import Config
 from paper_split_maker.decimal_utils import ZERO, ceil_tick, qdown
-from paper_split_maker.models import Market
+from paper_split_maker.models import WORKING_ORDER_STATUSES, Market, State
 from paper_split_maker.risk import reserved
-from paper_split_maker.models import State
 
 
 @dataclass(frozen=True)
@@ -57,12 +56,143 @@ def pair_edge_floor(market: Market, outcome: str, config: Config):
     return floor
 
 
-def unpaired_sell_room(market: Market, outcome: str, price: Decimal, config: Config):
+def _other(outcome: str) -> str:
+    return "down" if outcome == "up" else "up"
+
+
+def matched_to_sold(market: Market, outcome: str) -> Decimal:
+    """Shares of ``outcome`` that pair with the other side already sold."""
+    if outcome == "up":
+        gap = market.sold_down_shares - market.sold_up_shares
+    else:
+        gap = market.sold_up_shares - market.sold_down_shares
+    if gap < 0:
+        return ZERO
+    return gap
+
+
+def maker_sell_price(market: Market, outcome: str, config: Config) -> Decimal | None:
+    """Price ``propose`` would post before any pair floor. None if the book is unquotable."""
+    book = market.book(outcome)
+    bid = book.best_bid()
+    ask = book.best_ask()
+    if bid is None or ask is None or ask <= bid or ask - bid > config.max_spread:
+        return None
+    self_inv = market.inventory(outcome)
+    other_inv = market.down if outcome == "up" else market.up
+    adverse = other_inv - self_inv
+    if adverse < 0:
+        adverse = ZERO
+    required = config.min_edge + config.skew_edge_per_share * adverse
+    fair = (bid + ask) / 2
+    raw = ask if ask >= fair + required else fair + required
+    price = ceil_tick(raw, market.tick_size)
+    if price <= bid or price >= 1 or price < config.min_price or price > config.max_price:
+        return None
+    return price
+
+
+def planned_opposite_quote(
+    state: State, market: Market, outcome: str, config: Config
+) -> Decimal:
+    """Price we are quoting, or would quote, on the other side.
+
+    That is the best of our posted ask, one tick above that side's bid, and
+    the maker price we would post there before the pair floor.
+    """
+    other = _other(outcome)
+    book = market.book(other)
+    bid = book.best_bid()
+    ask = book.best_ask()
+    tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
+    quotable = (
+        bid is not None
+        and ask is not None
+        and ask > bid
+        and ask - bid <= config.max_spread
+    )
+    planned = (bid + tick) if quotable else ZERO
+    for order in state.orders.values():
+        if (
+            order.market_id == market.market_id
+            and order.outcome == other
+            and order.status in WORKING_ORDER_STATUSES
+            and order.price > planned
+        ):
+            planned = order.price
+    natural = maker_sell_price(market, other, config)
+    if natural is not None and natural > planned:
+        planned = natural
+    filled = pair_edge_floor(market, other, config)
+    if filled is not None:
+        raised = ceil_tick(filled, tick)
+        if raised > planned:
+            planned = raised
+    return planned
+
+
+def pair_plan_covers(
+    state: State, market: Market, outcome: str, price: Decimal, config: Config
+) -> bool:
+    """True when this price plus the planned opposite quote clears the pair edge."""
+    if price <= 0:
+        return False
+    planned = planned_opposite_quote(state, market, outcome, config)
+    return price + planned >= Decimal("1") + config.pair_min_edge
+
+
+def binding_sell_floor(
+    state: State,
+    market: Market,
+    outcome: str,
+    config: Config,
+    size: Decimal,
+    price: Decimal | None = None,
+) -> Decimal | None:
+    """Lowest price a working sell of ``size`` may use.
+
+    Shares matched to the other side's fills use ``1 + edge - avg_sold``.
+    Extra size uses ``1 + edge - planned_opposite`` only when this price
+    already belongs to a covered pair, so a quote the loss budget allowed
+    on its own is not pulled up to 1.01.
+    """
+    floors: list[Decimal] = []
+    for item in (
+        pair_min_price(market, outcome, config),
+        pair_edge_floor(market, outcome, config),
+    ):
+        if item is not None and item > 0:
+            floors.append(item)
+    if size > matched_to_sold(market, outcome):
+        planned = planned_opposite_quote(state, market, outcome, config)
+        probe = price if price is not None else maker_sell_price(market, outcome, config)
+        if (
+            probe is not None
+            and probe + planned >= Decimal("1") + config.pair_min_edge
+        ):
+            uncovered = Decimal("1") + config.pair_min_edge - planned
+            if uncovered > 0:
+                floors.append(uncovered)
+    if not floors:
+        return None
+    return max(floors)
+
+
+def unpaired_sell_room(
+    market: Market,
+    outcome: str,
+    price: Decimal,
+    config: Config,
+    *,
+    paired: bool = False,
+):
     """How many shares of ``outcome`` may still be sold.
 
     Shares that catch up to the other side are always allowed. Extra one-sided
     size is capped by ``max_unpaired_fraction`` of the split and by the loss
-    budget ``initial_capital * max_loss_fraction``.
+    budget ``initial_capital * max_loss_fraction``. A planned pair that already
+    clears ``pair_min_edge`` is not charged that budget: the other side is not
+    worth zero. The fraction cap still applies.
     """
     split = market.gross_split
     if split <= 0:
@@ -103,10 +233,10 @@ def unpaired_sell_room(market: Market, outcome: str, price: Decimal, config: Con
             existing = ZERO
     remain = budget - existing
     loss_per = Decimal("1") - price
-    if remain <= 0:
-        loss_room = ZERO
-    elif loss_per <= 0:
+    if paired or loss_per <= 0:
         loss_room = fraction_room
+    elif remain <= 0:
+        loss_room = ZERO
     else:
         loss_room = remain / loss_per
     fresh = fraction_room if fraction_room < loss_room else loss_room
@@ -218,7 +348,13 @@ def propose(state: State, market: Market, outcome: str, config: Config) -> Propo
     free = self_inv - reserved(state, market, outcome)
     if size > free:
         size = free
-    room = unpaired_sell_room(market, outcome, price, config)
+    room = unpaired_sell_room(
+        market,
+        outcome,
+        price,
+        config,
+        paired=pair_plan_covers(state, market, outcome, price, config),
+    )
     if room is not None and size > room:
         size = room
     size = qdown(size, config.order_size_quantum)

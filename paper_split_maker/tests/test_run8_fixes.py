@@ -115,10 +115,153 @@ def test_unpaired_cap_and_pair_floor_block(tmp_path):
             {"type": "heartbeat", "event_id": "hb", "ts": 2},
         ],
     )
+    # 0.06 + 0.06 is far under 1.01, so the loss budget still applies.
     # 0.03 * 30 / (1 - 0.06) is about one share, under the 5-share minimum.
     assert engine.state.orders == {}
     log = (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8")
     assert any(json.loads(line)["kind"] == "pair_floor_block" for line in log.splitlines())
+
+
+def _run5_session(tmp_path, **extra):
+    """Capital, fees, and pair edge from the live run that blocked 0.48/0.55."""
+    values = dict(
+        initial_capital=Decimal("30"),
+        max_loss_fraction=Decimal("0.03"),
+        per_market_budget=Decimal("30"),
+        clip_size=Decimal("30"),
+        split_clip=Decimal("30"),
+        min_order_size=Decimal("5"),
+        pair_min_edge=Decimal("0.01"),
+        max_unpaired_fraction=Decimal("0.5"),
+        risk_fee_rate=Decimal("0.07"),
+        maker_fee_rate=Decimal("0"),
+        operational_reserve=Decimal("0.05"),
+        global_rounding_reserve=Decimal("0.01"),
+        min_edge=Decimal("0.01"),
+        skew_edge_per_share=Decimal("0"),
+        max_spread=Decimal("0.10"),
+        auto_split=False,
+        merge_when_idle=True,
+        quote_cooldown_ms=0,
+        ack_latency_ms=0,
+        cancel_latency_ms=0,
+        fill_mode="none",
+        min_order_rest_seconds=20,
+        close_improve_seconds=90,
+        stop_quoting_before_expiry_ms=20_000,
+        pre_split_lead_ms=45_000,
+        stale_after_ms=1_000_000,
+    )
+    values.update(extra)
+    return make_engine(tmp_path, **values)
+
+
+def _working(engine):
+    return [
+        order
+        for order in engine.state.orders.values()
+        if order.status in {"queued", "live"}
+    ]
+
+
+def test_fresh_session_at_048_055_posts_both_sides(tmp_path):
+    engine = _run5_session(tmp_path)
+    end = 300_000
+    logs = run(
+        engine,
+        [
+            market_event(end_ts=end),
+            {"type": "split", "event_id": "s", "ts": 1, "market_id": "m1", "amount": "30"},
+            book_event("m1", "down", "0.46", "0.48", ts=1),
+            book_event("m1", "up", "0.53", "0.55", ts=1),
+            {"type": "heartbeat", "event_id": "hb", "ts": 2},
+        ],
+    )
+    market = engine.state.markets["m1"]
+    posted = _working(engine)
+    by_side = {order.outcome: order for order in posted}
+    assert set(by_side) == {"up", "down"}
+    assert by_side["down"].price == Decimal("0.48")
+    assert by_side["up"].price == Decimal("0.55")
+    assert by_side["down"].size >= Decimal("5")
+    assert by_side["up"].size >= Decimal("5")
+    assert market.up == Decimal("30") and market.down == Decimal("30")
+    assert not any(row["kind"] == "pair_floor_block" for row in logs)
+    assert not any(row.get("reason") == "risk_floor" for row in logs)
+
+
+def test_up_010_blocked_and_016_allowed_after_down_fill(tmp_path):
+    engine = _run5_session(tmp_path)
+    end = 300_000
+    run(
+        engine,
+        [
+            market_event(end_ts=end),
+            {"type": "split", "event_id": "s", "ts": 1, "market_id": "m1", "amount": "30"},
+            book_event("m1", "down", "0.84", "0.86", ts=1),
+            book_event("m1", "up", "0.08", "0.10", ts=1),
+        ],
+    )
+    market = engine.state.markets["m1"]
+    _sell_down(engine, market, "5", "0.86")
+    floor = pair_edge_floor(market, "up", engine.config)
+    assert floor == Decimal("0.15")
+    blocked = propose(engine.state, market, "up", engine.config)
+    assert blocked.reason != "ok" or blocked.price >= Decimal("0.15")
+    assert not (blocked.reason == "ok" and blocked.price <= Decimal("0.10"))
+    run(
+        engine,
+        [
+            book_event("m1", "up", "0.14", "0.16", ts=2),
+            {"type": "heartbeat", "event_id": "hb", "ts": 2},
+        ],
+    )
+    allowed = propose(engine.state, market, "up", engine.config)
+    assert allowed.reason == "ok"
+    assert allowed.price >= Decimal("0.16")
+    assert allowed.size >= Decimal("5")
+    posted = [order for order in _working(engine) if order.outcome == "up"]
+    assert posted
+    assert all(order.price >= Decimal("0.16") for order in posted)
+
+
+def test_close_improve_never_goes_below_the_floor(tmp_path):
+    engine = _run5_session(tmp_path)
+    end = 300_000
+    run(
+        engine,
+        [
+            market_event(end_ts=end),
+            {"type": "split", "event_id": "s", "ts": 1, "market_id": "m1", "amount": "30"},
+            book_event("m1", "down", "0.40", "0.48", ts=1),
+            book_event("m1", "up", "0.46", "0.55", ts=1),
+        ],
+    )
+    market = engine.state.markets["m1"]
+    up = propose(engine.state, market, "up", engine.config)
+    assert up.reason == "ok" and up.price == Decimal("0.55")
+    # Deep in the close window, one tick above the bid (0.47) is under 1.01 - 0.48.
+    engine.state.now_ms = 254_000
+    eased = engine._ease_for_close(market, up)
+    assert eased.reason == "ok"
+    assert eased.price >= Decimal("0.53")
+    assert eased.price >= market.book("up").best_bid() + market.tick_size
+
+    _sell_down(engine, market, "5", "0.86")
+    run(
+        engine,
+        [
+            book_event("m1", "down", "0.84", "0.86", ts=3),
+            book_event("m1", "up", "0.08", "0.16", ts=3),
+        ],
+    )
+    matched = propose(engine.state, market, "up", engine.config)
+    assert matched.reason == "ok"
+    assert matched.price >= Decimal("0.16")
+    eased_matched = engine._ease_for_close(market, matched)
+    assert eased_matched.reason == "ok"
+    assert eased_matched.price >= Decimal("0.15")
+    assert eased_matched.price >= market.book("up").best_bid() + market.tick_size
 
 
 def test_live_stale_feed_waits_and_spares_a_young_order(tmp_path):

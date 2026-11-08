@@ -24,9 +24,8 @@ from paper_split_maker.models import (
 )
 from paper_split_maker.quotes import (
     Proposal,
+    binding_sell_floor,
     ladder_prices,
-    pair_edge_floor,
-    pair_min_price,
     propose,
 )
 from paper_split_maker.risk import (
@@ -989,7 +988,14 @@ class Engine:
                 or order.status not in WORKING_ORDER_STATUSES
             ):
                 continue
-            floor = pair_edge_floor(market, order.outcome, self.config)
+            floor = binding_sell_floor(
+                self.state,
+                market,
+                order.outcome,
+                self.config,
+                order.remaining,
+                order.price,
+            )
             if floor is not None and order.price < floor:
                 self._request_cancel(market, order, "pair_floor")
                 continue
@@ -1100,16 +1106,11 @@ class Engine:
         if tick <= 0 or size <= 0:
             return None
         low = ceil_tick(max(self.config.min_price, bid + tick), tick)
-        floors = [
-            item
-            for item in (
-                pair_min_price(market, outcome, self.config),
-                pair_edge_floor(market, outcome, self.config),
-            )
-            if item is not None
-        ]
-        if floors:
-            paired = ceil_tick(max(floors), tick)
+        floor = binding_sell_floor(
+            self.state, market, outcome, self.config, size
+        )
+        if floor is not None:
+            paired = ceil_tick(floor, tick)
             if paired > low:
                 low = paired
         high = qdown(self.config.max_price, tick)
@@ -1142,7 +1143,14 @@ class Engine:
             return proposal
         tick = market.tick_size
         aggressive = bid + tick
-        edge = pair_edge_floor(market, proposal.outcome, self.config)
+        edge = binding_sell_floor(
+            self.state,
+            market,
+            proposal.outcome,
+            self.config,
+            proposal.size,
+            proposal.price,
+        )
         if edge is not None:
             edged = ceil_tick(edge, tick)
             if edged > aggressive:
