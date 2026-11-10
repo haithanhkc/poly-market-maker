@@ -290,12 +290,66 @@ class Engine:
             self._emit(kind="risk_freeze", reason="loss_floor")
         self.state.was_at_cap = at_cap
 
-    def _skip(self, market: Market, reason: str, outcome: str = "") -> None:
+    def _skip(
+        self,
+        market: Market,
+        reason: str,
+        outcome: str = "",
+        price: Optional[Decimal] = None,
+    ) -> None:
+        # Printed on every decision. The event log below stays once per reason
+        # so a quiet book does not inflate risk_rejections.
+        self._announce_quote_skip(market, reason, outcome, price)
         key = (market.market_id, outcome, reason)
         if key in self._skip_once:
             return
         self._skip_once.add(key)
         self._emit(kind="quote_reject", market=market, outcome=outcome, reason=reason)
+
+    def _announce_quote_skip(
+        self,
+        market: Market,
+        reason: str,
+        outcome: str = "",
+        price: Optional[Decimal] = None,
+    ) -> None:
+        """Say why this heartbeat did not post a sell, with the numbers."""
+        budget = self.config.initial_capital * self.config.max_loss_fraction
+        label = reason
+        bits: list[str] = []
+        if price is not None and price > 0:
+            bits.append(f"price={money(price)}")
+            min_loss = (Decimal("1") - price) * self.config.min_order_size
+            bits.append(f"min_loss={money(min_loss)}")
+            # A 5-share sell below ~0.80 cannot fit a ~$1 loss budget. That is
+            # the gate, not a missing opposite fill.
+            if reason == "pair_floor" and min_loss > budget:
+                label = "loss_budget"
+        bits.append(f"budget={money(budget)}")
+        bits.append(f"min_size={money(self.config.min_order_size)}")
+        headroom = worst_case_equity(self.state) - self.state.loss_floor
+        bits.append(f"headroom={money(headroom)}")
+        if reason in {"stale_feed", "disconnected"}:
+            for side in ("up", "down"):
+                book = market.book(side)
+                if book.received_ms >= 0:
+                    bits.append(
+                        f"{side}_age_ms={self.state.now_ms - book.received_ms}"
+                    )
+        detail = " ".join(bits)
+        self._emit(
+            kind="quote_skipped",
+            market=market,
+            outcome=outcome,
+            price=price if price is not None and price > 0 else None,
+            reason=label,
+            detail=detail,
+        )
+        side = outcome or "-"
+        print(
+            f"quote_skipped {market.slug or market.market_id} {side} {label} {detail}",
+            flush=True,
+        )
 
     def _market(self, event: dict) -> Optional[Market]:
         market_id = event.get("market_id")
@@ -866,27 +920,36 @@ class Engine:
             if item.reason == "pair_floor":
                 self._note_pair_block(market, item.outcome, item.price)
         self._sync_working(market, proposals)
+        # Nothing sold yet: pair_floor here is the loss budget (a 5-share sell
+        # below ~0.80), not an unwind that can no longer be posted. Merging in
+        # the close-improve window is what round-tripped sessions 2 and 3 with
+        # zero sells. Hold until the stop window so a later legal price posts.
+        unsold = market.sold_up_shares <= 0 and market.sold_down_shares <= 0
+        hold_for_price = unsold and self._wait_for_sell(market)
         if (
             self._in_close_improve(market)
             and any(item.reason == "pair_floor" for item in proposals)
             and not any(item.reason == "ok" for item in proposals)
             and not self._working(market)
+            and not hold_for_price
         ):
-            # The floor cannot be met. Merge the pair and hold the remainder
-            # for resolution instead of cutting the ask down to the bid.
+            # One side is already sold and the remainder cannot clear the
+            # floor. Merge the pair instead of cutting the ask down to the bid.
             self._merge_free(market, "pair_floor")
         if any(item.reason == "ok" for item in proposals):
             self._place_proposals(market, proposals)
-        elif self.config.merge_when_idle and not self._working(market):
+        elif not self._working(market) and (
+            self.config.merge_when_idle or hold_for_price
+        ):
             if self._wait_for_sell(market):
                 # The pair stays until a side is expensive enough to sell
                 # under the loss floor, or the session reaches its stop window.
                 self._skip(market, "waiting_for_price")
-            else:
+            elif self.config.merge_when_idle:
                 self._merge_free(market, "idle_no_edge")
         for item in proposals:
             if item.reason != "ok":
-                self._skip(market, item.reason, item.outcome)
+                self._skip(market, item.reason, item.outcome, item.price)
 
     def _wait_for_sell(self, market: Market) -> bool:
         """True when a live split should be held for a later, floor-legal sell."""

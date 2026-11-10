@@ -374,3 +374,191 @@ def test_sell_is_posted_once_the_floor_allows_min_size(tmp_path, capsys):
     sides = {order.outcome for order in other.state.orders.values()}
     assert sides == {"down"}
     assert worst_case_equity(other.state) >= other.state.loss_floor
+
+
+def _run14(tmp_path):
+    """capital 30, 3.4% loss budget, 5-share splits, one open market."""
+    engine = make_engine(
+        tmp_path,
+        initial_capital=Decimal("30"),
+        max_loss_fraction=Decimal("0.034"),
+        per_market_budget=Decimal("30"),
+        clip_size=Decimal("5"),
+        split_clip=Decimal("5"),
+        min_order_size=Decimal("5"),
+        min_pair_inventory=Decimal("5"),
+        auto_split=False,
+        merge_when_idle=True,
+        max_open_markets=1,
+        pre_split_lead_ms=45_000,
+        stop_quoting_before_expiry_ms=20_000,
+        close_improve_seconds=90,
+        stale_feed_seconds=10,
+        stale_after_ms=1_000_000,
+        quote_cooldown_ms=0,
+        ack_latency_ms=0,
+        cancel_latency_ms=0,
+        fill_mode="none",
+        risk_fee_rate=Decimal("0.07"),
+        maker_fee_rate=Decimal("0"),
+        operational_reserve=Decimal("0.05"),
+        global_rounding_reserve=Decimal("0.01"),
+        min_edge=Decimal("0.01"),
+        max_spread=Decimal("0.10"),
+    )
+    engine.mode = "live"
+    assert engine.state.loss_floor == Decimal("28.980")
+    return engine
+
+
+def test_loss_budget_holds_a_fresh_pair_and_logs_every_skip(tmp_path, capsys):
+    """A mid 5-share book does not fit the $1.02 budget, so nothing is posted.
+
+    The close-improve window used to merge that unsold pair. A later book
+    the budget does allow must still be quoted, and every skip is printed.
+    """
+    engine = _run14(tmp_path)
+    run(
+        engine,
+        [
+            market_event(end_ts=300_000),
+            {
+                "type": "split",
+                "event_id": "split",
+                "ts": 1_000,
+                "market_id": "m1",
+                "amount": "5",
+            },
+        ],
+    )
+    _quote(engine, ("0.45", "0.55"), ("0.45", "0.55"), 10_000)
+    _quote(engine, ("0.45", "0.55"), ("0.45", "0.55"), 12_000)
+    market = engine.state.markets["m1"]
+    assert market.up == Decimal("5") and market.down == Decimal("5")
+    assert engine.state.orders == {}
+    # 170s is inside close-improve (starts at 165s) and the books are fresh.
+    _quote(engine, ("0.45", "0.55"), ("0.45", "0.55"), 170_000)
+    assert market.up == Decimal("5") and market.down == Decimal("5")
+    assert engine.chain_outbox == []
+    printed = capsys.readouterr().out
+    assert printed.count("quote_skipped") >= 4
+    assert printed.count("loss_budget") >= 4
+    assert "budget=1.02" in printed
+    assert "min_size=5" in printed
+    _quote(engine, ("0.88", "0.90"), ("0.08", "0.10"), 171_000)
+    sells = [
+        order
+        for order in engine.state.orders.values()
+        if order.status in {"queued", "live"}
+    ]
+    assert {order.outcome for order in sells} == {"up"}
+    for order in sells:
+        assert order.size >= Decimal("5")
+        assert order.price > Decimal("0.88")
+    assert market.up == Decimal("5") and market.down == Decimal("5")
+    assert worst_case_equity(engine.state) >= engine.state.loss_floor
+
+
+def test_stale_feed_is_logged_and_does_not_merge(tmp_path, capsys):
+    engine = _run14(tmp_path / "stale")
+    run(
+        engine,
+        [
+            market_event(end_ts=300_000),
+            {
+                "type": "split",
+                "event_id": "split",
+                "ts": 1_000,
+                "market_id": "m1",
+                "amount": "5",
+            },
+            book_event("m1", "up", "0.88", "0.90", ts=1_000),
+            book_event("m1", "down", "0.08", "0.10", ts=1_000),
+            {"type": "heartbeat", "event_id": "hb-fresh", "ts": 1_000},
+        ],
+    )
+    market = engine.state.markets["m1"]
+    assert any(order.outcome == "up" for order in engine.state.orders.values())
+    # Live freshness is receipt time. A clock jump with no new book is stale
+    # even when stale_after_ms is huge. That skip must not merge the pair.
+    run(engine, [{"type": "heartbeat", "event_id": "hb-stale", "ts": 20_000}])
+    assert market.up == Decimal("5") and market.down == Decimal("5")
+    assert engine.chain_outbox == []
+    printed = capsys.readouterr().out
+    assert "quote_skipped" in printed and "stale_feed" in printed
+    assert "up_age_ms=" in printed
+
+
+def test_expired_leftover_does_not_block_the_next_session(tmp_path, capsys):
+    """A held Up after session 1 expires releases the open-market slot.
+
+    The next session still quotes a price the remaining budget allows, and
+    a mid book is skipped with a reason instead of being merged.
+    """
+    engine = _run14(tmp_path / "next")
+    run(
+        engine,
+        [
+            market_event("m1", end_ts=300_000),
+            {
+                "type": "split",
+                "event_id": "s1",
+                "ts": 1_000,
+                "market_id": "m1",
+                "amount": "5",
+            },
+        ],
+    )
+    first = engine.state.markets["m1"]
+    first.sold_down_shares = Decimal("5")
+    first.sold_down_proceeds = Decimal("4.62")
+    first.down = Decimal("0")
+    first.net_cash_flow += Decimal("4.62")
+    engine.state.cash += Decimal("4.62")
+    run(engine, [{"type": "heartbeat", "event_id": "expire", "ts": 300_000}])
+    assert first.status == "expired_unresolved"
+    assert first.up == Decimal("5") and first.down == Decimal("0")
+    opened = run(
+        engine,
+        [market_event("m2", end_ts=600_000, event_id="open-m2", ts=310_000)],
+    )
+    assert "m2" in engine.state.markets
+    assert not any(row.get("reason") == "max_open_markets" for row in opened)
+    run(
+        engine,
+        [
+            {
+                "type": "split",
+                "event_id": "s2",
+                "ts": 310_000,
+                "market_id": "m2",
+                "amount": "5",
+            },
+            book_event("m2", "up", "0.45", "0.55", ts=320_000),
+            book_event("m2", "down", "0.45", "0.55", ts=320_000),
+            {"type": "heartbeat", "event_id": "mid", "ts": 320_000},
+        ],
+    )
+    second = engine.state.markets["m2"]
+    assert second.up == Decimal("5") and second.down == Decimal("5")
+    assert not any(
+        order.market_id == "m2" and order.status in {"queued", "live"}
+        for order in engine.state.orders.values()
+    )
+    run(
+        engine,
+        [
+            book_event("m2", "up", "0.88", "0.90", ts=321_000, digest="up-hi"),
+            book_event("m2", "down", "0.08", "0.10", ts=321_000, digest="down-hi"),
+            {"type": "heartbeat", "event_id": "hi", "ts": 321_000},
+        ],
+    )
+    sells = [
+        order
+        for order in engine.state.orders.values()
+        if order.market_id == "m2" and order.status in {"queued", "live"}
+    ]
+    assert {order.outcome for order in sells} == {"up"}
+    printed = capsys.readouterr().out
+    assert "quote_skipped" in printed and "loss_budget" in printed
+    assert "synthetic-m2" in printed
