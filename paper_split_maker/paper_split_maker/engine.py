@@ -26,7 +26,6 @@ from paper_split_maker.quotes import (
     Proposal,
     binding_sell_floor,
     ladder_plan,
-    ladder_prices,
     propose,
 )
 from paper_split_maker.risk import (
@@ -90,12 +89,10 @@ class Engine:
         self._skip_once: set[tuple[str, str, str]] = set()
         self.mode = "library"
         self.chain_outbox: list[dict] = []
-        self.buy_outbox: list[dict] = []
         self.marketable_ids: set[str] = set()
         self.leg_since: dict[str, int] = {}
         self.leg_cross: set[tuple[str, str]] = set()
         self._leg_log_key: dict[str, tuple] = {}
-        self.buy_fail_outcome: str = ""
         # Long replays flush the ledger once at the end. Live paper mode keeps
         # the default and writes state after every event.
         self.persist_each_event = True
@@ -132,9 +129,6 @@ class Engine:
             pass
         else:
             state.session_max_loss = config.session_max_loss
-        if config.max_pair_loss < state.max_pair_loss:
-            state.max_pair_loss = config.max_pair_loss
-        config.max_pair_loss = state.max_pair_loss
         config.session_max_loss = state.session_max_loss
         engine = cls(state, config, state_path, log_dir, resumed=True)
         engine.assert_invariants()
@@ -202,7 +196,6 @@ class Engine:
             "split_pending": self._on_split_pending,
             "split_confirmed": self._on_split_confirmed,
             "split_abandoned": self._on_split_abandoned,
-            "taker_repair": self._on_taker_repair,
             "adverse_fill": self._on_adverse_fill,
             "split": self._on_split,
             "merge": self._on_merge,
@@ -563,7 +556,6 @@ class Engine:
         book.uncertain = False
         book.received_ms = self.state.now_ms
         self._record_mid(market, outcome)
-        self._note_volatility(market)
         self._emit(kind="book", market=market, outcome=outcome, reason="ok")
         # Reprice when the leftover leg's own book moves. The other side's
         # book does not change this bid.
@@ -894,16 +886,13 @@ class Engine:
             self._skip(market, "near_expiry")
             return
         if self.state.now_ms < market.pause_until_ms:
-            self._cancel_market(market, "vol_pause")
-            self._skip(market, "vol_pause")
+            # A refused post waits a few seconds so it is not sent again immediately.
+            self._cancel_market(market, "reject_pause")
+            self._skip(market, "reject_pause")
             return
         if not market.accepting_orders:
             self._cancel_market(market, "not_accepting")
             self._skip(market, "not_accepting")
-            return
-        if self.config.entry_mode == "buy_pair_arb":
-            if not self.at_cap() and not self.state.killed:
-                self._try_buy_pair(market)
             return
         if self._in_cooldown(market):
             self._skip(market, "cooldown")
@@ -914,32 +903,18 @@ class Engine:
         if self._quotes_possible(market) and not self.at_cap():
             self._auto_split(market)
         proposals = [
-            self._ease_for_close(market, propose(self.state, market, "up", self.config)),
-            self._ease_for_close(
-                market, propose(self.state, market, "down", self.config)
-            ),
+            propose(self.state, market, "up", self.config),
+            propose(self.state, market, "down", self.config),
         ]
         proposals.sort(key=lambda item: (0 if item.repair else 1, item.outcome))
         for item in proposals:
             if item.reason == "pair_floor":
                 self._note_pair_block(market, item.outcome, item.price)
         self._sync_working(market, proposals)
-        # Nothing sold yet: pair_floor here is the loss budget (a 5-share sell
-        # below ~0.80), not an unwind that can no longer be posted. Merging in
-        # the close-improve window is what round-tripped sessions 2 and 3 with
-        # zero sells. Hold until the stop window so a later legal price posts.
+        # A fresh pair that the loss budget will not quote stays until the
+        # stop window. Merging it here is what skipped the sells.
         unsold = market.sold_up_shares <= 0 and market.sold_down_shares <= 0
         hold_for_price = unsold and self._wait_for_sell(market)
-        if (
-            self._in_close_improve(market)
-            and any(item.reason == "pair_floor" for item in proposals)
-            and not any(item.reason == "ok" for item in proposals)
-            and not self._working(market)
-            and not hold_for_price
-        ):
-            # One side is already sold and the remainder cannot clear the
-            # floor. Merge the pair instead of cutting the ask down to the bid.
-            self._merge_free(market, "pair_floor")
         if any(item.reason == "ok" for item in proposals):
             self._place_proposals(market, proposals)
         elif not self._working(market) and (
@@ -1055,19 +1030,8 @@ class Engine:
             if proposal.price <= 0 or proposal.reason != "ok":
                 desired[proposal.outcome] = []
                 continue
-            bid = market.book(proposal.outcome).best_bid()
-            if self.config.slices_per_side <= 1:
-                desired[proposal.outcome] = [proposal.price]
-            else:
-                desired[proposal.outcome] = ladder_prices(
-                    proposal.price,
-                    market.tick_size,
-                    self.config.slices_per_side,
-                    bid,
-                    inside=self.config.slice_inside_tick,
-                )
+            desired[proposal.outcome] = [proposal.price]
         rest_ms = int(self.config.min_order_rest_seconds) * 1000
-        closing = self._in_close_improve(market)
         for order in list(self.state.orders.values()):
             if (
                 order.market_id != market.market_id
@@ -1094,9 +1058,6 @@ class Engine:
                 diff = min(abs(order.price - item) for item in prices)
                 band = self._requote_band(market, order.outcome)
                 price_move = diff > band
-                # The close window intentionally walks the ask down by a tick.
-                if closing and diff >= market.tick_size:
-                    price_move = True
                 wanted = sized.get(order.outcome, order.remaining)
                 size_move = (
                     abs(order.remaining - wanted) > self.config.requote_size_threshold
@@ -1169,151 +1130,21 @@ class Engine:
     def _preclose_ms(self, market: Market) -> int:
         """When this session's quotes are pulled for the close or the next split."""
         stop = market.end_ts_ms - int(self.config.stop_quoting_before_expiry_ms)
-        seconds = int(self.config.split_lead_seconds)
-        lead = seconds * 1000 if seconds > 0 else int(self.config.pre_split_lead_ms)
+        lead = int(self.config.split_lead_seconds) * 1000
         if lead > 0:
             lead_stop = market.end_ts_ms - lead
             if lead_stop < stop:
                 stop = lead_stop
         return stop
 
-    def _in_close_improve(self, market: Market) -> bool:
-        seconds = int(self.config.close_improve_seconds)
-        if seconds <= 0:
-            return False
-        deadline = self._preclose_ms(market)
-        start = deadline - seconds * 1000
-        return start <= self.state.now_ms < deadline
-
-    def _min_sell_price(
-        self, market: Market, outcome: str, size: Decimal, bid: Decimal
-    ) -> Optional[Decimal]:
-        """Lowest tick that still clears the loss floor for ``size``."""
-        tick = market.tick_size
-        if tick <= 0 or size <= 0:
-            return None
-        low = ceil_tick(max(self.config.min_price, bid + tick), tick)
-        floor = binding_sell_floor(
-            self.state, market, outcome, self.config, size
-        )
-        if floor is not None:
-            paired = ceil_tick(floor, tick)
-            if paired > low:
-                low = paired
-        high = qdown(self.config.max_price, tick)
-        if high < low or not self._size_ok(market, outcome, high, size, False):
-            return None
-        steps = int((high - low) / tick)
-        left = 0
-        right = steps
-        best = steps
-        while left <= right:
-            mid = (left + right) // 2
-            px = low + tick * mid
-            if self._size_ok(market, outcome, px, size, False):
-                best = mid
-                right = mid - 1
-            else:
-                left = mid + 1
-        return low + tick * best
-
-    def _ease_for_close(self, market: Market, proposal: Proposal) -> Proposal:
-        """Walk a sell toward the bid near the close, never through the loss floor."""
-        if (
-            proposal.reason != "ok"
-            or proposal.price <= 0
-            or not self._in_close_improve(market)
-        ):
-            return proposal
-        bid = market.book(proposal.outcome).best_bid()
-        if bid is None:
-            return proposal
-        tick = market.tick_size
-        aggressive = bid + tick
-        edge = binding_sell_floor(
-            self.state,
-            market,
-            proposal.outcome,
-            self.config,
-            proposal.size,
-            proposal.price,
-        )
-        if edge is not None:
-            edged = ceil_tick(edge, tick)
-            if edged > aggressive:
-                aggressive = edged
-        if proposal.price < aggressive:
-            return Proposal(
-                outcome=proposal.outcome,
-                price=ZERO,
-                size=ZERO,
-                fair=proposal.fair,
-                required_edge=proposal.required_edge,
-                repair=proposal.repair,
-                reason="pair_floor",
-            )
-        if aggressive >= proposal.price:
-            return proposal
-        deadline = self._preclose_ms(market)
-        window_ms = int(self.config.close_improve_seconds) * 1000
-        if window_ms <= 0:
-            return proposal
-        elapsed = self.state.now_ms - (deadline - window_ms)
-        if elapsed < 0:
-            return proposal
-        if elapsed > window_ms:
-            elapsed = window_ms
-        progress = Decimal(elapsed) / Decimal(window_ms)
-        stepped = ceil_tick(
-            proposal.price - (proposal.price - aggressive) * progress, tick
-        )
-        if stepped < aggressive:
-            stepped = aggressive
-        floor_px = self._min_sell_price(
-            market, proposal.outcome, proposal.size, bid
-        )
-        if floor_px is not None and stepped < floor_px:
-            stepped = floor_px
-        if stepped <= bid or stepped >= 1 or stepped >= proposal.price:
-            return proposal
-        return Proposal(
-            outcome=proposal.outcome,
-            price=stepped,
-            size=proposal.size,
-            fair=proposal.fair,
-            required_edge=proposal.required_edge,
-            repair=proposal.repair,
-        )
-
     def _place_proposals(self, market: Market, proposals: list[Proposal]) -> None:
         for proposal in proposals:
             if proposal.reason != "ok":
                 continue
             require_repair = self.at_cap()
-            if self.config.slices_per_side <= 1:
-                if self._working_outcome(market, proposal.outcome):
-                    continue
-                self._place_one(market, proposal, proposal.price, require_repair)
+            if self._working_outcome(market, proposal.outcome):
                 continue
-            bid = market.book(proposal.outcome).best_bid()
-            for price in ladder_prices(
-                proposal.price,
-                market.tick_size,
-                self.config.slices_per_side,
-                bid,
-                inside=self.config.slice_inside_tick,
-            ):
-                if self._working_at(market, proposal.outcome, price):
-                    continue
-                sized = Proposal(
-                    outcome=proposal.outcome,
-                    price=price,
-                    size=proposal.size,
-                    fair=proposal.fair,
-                    required_edge=proposal.required_edge,
-                    repair=proposal.repair,
-                )
-                self._place_one(market, sized, price, require_repair)
+            self._place_one(market, proposal, proposal.price, require_repair)
 
     def _place_one(
         self,
@@ -1662,7 +1493,8 @@ class Engine:
         return proceeds / sold
 
     def _leg_floor(self, market: Market, outcome: str, size: Decimal) -> Decimal:
-        """Breakeven for the unsold leg: ``1 - P``, lifted by the taker fee when asked."""
+        """Breakeven for the unsold leg: ``1 - P`` of the side already sold."""
+        del size
         tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
         avg = self._leg_fill_price(market, outcome)
         if avg is None:
@@ -1671,20 +1503,6 @@ class Engine:
         if raw < self.config.min_price:
             raw = self.config.min_price
         price = ceil_tick(raw, tick)
-        if (
-            self.config.leg_fee_buffer
-            and self.state.risk_fee_rate > 0
-            and size > 0
-            and price < 1
-        ):
-            need = size * (ONE - avg)
-            for _ in range(50):
-                net = size * price - conservative_fee(
-                    size, price, self.state.risk_fee_rate
-                )
-                if net >= need or price + tick >= 1:
-                    break
-                price += tick
         if price >= 1:
             price = ONE - tick
         if price < self.config.min_price:
@@ -1729,9 +1547,9 @@ class Engine:
         Floor is ``1 - P`` for the filled price P. When the best bid is at
         least that floor, sell the filled size as a taker at the bid. Otherwise
         rest a post-only sell at ``max(floor, best_ask - tick)``. After
-        ``leg_unwind_seconds`` the same bid check is repeated. Below the floor,
-        a taker is used only near expiry when ``allow_loss_unwind`` permits it.
-        A partial fill sells the same gap, not the whole inventory.
+        ``leg_unwind_seconds`` the same bid check is repeated. A bid below
+        the floor is not taken. A partial fill sells the same gap, not the
+        whole inventory.
         """
         naked = self._naked_leg(market)
         if naked is None:
@@ -1754,20 +1572,9 @@ class Engine:
         started = self.leg_since.get(market.market_id, self.state.now_ms)
         elapsed = self.state.now_ms - started
         timed_out = elapsed >= int(self.config.leg_unwind_seconds) * 1000
-        left_ms = market.end_ts_ms - self.state.now_ms
-        near_expiry = 0 <= left_ms <= int(
-            self.config.unwind_loss_before_expiry_seconds
-        ) * 1000
         take_px = qdown(bid, tick)
         if take_px <= 0:
             take_px = bid
-        shortfall = (floor - take_px) * gap if take_px < floor else ZERO
-        loss_ok = (
-            self.config.allow_loss_unwind
-            and near_expiry
-            and shortfall > 0
-            and shortfall <= self.config.max_unwind_loss
-        )
         crossed = (market.market_id, outcome) in self.leg_cross
         taker = False
         reason = "rest_floor"
@@ -1775,10 +1582,6 @@ class Engine:
             taker = True
             price = take_px
             reason = "taker_timeout" if timed_out else "taker_breakeven"
-        elif loss_ok:
-            taker = True
-            price = take_px
-            reason = "taker_loss_cap"
         elif crossed:
             price = bid + tick
             price = ceil_tick(price, tick)
@@ -1902,165 +1705,6 @@ class Engine:
         # reservation, so a partial fill does not pull the remainder.
         self._merge_free(market, "leg_unwind")
         return True
-
-    def _buy_plan(self, market: Market) -> Optional[dict]:
-        """Both asks, or nothing. One tick of edge after taker fees."""
-        if market.status != "open" or market.up > 0 or market.down > 0:
-            return None
-        if market.pending_split > 0 or market.gross_split > 0:
-            return None
-        up = market.book("up")
-        down = market.book("down")
-        ask_up, ask_down = up.best_ask(), down.best_ask()
-        bid_up, bid_down = up.best_bid(), down.best_bid()
-        if (
-            ask_up is None
-            or ask_down is None
-            or bid_up is None
-            or bid_down is None
-            or ask_up <= bid_up
-            or ask_down <= bid_down
-        ):
-            return None
-        fee = conservative_fee(ONE, ask_up, self.state.risk_fee_rate) + conservative_fee(
-            ONE, ask_down, self.state.risk_fee_rate
-        )
-        if ask_up + ask_down + fee > ONE - self.config.pair_min_edge:
-            return None
-        slip = ask_up - bid_up
-        other = ask_down - bid_down
-        if other > slip:
-            slip = other
-        if slip <= 0:
-            slip = market.tick_size if market.tick_size > 0 else Decimal("0.01")
-        budget = self.config.initial_capital * self.config.max_loss_fraction
-        if self.state.realized_pnl < 0:
-            budget += self.state.realized_pnl
-        if budget <= 0:
-            return None
-        size = budget / slip
-        cost = ask_up + ask_down + fee
-        if cost <= 0:
-            return None
-        affordable = self.state.cash / cost
-        if affordable < size:
-            size = affordable
-        if self.config.clip_size < size:
-            size = self.config.clip_size
-        have_up = up.ask_size_at(ask_up)
-        have_down = down.ask_size_at(ask_down)
-        if have_up < size:
-            size = have_up
-        if have_down < size:
-            size = have_down
-        size = qdown(size, self.config.order_size_quantum)
-        minimum = (
-            market.min_order_size
-            if market.min_order_size > self.config.min_order_size
-            else self.config.min_order_size
-        )
-        if size < minimum:
-            return None
-        return {
-            "market_id": market.market_id,
-            "up_price": ask_up,
-            "down_price": ask_down,
-            "size": size,
-            "up_token": market.up_token_id,
-            "down_token": market.down_token_id,
-            "tick_size": market.tick_size,
-        }
-
-    def _try_buy_pair(self, market: Market) -> None:
-        plan = self._buy_plan(market)
-        if plan is None:
-            return
-        if self.mode == "live":
-            self.buy_outbox.append(plan)
-            return
-        fail = self.buy_fail_outcome
-        up_size = ZERO if fail == "up" else plan["size"]
-        down_size = ZERO if fail == "down" else plan["size"]
-        self.apply_buy_fills(
-            market,
-            up_price=plan["up_price"],
-            down_price=plan["down_price"],
-            up_size=up_size,
-            down_size=down_size,
-        )
-
-    def apply_buy_fills(
-        self,
-        market: Market,
-        *,
-        up_price: Decimal,
-        down_price: Decimal,
-        up_size: Decimal,
-        down_size: Decimal,
-    ) -> None:
-        """Take the filled buy legs, merge a pair, and sell a lone leg now."""
-        paid = ZERO
-        if up_size > 0:
-            paid += up_size * up_price + conservative_fee(
-                up_size, up_price, self.state.risk_fee_rate
-            )
-            market.up += up_size
-        if down_size > 0:
-            paid += down_size * down_price + conservative_fee(
-                down_size, down_price, self.state.risk_fee_rate
-            )
-            market.down += down_size
-        if paid > self.state.cash:
-            market.up -= up_size
-            market.down -= down_size
-            self._emit(kind="quote_reject", market=market, reason="insufficient_cash")
-            return
-        self.state.cash -= paid
-        market.net_cash_flow -= paid
-        self._emit(
-            kind="buy_pair",
-            market=market,
-            size=up_size if up_size > down_size else down_size,
-            price=up_price + down_price,
-            reason="buy_pair_arb",
-        )
-        paired = up_size if up_size < down_size else down_size
-        if paired > 0:
-            self._merge(market, paired, "buy_pair")
-        lone = "up" if market.up > market.down else "down"
-        if market.up == market.down:
-            return
-        book = market.book(lone)
-        bid = book.best_bid()
-        held = market.inventory(lone)
-        if bid is None or held <= 0:
-            return
-        self._place_one(
-            market,
-            Proposal(
-                outcome=lone,
-                price=bid,
-                size=held,
-                fair=bid,
-                required_edge=ZERO,
-                repair=True,
-            ),
-            bid,
-            False,
-            marketable=True,
-            ignore_floor=True,
-        )
-        if self.config.live:
-            return
-        for order in list(self._working(market, lone)):
-            if order.price == bid and order.remaining > 0:
-                self._apply_fill(
-                    market,
-                    order,
-                    order.remaining,
-                    synthetic=True,
-                    source="leg_unwind",
-                )
 
     def _check_realized_loss(self) -> None:
         budget = self.state.initial_capital * self.state.max_loss_fraction
@@ -2343,52 +1987,15 @@ class Engine:
             self.state.killed = True
             self._emit(kind="kill", reason="kill_switch_file")
 
-    def _note_volatility(self, market: Market) -> None:
-        book = market.book("up")
-        bid, ask = book.best_bid(), book.best_ask()
-        if bid is None or ask is None:
-            return
-        mid = (bid + ask) / 2
-        move = self.config.vol_pause_move
-        window = self.config.vol_pause_window_ms
-        if (
-            move > 0
-            and window > 0
-            and market.last_mid is not None
-            and self.state.now_ms - market.last_mid_ts <= window
-            and abs(mid - market.last_mid) > move
-        ):
-            market.pause_until_ms = self.state.now_ms + max(
-                self.config.vol_pause_hold_ms, window
-            )
-            self._emit(
-                kind="vol_pause",
-                market=market,
-                reason="outcome_jump",
-                detail=money(mid),
-            )
-        market.last_mid = mid
-        market.last_mid_ts = self.state.now_ms
-
     def _on_reference(self, event: dict) -> None:
         try:
             price = Decimal(str(event["price"]))
         except (KeyError, ValueError, ArithmeticError):
             self._emit(kind="reject", reason="bad_reference")
             return
-        previous = self.state.btc_price
         self.state.btc_price = price
         self.state.btc_price_ts = self.state.now_ms
-        threshold = self.config.btc_pause_move
-        if previous is not None and threshold > 0 and abs(price - previous) > threshold:
-            hold = self.config.vol_pause_hold_ms or self.config.vol_pause_window_ms
-            for market in self.state.markets.values():
-                market.pause_until_ms = max(
-                    market.pause_until_ms, self.state.now_ms + hold
-                )
-            self._emit(kind="vol_pause", reason="btc_jump", detail=money(price))
-        else:
-            self._emit(kind="reference", reason="ok", detail=money(price))
+        self._emit(kind="reference", reason="ok", detail=money(price))
 
     def _on_user_fill(self, event: dict) -> None:
         trade_id = str(event.get("trade_id") or "")
@@ -2627,39 +2234,6 @@ class Engine:
             return
         market.pending_split -= amount
         self._split(market, amount, "split_confirmed")
-
-    def _on_taker_repair(self, event: dict) -> None:
-        if not self.config.taker_repair:
-            self._emit(kind="reject", reason="taker_disabled")
-            return
-        market = self._market(event)
-        if market is None:
-            return
-        try:
-            size = qdown(Decimal(str(event["size"])), Decimal("0.000001"))
-            price = Decimal(str(event["price"]))
-        except (KeyError, ValueError, ArithmeticError):
-            self._emit(kind="reject", market=market, reason="bad_size")
-            return
-        if size * price > self.config.taker_repair_max_usdc:
-            self._emit(kind="reject", market=market, size=size, reason="taker_cap")
-            return
-        outcome = str(event.get("outcome") or "")
-        from paper_split_maker.quotes import pair_min_price
-
-        floor = pair_min_price(market, outcome, self.config)
-        if floor is not None and price < floor:
-            self._emit(kind="reject", market=market, price=price, reason="pair_floor")
-            return
-        self._emit(
-            kind="taker_repair",
-            market=market,
-            outcome=outcome,
-            size=size,
-            price=price,
-            reason="capped",
-        )
-
 
 def _jsonable(value):
     if isinstance(value, Decimal):

@@ -133,5 +133,11 @@ dmypy.json
 # logs
 logs/
 
+# Bot run outputs. Never commit a ledger, a kill file, or a session directory.
+runs/
+out/
+state.json
+kill.switch
+
 # vscode settings
 .vscode/

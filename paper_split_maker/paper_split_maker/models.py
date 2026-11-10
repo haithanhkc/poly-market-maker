@@ -102,8 +102,6 @@ class Market:
     sold_down_proceeds: Decimal = ZERO
     session_stopped: bool = False
     pause_until_ms: int = 0
-    last_mid: Optional[Decimal] = None
-    last_mid_ts: int = 0
     last_requote_ts: int = -(10**18)
     pending_split: Decimal = ZERO
 
@@ -153,8 +151,6 @@ class Market:
             "sold_down_proceeds": money(self.sold_down_proceeds),
             "session_stopped": self.session_stopped,
             "pause_until_ms": self.pause_until_ms,
-            "last_mid": None if self.last_mid is None else money(self.last_mid),
-            "last_mid_ts": self.last_mid_ts,
             "last_requote_ts": self.last_requote_ts,
             "pending_split": money(self.pending_split),
         }
@@ -200,10 +196,6 @@ class Market:
             sold_down_proceeds=_d(data.get("sold_down_proceeds", "0")),
             session_stopped=bool(data.get("session_stopped", False)),
             pause_until_ms=int(data.get("pause_until_ms", 0)),
-            last_mid=None
-            if data.get("last_mid") in (None, "")
-            else _d(data.get("last_mid")),
-            last_mid_ts=int(data.get("last_mid_ts", 0)),
             last_requote_ts=int(data.get("last_requote_ts", -(10**18))),
             pending_split=_d(data.get("pending_split", "0")),
         )
@@ -294,7 +286,6 @@ class State:
     was_at_cap: bool = False
     schema_version: int = SCHEMA_VERSION
     session_max_loss: Decimal = ZERO
-    max_pair_loss: Decimal = Decimal("1")
     killed: bool = False
     btc_price: Optional[Decimal] = None
     btc_price_ts: int = 0
@@ -325,7 +316,6 @@ class State:
             published_taker_fee_rate=config.published_taker_fee_rate,
             rebate_share=config.rebate_share,
             session_max_loss=config.session_max_loss,
-            max_pair_loss=config.max_pair_loss,
         )
 
     def to_dict(self) -> dict:
@@ -362,7 +352,6 @@ class State:
             "risk_rejections": list(self.risk_rejections),
             "was_at_cap": self.was_at_cap,
             "session_max_loss": money(self.session_max_loss),
-            "max_pair_loss": money(self.max_pair_loss),
             "killed": self.killed,
             "btc_price": None if self.btc_price is None else money(self.btc_price),
             "btc_price_ts": self.btc_price_ts,
@@ -398,7 +387,6 @@ class State:
             was_at_cap=bool(data.get("was_at_cap", False)),
             schema_version=version,
             session_max_loss=_d(data.get("session_max_loss", "0")),
-            max_pair_loss=_d(data.get("max_pair_loss", "1")),
             killed=bool(data.get("killed", False)),
             btc_price=None
             if data.get("btc_price") in (None, "")

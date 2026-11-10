@@ -70,13 +70,13 @@ That file lives only on the operator PC. It is not in this repo. Copy the values
 
 | Old key | What to do |
 | --- | --- |
-| `pre_split_lead_ms` | Divide by 1000 and set `split_lead_seconds`. If the seconds field is missing, the loader does this itself. When both are set, seconds win |
+| `pre_split_lead_ms` | Delete it. Set `split_lead_seconds` (8 in the shipped file) |
 | `stale_after_ms` | Paper book age. Live uses `stale_feed_seconds` |
-| `market_slugs` | Delete it. A placeholder such as `no-initial-discovery-placeholder` is ignored; the bot discovers `btc-updown-5m-<open>` |
-| `entry_mode` | Keep `split_sell` |
-| `max_loss_fraction` `0.034` | That 0.90–1.02 budget blocks a 5-share sell below about 0.80. The shipped file uses `0.20` on 59 pUSD (budget 11.80, floor 47.20) plus `session_max_loss` 6 |
-| `strategy` | Set `ladder`. `slices_per_side` stays 1; depth is `ladder_levels` |
-| `vol_pause_move`, `btc_pause_move`, `taker_repair`, `session_max_loss`, `max_pair_loss` | Still accepted. Leave them out. They default off. The loss budget, the pair edge, and the other-leg unwind replace them |
+| `market_slugs` | Delete it. The bot discovers `btc-updown-5m-<open>` |
+| `entry_mode`, `buy_pair_arb`, `slices_per_side` | Delete them. The live bot is `strategy: ladder` |
+| `close_improve_seconds`, `vol_pause_*`, `btc_pause_move`, `taker_repair`, `max_pair_loss`, `allow_loss_unwind`, `leg_fee_buffer` | Delete them. The loader rejects unknown keys |
+| `session_max_loss` | Keep it. The shipped file stops one session at 6 pUSD |
+| `max_loss_fraction` `0.034` | That 0.90–1.02 budget blocks a 5-share sell below about 0.80. The shipped file uses `0.20` on 59 pUSD (budget 11.80, floor 47.20) |
 | `config.live.run5.json`, `run13`, `run15`, `old30`, `old200` | Removed from the repo. Do not point `--config` at them |
 
 A 3% budget on a 30 pUSD account (0.90) only fits a 5-share sell near 0.82 or higher. The ladder mode needs the wider daily budget above, or the mid quotes never post. Use a new `--out` directory so the old 29.10 floor is not locked in.

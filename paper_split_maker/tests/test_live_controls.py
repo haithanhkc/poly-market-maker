@@ -20,7 +20,7 @@ from paper_split_maker.chain_send import (
     relayer_body,
 )
 from paper_split_maker.cli import main
-from paper_split_maker.config import Config, config_from_mapping, load_config
+from paper_split_maker.config import Config, load_config
 from paper_split_maker.credentials import load_credentials
 from paper_split_maker.engine import Engine
 from paper_split_maker.risk import reserved, worst_case_equity
@@ -30,7 +30,6 @@ from paper_split_maker.feeds import (
     user_fill_deltas,
     user_subscribe,
 )
-from paper_split_maker.historical import session_distribution
 from paper_split_maker.live_gate import live_gates
 from paper_split_maker.live_runner import (
     apply_market_frame,
@@ -184,55 +183,8 @@ def test_confirmed_split_can_be_quoted(tmp_path):
     assert engine.state.orders
 
 
-def test_slices_respect_min_size_and_tick(tmp_path):
-    engine = make_engine(
-        tmp_path,
-        slices_per_side=3,
-        slice_inside_tick=True,
-        clip_size=Decimal("5"),
-        split_clip=Decimal("20"),
-        min_pair_inventory=Decimal("5"),
-    )
-    run(
-        engine,
-        [
-            market_event(),
-            *both_books("m1", "0.40", "0.50", 1),
-            {"type": "heartbeat", "event_id": "h1", "ts": 2},
-            {"type": "heartbeat", "event_id": "h2", "ts": 3},
-        ],
-    )
-    up = sorted(
-        (
-            order.price
-            for order in engine.state.orders.values()
-            if order.outcome == "up"
-        ),
-    )
-    assert up == [Decimal("0.41"), Decimal("0.50"), Decimal("0.51")]
-    assert all(order.size == Decimal("5") for order in engine.state.orders.values())
-    wide = make_engine(
-        tmp_path / "wide",
-        slices_per_side=3,
-        clip_size=Decimal("5"),
-        split_clip=Decimal("20"),
-        min_pair_inventory=Decimal("5"),
-    )
-    run(
-        wide,
-        [
-            market_event(min_order_size="10"),
-            *both_books("m1", "0.40", "0.50", 1),
-            {"type": "heartbeat", "event_id": "h", "ts": 2},
-        ],
-    )
-    assert wide.state.orders == {}
-
-
 def test_pair_floor_and_session_cap(tmp_path):
-    engine = make_engine(
-        tmp_path, max_pair_loss=Decimal("0.01"), clip_size=Decimal("5")
-    )
+    engine = make_engine(tmp_path, clip_size=Decimal("5"))
     run(
         engine,
         [
@@ -476,29 +428,20 @@ def test_user_fills_during_cancel_and_replays(tmp_path):
     assert "trade-big" in engine.state.seen_trade_ids
 
 
-def test_restart_cannot_loosen_session_or_pair_caps(tmp_path):
-    engine = make_engine(
-        tmp_path,
-        session_max_loss=Decimal("1"),
-        max_pair_loss=Decimal("0.01"),
-    )
+def test_restart_cannot_loosen_the_session_cap(tmp_path):
+    engine = make_engine(tmp_path, session_max_loss=Decimal("1"))
     looser = Config(**{**engine.config.__dict__})
     looser.session_max_loss = Decimal("5")
-    looser.max_pair_loss = Decimal("0.50")
     resumed = Engine.load(looser, tmp_path / "state.json", tmp_path / "logs")
     assert resumed.state.session_max_loss == Decimal("1")
-    assert resumed.state.max_pair_loss == Decimal("0.01")
     tighter = Config(**{**engine.config.__dict__})
     tighter.session_max_loss = Decimal("0.25")
-    tighter.max_pair_loss = Decimal("0")
     resumed = Engine.load(tighter, tmp_path / "state.json", tmp_path / "logs")
     assert resumed.state.session_max_loss == Decimal("0.25")
-    assert resumed.state.max_pair_loss == Decimal("0")
 
 
-def test_taker_repair_is_off_and_calldata_is_labeled():
+def test_calldata_is_labeled_and_the_secret_stays_out():
     engine_config = load_config(ROOT / "config.live.json")
-    assert engine_config.taker_repair is False
     assert engine_config.live is True
     plan = split_plan("v1", "0x" + "11" * 32, "5")
     assert plan["target"] == CTF_ADAPTER
@@ -551,19 +494,9 @@ def test_live_config_quotes_both_legs_and_holds_the_slot(tmp_path):
     assert shipped.session_max_loss == Decimal("6")
     assert shipped.ladder_levels == 3
     assert shipped.max_open_markets == 1
-    assert shipped.entry_mode == "split_sell"
-    assert shipped.slices_per_side == 1
-    assert shipped.taker_repair is False
     assert shipped.kill_switch_file == "kill.switch"
     assert shipped.leg_unwind_seconds == 5
-    migrated = config_from_mapping(
-        {
-            "pre_split_lead_ms": 60_000,
-            "initial_capital": "30",
-            "per_market_budget": "30",
-        }
-    )
-    assert migrated.split_lead_seconds == 60
+    assert shipped.split_lead_seconds == 8
     shared = dict(
         initial_capital=Decimal("200"),
         max_loss_fraction=Decimal("0.03"),
@@ -736,17 +669,6 @@ def test_official_client_signs_proxy_split_merge_redeem():
     )
     assert [item[0] for item in client.calls] == ["split", "merge", "redeem"]
     assert SECRET not in json.dumps(client.calls)
-
-
-def test_session_distribution_reports_the_losing_tail():
-    report = session_distribution(
-        [Decimal("-1.5"), Decimal("0.2"), Decimal("0"), Decimal("-0.1")]
-    )
-    assert report["sessions"] == 4
-    assert report["best"] == "0.2"
-    assert report["worst"] == "-1.5"
-    assert report["losing_sessions"] == 2
-    assert report["max_session_loss"] == "1.5"
 
 
 def test_reconcile_lag_clears_without_stopping(tmp_path):

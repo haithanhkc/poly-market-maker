@@ -76,11 +76,6 @@ class Config:
     market_slugs: tuple[str, ...] = ()
     # Live is off unless this is true AND the CLI flag AND the risk confirmation.
     live: bool = False
-    # 1 keeps the original one-order-per-side behavior. Live configs raise it.
-    slices_per_side: int = 1
-    slice_inside_tick: bool = False
-    # >= 1 disables the pair floor. The live example sets 0.01.
-    max_pair_loss: Decimal = Decimal("1")
     # 0 disables the per-session cap. The aggregate floor still applies.
     session_max_loss: Decimal = Decimal("0")
     # 0 cancels on any price change. 1 cancels only after a full tick.
@@ -93,8 +88,6 @@ class Config:
     requote_vol_window_ms: int = 30_000
     # Inventory drift at or below this does not cancel a resting sell.
     requote_size_threshold: Decimal = Decimal("1")
-    # Seconds before the pre-close cancel during which asks step toward the bid.
-    close_improve_seconds: int = 90
     # After the open, give posts this long before unwinding a session whose
     # sells are failing. Floor-blocked quotes are left until the normal close.
     sell_ready_timeout_seconds: int = 30
@@ -110,9 +103,6 @@ class Config:
     max_runtime_seconds: int = 2400
     # Give up on a redeem after this many attempts and leave it for redeem-pending.
     redeem_max_attempts: int = 5
-    # split_sell quotes both outcomes after a split. buy_pair_arb buys both
-    # asks only when they sum to 1 - pair_min_edge, then merges.
-    entry_mode: str = "split_sell"
     # single keeps one maker sell per side. ladder posts a few post-only
     # rungs around the mid and skews size toward the side that is falling.
     strategy: str = "single"
@@ -128,23 +118,7 @@ class Config:
     # A bid at or above 1 - fill_price is taken immediately; this is the
     # backstop that repeats that check and then allows a capped loss.
     leg_unwind_seconds: int = 5
-    # Lift 1 - P so a taker fee at risk_fee_rate still nets a breakeven pair.
-    leg_fee_buffer: bool = False
-    # Near expiry, sell below 1 - P rather than carry the leftover to zero.
-    allow_loss_unwind: bool = False
-    # Most USDC the naked size may give up below the breakeven floor.
-    max_unwind_loss: Decimal = Decimal("0")
-    # The loss unwind is allowed only in this many seconds before expiry.
-    unwind_loss_before_expiry_seconds: int = 30
-    # 0 disables the pause. Otherwise pull quotes when the mid jumps.
-    vol_pause_move: Decimal = Decimal("0")
-    vol_pause_window_ms: int = 0
-    vol_pause_hold_ms: int = 0
-    btc_pause_move: Decimal = Decimal("0")
-    pre_split_lead_ms: int = 45_000
     split_confirm_timeout_ms: int = 30_000
-    taker_repair: bool = False
-    taker_repair_max_usdc: Decimal = Decimal("0")
     kill_switch_file: str = ""
     gas_limit: int = 500_000
     max_fee_gwei: Decimal = Decimal("0")
@@ -207,17 +181,12 @@ class Config:
             raise ConfigError("max_open_markets must be at least 1")
         if self.split_clip <= 0 or self.min_pair_inventory < 0:
             raise ConfigError("split settings are invalid")
-        if self.slices_per_side < 1:
-            raise ConfigError("slices_per_side must be at least 1")
-        if self.max_pair_loss < 0:
-            raise ConfigError("max_pair_loss must be non-negative")
         if self.session_max_loss < 0:
             raise ConfigError("session_max_loss must be non-negative")
         if self.requote_min_ticks < 0 or self.requote_min_interval_ms < 0:
             raise ConfigError("requote limits must be non-negative")
         if (
             self.min_order_rest_seconds < 0
-            or self.close_improve_seconds < 0
             or self.sell_ready_timeout_seconds < 0
         ):
             raise ConfigError("rest and close windows must be non-negative")
@@ -235,8 +204,6 @@ class Config:
             raise ConfigError("max_runtime_seconds must be positive")
         if self.redeem_max_attempts < 1:
             raise ConfigError("redeem_max_attempts must be at least 1")
-        if self.entry_mode not in ("split_sell", "buy_pair_arb"):
-            raise ConfigError("entry_mode must be split_sell or buy_pair_arb")
         if self.strategy not in ("single", "ladder"):
             raise ConfigError("strategy must be single or ladder")
         if self.ladder_levels < 1:
@@ -251,27 +218,12 @@ class Config:
             raise ConfigError("winner_min_price must sit inside (0, 1)")
         if self.leg_unwind_seconds < 0:
             raise ConfigError("leg_unwind_seconds must be non-negative")
-        if self.max_unwind_loss < 0:
-            raise ConfigError("max_unwind_loss must be non-negative")
-        if self.unwind_loss_before_expiry_seconds < 0:
-            raise ConfigError("unwind_loss_before_expiry_seconds must be non-negative")
         if self.requote_vol_window_ms < 0:
             raise ConfigError("requote_vol_window_ms must be non-negative")
-        if self.vol_pause_move < 0 or self.btc_pause_move < 0:
-            raise ConfigError("pause thresholds must be non-negative")
-        if (
-            self.vol_pause_window_ms < 0
-            or self.vol_pause_hold_ms < 0
-            or self.pre_split_lead_ms < 0
-            or self.split_confirm_timeout_ms < 0
-        ):
+        if self.split_confirm_timeout_ms < 0:
             raise ConfigError("timing settings must be non-negative")
-        if self.taker_repair_max_usdc < 0:
-            raise ConfigError("taker_repair_max_usdc must be non-negative")
         if self.gas_limit < 0 or self.max_fee_gwei < 0 or self.priority_fee_gwei < 0:
             raise ConfigError("gas settings must be non-negative")
-        if self.taker_repair and self.taker_repair_max_usdc <= 0:
-            raise ConfigError("taker repair needs a positive USDC cap")
         if self.paper_duration_seconds <= 0:
             raise ConfigError("paper_duration_seconds must be positive")
         if self.paper_max_markets < 1:
@@ -327,19 +279,14 @@ _DECIMAL_FIELDS = {
     "freeze_band",
     "split_clip",
     "min_pair_inventory",
-    "max_pair_loss",
     "session_max_loss",
-    "vol_pause_move",
-    "btc_pause_move",
     "requote_vol_k",
     "requote_size_threshold",
     "pair_min_edge",
     "max_unpaired_fraction",
-    "max_unwind_loss",
     "ladder_spacing",
     "skew_mid_gap",
     "winner_min_price",
-    "taker_repair_max_usdc",
     "max_fee_gwei",
     "priority_fee_gwei",
 }
@@ -353,24 +300,18 @@ _INT_FIELDS = {
     "max_open_markets",
     "paper_duration_seconds",
     "paper_max_markets",
-    "slices_per_side",
     "requote_min_ticks",
     "requote_min_interval_ms",
     "min_order_rest_seconds",
     "requote_vol_window_ms",
-    "close_improve_seconds",
     "sell_ready_timeout_seconds",
     "stale_feed_seconds",
     "split_lead_seconds",
     "max_runtime_seconds",
     "redeem_max_attempts",
     "leg_unwind_seconds",
-    "unwind_loss_before_expiry_seconds",
     "ladder_levels",
     "late_window_seconds",
-    "vol_pause_window_ms",
-    "vol_pause_hold_ms",
-    "pre_split_lead_ms",
     "split_confirm_timeout_ms",
     "gas_limit",
 }
@@ -379,28 +320,12 @@ _BOOL_FIELDS = {
     "auto_split",
     "merge_when_idle",
     "live",
-    "slice_inside_tick",
-    "taker_repair",
-    "leg_fee_buffer",
-    "allow_loss_unwind",
 }
-
-
-def _apply_legacy_keys(data: dict) -> dict:
-    """Map run14-style names onto the current fields. Seconds win."""
-    data = dict(data)
-    if "split_lead_seconds" not in data and "pre_split_lead_ms" in data:
-        raw_ms = data["pre_split_lead_ms"]
-        if isinstance(raw_ms, bool) or not isinstance(raw_ms, (int, str)):
-            raise ConfigError("pre_split_lead_ms is not an integer")
-        data["split_lead_seconds"] = int(raw_ms) // 1000
-    return data
 
 
 def config_from_mapping(data: dict) -> Config:
     if not isinstance(data, dict):
         raise ConfigError("config must be an object")
-    data = _apply_legacy_keys(data)
     allowed = {item.name for item in fields(Config)}
     unknown = sorted(set(data) - allowed)
     if unknown:
@@ -425,7 +350,7 @@ def config_from_mapping(data: dict) -> Config:
             kwargs[key] = value
         elif key == "fill_mode":
             kwargs[key] = str(value)
-        elif key in ("entry_mode", "strategy"):
+        elif key == "strategy":
             kwargs[key] = str(value)
         elif key == "poll_interval_seconds":
             kwargs[key] = float(value)

@@ -164,11 +164,8 @@ def _refresh_readiness(engine, client, creds, notes: list[str], now: float) -> b
 
 
 def _lead_ms(config) -> int:
-    """How early the next session is split. ``split_lead_seconds`` wins."""
-    seconds = int(getattr(config, "split_lead_seconds", 0) or 0)
-    if seconds > 0:
-        return seconds * 1000
-    return int(getattr(config, "pre_split_lead_ms", 0) or 0)
+    """How early the next session is split."""
+    return int(getattr(config, "split_lead_seconds", 0) or 0) * 1000
 
 
 def _runtime_seconds(config) -> int:
@@ -208,15 +205,10 @@ def _note_session_done(engine, market) -> None:
         return
     if engine._working(market):
         return
-    if getattr(engine.config, "entry_mode", "split_sell") == "buy_pair_arb":
-        # Count the window once it has ended, whether or not the edge appeared.
-        if market.status == "open" and engine.state.now_ms < market.end_ts_ms:
-            return
-    else:
-        if market.gross_split <= 0:
-            return
-        if not _was_quoted(engine, market):
-            return
+    if market.gross_split <= 0:
+        return
+    if not _was_quoted(engine, market):
+        return
     _ensure_live_state(engine)
     engine.sessions_finished.add(market.market_id)
 
@@ -381,10 +373,7 @@ def _live_tick(
             }
         )
         _send_new_quotes(engine, client, post_only_sells, creds, notes)
-    if getattr(config, "entry_mode", "split_sell") == "buy_pair_arb":
-        _drain_buy_pairs(engine, client, creds, notes, stamp)
-    else:
-        _consider_pre_split(engine, reader, config, creds, stamp, notes)
+    _consider_pre_split(engine, reader, config, creds, stamp, notes)
     _ingest_matched(engine, client, creds, notes)
     _send_cancels(engine, client, creds, notes, now)
     if engine.orders_ok and isinstance(engine.open_orders_cache, list):
@@ -829,62 +818,6 @@ def _confirm_splits(engine, creds, stamp: int, notes: list[str]) -> list[str]:
     return confirmed
 
 
-def _drain_buy_pairs(engine, client, creds, notes: list[str], stamp: int) -> None:
-    """Post a planned two-sided buy. A one-leg fill is unwound by the engine."""
-    plans = list(getattr(engine, "buy_outbox", []))
-    engine.buy_outbox = []
-    if not plans or client is None:
-        return
-    from decimal import Decimal
-
-    from paper_split_maker.live_clob import post_fok_buys
-
-    for plan in plans:
-        orders = [
-            {
-                "token_id": plan["up_token"],
-                "price": str(plan["up_price"]),
-                "size": str(plan["size"]),
-                "tick_size": str(plan["tick_size"]),
-            },
-            {
-                "token_id": plan["down_token"],
-                "price": str(plan["down_price"]),
-                "size": str(plan["size"]),
-                "tick_size": str(plan["tick_size"]),
-            },
-        ]
-        try:
-            results = post_fok_buys(client, orders)
-        except Exception as exc:
-            notes.append(creds.redact(f"buy pair failed: {exc}"))
-            _log_exchange_error(engine, "buy_pair", creds.redact(str(exc)))
-            continue
-        if not isinstance(results, list):
-            results = [results, results]
-        sizes = []
-        for result in list(results)[:2]:
-            failed = not isinstance(result, dict) or result.get("success") is False or result.get(
-                "errorMsg"
-            )
-            sizes.append(Decimal("0") if failed else plan["size"])
-        while len(sizes) < 2:
-            sizes.append(Decimal("0"))
-        market = engine.state.markets.get(str(plan["market_id"]))
-        if market is None:
-            continue
-        engine.apply_buy_fills(
-            market,
-            up_price=plan["up_price"],
-            down_price=plan["down_price"],
-            up_size=sizes[0],
-            down_size=sizes[1],
-        )
-        notes.append(
-            f"buy pair {market.slug or market.market_id} up={sizes[0]} down={sizes[1]}"
-        )
-
-
 def _consider_pre_split(
     engine, reader, config, creds, stamp: int, notes: list[str]
 ) -> None:
@@ -1218,17 +1151,6 @@ def _load_market(
     if loaded is None:
         return False
     _remember_route(engine, loaded.market_id, payload, str(event["condition_id"]))
-    if (
-        getattr(engine.config, "entry_mode", "split_sell") == "buy_pair_arb"
-        and open_s is not None
-        and stamp < open_s * 1000
-    ):
-        # There is no split to mark the session. Keep it across the open so a
-        # pending merge on the previous window cannot drop this one.
-        joined = getattr(engine, "preopen_joined", set())
-        joined.add(slug)
-        joined.add(loaded.market_id)
-        engine.preopen_joined = joined
     return True
 
 

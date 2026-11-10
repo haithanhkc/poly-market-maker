@@ -35,7 +35,7 @@ def _capital30(tmp_path, **extra):
         leg_unwind_seconds=5,
         stale_after_ms=1_000_000,
         stop_quoting_before_expiry_ms=20_000,
-        pre_split_lead_ms=45_000,
+        split_lead_seconds=45,
     )
     values.update(extra)
     return make_engine(tmp_path, **values)
@@ -127,51 +127,6 @@ def test_partial_fill_unwinds_only_the_naked_shares(tmp_path):
     # The unsold Down quote stays. What remains is a matched pair, not a naked leg.
     assert market.up == market.down
     assert market.sold_down_shares - market.sold_up_shares == Decimal("0")
-
-
-def test_buy_pair_enters_only_under_the_edge_and_unwinds_one_leg(tmp_path):
-    engine = _capital30(
-        tmp_path,
-        entry_mode="buy_pair_arb",
-        pair_min_edge=Decimal("0.02"),
-        risk_fee_rate=Decimal("0"),
-        clip_size=Decimal("5"),
-        min_order_size=Decimal("5"),
-    )
-    run(
-        engine,
-        [
-            market_event(end_ts=300_000),
-            book_event("m1", "up", "0.39", "0.40", ts=1, ask_size="10"),
-            book_event("m1", "down", "0.39", "0.40", ts=1, ask_size="10"),
-            {"type": "heartbeat", "event_id": "buy", "ts": 2},
-        ],
-    )
-    market = engine.state.markets["m1"]
-    assert market.gross_split == Decimal("0")
-    assert market.up == Decimal("0") and market.down == Decimal("0")
-    assert engine.state.cash > Decimal("30")
-    locked = engine.state.cash
-    run(
-        engine,
-        [
-            book_event("m1", "up", "0.49", "0.50", ts=3, ask_size="10"),
-            book_event("m1", "down", "0.49", "0.50", ts=3, ask_size="10"),
-            {"type": "heartbeat", "event_id": "skip", "ts": 4},
-        ],
-    )
-    assert engine.state.cash == locked
-    engine.buy_fail_outcome = "down"
-    run(
-        engine,
-        [
-            book_event("m1", "up", "0.39", "0.40", ts=5, ask_size="10"),
-            book_event("m1", "down", "0.39", "0.40", ts=5, ask_size="10"),
-            {"type": "heartbeat", "event_id": "one-leg", "ts": 6},
-        ],
-    )
-    assert market.up == Decimal("0") and market.down == Decimal("0")
-    assert engine.state.cash < locked
 
 
 def test_flat_session_does_not_block_the_next(tmp_path):
@@ -358,26 +313,6 @@ def test_crosses_book_rejection_retries_as_taker(tmp_path, monkeypatch):
     assert any("order rejected" in note for note in notes)
     log = (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8")
     assert "cross_retry_taker" in log
-
-
-def test_loss_unwind_is_only_near_expiry_and_inside_the_cap(tmp_path):
-    engine = _capital30(
-        tmp_path,
-        clip_size=Decimal("5"),
-        split_clip=Decimal("5"),
-        risk_fee_rate=Decimal("0"),
-        allow_loss_unwind=True,
-        max_unwind_loss=Decimal("0.50"),
-        unwind_loss_before_expiry_seconds=30,
-    )
-    _split_five(engine, down_bid="0.80", down_ask="0.83", up_bid="0.10", up_ask="0.12")
-    _fill_down(engine, "5", "0.83")
-    run(engine, [{"type": "heartbeat", "event_id": "early", "ts": 1000}])
-    market = engine.state.markets["m1"]
-    assert market.sold_up_shares == Decimal("0")
-    run(engine, [{"type": "heartbeat", "event_id": "late", "ts": 280_000}])
-    assert market.sold_up_shares == Decimal("5")
-    assert market.sold_up_proceeds == Decimal("0.50")
 
 
 def _split_five(engine, *, down_bid, down_ask, up_bid, up_ask):

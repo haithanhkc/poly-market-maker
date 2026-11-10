@@ -66,7 +66,7 @@ def test_symmetric_demo_scenario_is_flat_to_slightly_positive(tmp_path):
     summary = run_demo(
         config,
         tmp_path / "out",
-        ROOT / "paper_split_maker" / "scenarios" / "symmetric_demo.json",
+        ROOT / "tests" / "fixtures" / "symmetric_demo.json",
     )
     assert summary["live_orders"] is False
     assert Decimal(summary["cash"]) == Decimal("1000.20")

@@ -164,11 +164,6 @@ def post_taker_sells(client, orders: list[dict]) -> list[dict]:
     return _post_orders(client, orders, side_name="SELL", taker=True)
 
 
-def post_fok_buys(client, orders: list[dict]) -> list[dict]:
-    """Buy both asks as fill-or-kill. A miss does not rest."""
-    return _post_orders(client, orders, side_name="BUY", taker=True)
-
-
 def _post_orders(client, orders: list[dict], *, side_name: str, taker: bool) -> list[dict]:
     from py_clob_client_v2 import (
         OrderArgs,

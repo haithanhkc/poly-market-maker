@@ -20,7 +20,6 @@ def _engine(tmp_path, **extra):
         per_market_budget=Decimal("25"),
         split_clip=Decimal("25"),
         pair_min_edge=Decimal("0"),
-        max_pair_loss=Decimal("1"),
         max_unpaired_fraction=Decimal("0.60"),
         ladder_levels=3,
         ladder_spacing=Decimal("0.01"),

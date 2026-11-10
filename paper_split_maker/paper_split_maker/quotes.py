@@ -157,12 +157,9 @@ def binding_sell_floor(
     on its own is not pulled up to 1.01.
     """
     floors: list[Decimal] = []
-    for item in (
-        pair_min_price(market, outcome, config),
-        pair_edge_floor(market, outcome, config),
-    ):
-        if item is not None and item > 0:
-            floors.append(item)
+    edge = pair_edge_floor(market, outcome, config)
+    if edge is not None and edge > 0:
+        floors.append(edge)
     if size > matched_to_sold(market, outcome):
         planned = planned_opposite_quote(state, market, outcome, config)
         probe = price if price is not None else maker_sell_price(market, outcome, config)
@@ -240,53 +237,6 @@ def unpaired_sell_room(
     return catch_up + fresh
 
 
-def pair_min_price(market: Market, outcome: str, config: Config):
-    """Minimum offer for the unfilled side of shares already sold.
-
-    A max_pair_loss of 1 or more turns the floor off. Fees already taken out
-    of sale proceeds lower the average price and raise this floor.
-    """
-    if config.max_pair_loss >= 1:
-        return None
-    if outcome == "down":
-        shares = market.sold_up_shares
-        proceeds = market.sold_up_proceeds
-        other = market.sold_down_shares
-    else:
-        shares = market.sold_down_shares
-        proceeds = market.sold_down_proceeds
-        other = market.sold_up_shares
-    if shares <= 0 or shares <= other:
-        return None
-    average = proceeds / shares
-    floor = Decimal("1") - average - config.max_pair_loss
-    if floor <= 0:
-        return None
-    return floor
-
-
-def ladder_prices(
-    base: Decimal,
-    tick: Decimal,
-    count: int,
-    bid: Decimal | None,
-    *,
-    inside: bool,
-) -> list[Decimal]:
-    """Maker prices: optional one tick inside the spread, then the base and above."""
-    prices: list[Decimal] = []
-    if inside and bid is not None and count > 1:
-        inside_px = bid + tick
-        if bid < inside_px < base and inside_px < 1:
-            prices.append(inside_px)
-    price = base
-    while len(prices) < count and price < 1:
-        if price not in prices and price > (bid or Decimal("0")):
-            prices.append(price)
-        price += tick
-    return prices
-
-
 def _no(reason: str, outcome: str) -> Proposal:
     return Proposal(
         outcome=outcome,
@@ -318,14 +268,8 @@ def propose(state: State, market: Market, outcome: str, config: Config) -> Propo
     fair = (bid + ask) / 2
     raw = ask if ask >= fair + required_edge else fair + required_edge
     price = ceil_tick(raw, market.tick_size)
-    floors = [
-        item
-        for item in (
-            pair_min_price(market, outcome, config),
-            pair_edge_floor(market, outcome, config),
-        )
-        if item is not None
-    ]
+    edge_floor = pair_edge_floor(market, outcome, config)
+    floors = [edge_floor] if edge_floor is not None else []
     floor = max(floors) if floors else None
     if floor is not None and price < floor:
         price = ceil_tick(floor, market.tick_size)

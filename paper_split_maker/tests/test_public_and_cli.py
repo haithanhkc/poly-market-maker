@@ -316,7 +316,7 @@ def test_paper_session_is_bounded_and_dedupes_trades(tmp_path):
 def test_cli_demo_is_idempotent_on_restart(tmp_path):
     config = load_config(ROOT / "config.paper.json")
     out = tmp_path / "demo"
-    scenario = ROOT / "paper_split_maker" / "scenarios" / "symmetric_demo.json"
+    scenario = ROOT / "tests" / "fixtures" / "symmetric_demo.json"
     run_demo(config, out, scenario)
     first = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     run_demo(config, out, scenario)

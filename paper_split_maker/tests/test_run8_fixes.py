@@ -50,9 +50,8 @@ def test_pair_floor_holds_the_cheap_side(tmp_path):
         quote_cooldown_ms=0,
         ack_latency_ms=0,
         min_order_rest_seconds=20,
-        close_improve_seconds=90,
         stop_quoting_before_expiry_ms=20_000,
-        pre_split_lead_ms=45_000,
+        split_lead_seconds=45,
         stale_after_ms=1_000_000,
     )
     end = 300_000
@@ -73,12 +72,6 @@ def test_pair_floor_holds_the_cheap_side(tmp_path):
     assert proposal.reason == "ok"
     assert proposal.price >= Decimal("0.15")
     assert proposal.price > Decimal("0.05")
-    # Close step-down cannot cut through the floor or through bid + 1 tick.
-    engine.state.now_ms = end - 50_000
-    eased = engine._ease_for_close(market, proposal)
-    assert eased.reason == "ok"
-    assert eased.price >= Decimal("0.15")
-    assert eased.price >= Decimal("0.03") + market.tick_size
     logs = run(engine, [{"type": "heartbeat", "event_id": "hb", "ts": end - 50_000}])
     posted = [
         order
@@ -148,9 +141,8 @@ def _run5_session(tmp_path, **extra):
         cancel_latency_ms=0,
         fill_mode="none",
         min_order_rest_seconds=20,
-        close_improve_seconds=90,
         stop_quoting_before_expiry_ms=20_000,
-        pre_split_lead_ms=45_000,
+        split_lead_seconds=45,
         stale_after_ms=1_000_000,
     )
     values.update(extra)
@@ -217,46 +209,6 @@ def test_up_010_blocked_and_016_allowed_after_down_fill(tmp_path):
     # Bid 0.14 is 1 - 0.86, so the filled size is taken instead of left to expire.
     assert market.sold_up_shares == Decimal("5")
     assert market.up == market.down
-
-
-def test_close_improve_never_goes_below_the_floor(tmp_path):
-    engine = _run5_session(tmp_path)
-    # The floor check is about price, so give the size budget room to quote.
-    engine.config.initial_capital = Decimal("200")
-    engine.config.max_loss_fraction = Decimal("0.50")
-    end = 300_000
-    run(
-        engine,
-        [
-            market_event(end_ts=end),
-            {"type": "split", "event_id": "s", "ts": 1, "market_id": "m1", "amount": "30"},
-            book_event("m1", "down", "0.40", "0.48", ts=1),
-            book_event("m1", "up", "0.46", "0.55", ts=1),
-        ],
-    )
-    market = engine.state.markets["m1"]
-    up = propose(engine.state, market, "up", engine.config)
-    assert up.reason == "ok" and up.price == Decimal("0.55")
-    # Deep in the close window, one tick above the bid (0.47) is under 1.01 - 0.48.
-    engine.state.now_ms = 254_000
-    eased = engine._ease_for_close(market, up)
-    assert eased.reason == "ok"
-    assert eased.price >= Decimal("0.53")
-    assert eased.price >= market.book("up").best_bid() + market.tick_size
-
-    _sell_down(engine, market, "5", "0.86")
-    # Set the book without an event. A book event would sell the leftover leg.
-    market.book("down").bids = [(Decimal("0.84"), Decimal("100"))]
-    market.book("down").asks = [(Decimal("0.86"), Decimal("10"))]
-    market.book("up").bids = [(Decimal("0.08"), Decimal("100"))]
-    market.book("up").asks = [(Decimal("0.16"), Decimal("10"))]
-    matched = propose(engine.state, market, "up", engine.config)
-    assert matched.reason == "ok"
-    assert matched.price >= Decimal("0.16")
-    eased_matched = engine._ease_for_close(market, matched)
-    assert eased_matched.reason == "ok"
-    assert eased_matched.price >= Decimal("0.15")
-    assert eased_matched.price >= market.book("up").best_bid() + market.tick_size
 
 
 def test_live_stale_feed_waits_and_spares_a_young_order(tmp_path):
