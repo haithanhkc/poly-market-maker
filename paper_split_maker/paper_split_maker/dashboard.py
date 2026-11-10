@@ -11,17 +11,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from paper_split_maker.config import ConfigError
+from paper_split_maker.config import ConfigError, load_config
 from paper_split_maker.envfile import (
-    BOT_KEYS,
     apply_bot_env,
+    clear_wallet_values,
     prepare_run,
     read_env,
+    redact_secrets,
+    wallet_public,
     write_bot_values,
+    write_wallet_values,
 )
 
 HOST = "127.0.0.1"
 PORT = 8765
+_LOCAL_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
 
 class DashboardError(RuntimeError):
@@ -40,7 +44,7 @@ class Supervisor:
         self.launched_max_markets = 1
 
     def form_values(self) -> dict[str, str]:
-        """Effective non-secret settings: JSON, then .env. Safe to render."""
+        """Effective non-secret settings: JSON, then .env, then the split formula."""
         settings = self._settings("paper")
         env = read_env(self.env_path)
         mode = env.get("BOT_MODE") or settings.mode
@@ -61,18 +65,35 @@ class Supervisor:
         }
 
     def save_form(self, posted: dict) -> None:
-        """Validate, then write BOT_* only. Secret lines are not replaced."""
-        updates = {key: str(posted.get(key) or "").strip() for key in BOT_KEYS}
-        base = prepare_run(
-            self.root / "config.paper.json", {}, max_markets=1
-        )
-        # Validate the posted values against the JSON before touching .env.
+        """Write the split and the session count. Derived fields stay out of .env."""
+        split = str(posted.get("BOT_SPLIT_SIZE") or "").strip()
+        markets = str(posted.get("BOT_MAX_MARKETS") or "").strip()
+        if not split or not markets:
+            raise ConfigError("split and session count are required")
+        env = read_env(self.env_path)
+        env["BOT_SPLIT_SIZE"] = split
+        env["BOT_MAX_MARKETS"] = markets
         apply_bot_env(
-            base.config,
-            updates,
-            max_markets=base.max_markets,
+            load_config(self.root / "config.paper.json"),
+            env,
+            max_markets=1,
         )
-        write_bot_values(self.env_path, updates)
+        write_bot_values(
+            self.env_path,
+            {"BOT_SPLIT_SIZE": split, "BOT_MAX_MARKETS": markets},
+        )
+
+    def save_wallet(self, posted: dict) -> None:
+        """Write non-blank wallet fields. A blank field keeps the saved value."""
+        if self.running():
+            raise DashboardError("refusing to change keys while a bot is running")
+        write_wallet_values(self.env_path, posted)
+
+    def clear_wallet(self) -> None:
+        """Drop every wallet secret and the funder."""
+        if self.running():
+            raise DashboardError("refusing to change keys while a bot is running")
+        clear_wallet_values(self.env_path)
 
     def start(self, mode: str, *, confirmed: bool = False, runner=None) -> dict:
         if mode not in {"paper", "live"}:
@@ -158,10 +179,11 @@ class Supervisor:
             if launch.exists():
                 data = json.loads(launch.read_text(encoding="utf-8"))
                 floor = str(data.get("loss_floor") or "")
+        env = read_env(self.env_path)
         return {
             "running": self.running(),
             "state": "running" if self.running() else "stopped",
-            "mode": self.mode or (read_env(self.env_path).get("BOT_MODE") or "paper"),
+            "mode": self.mode or (env.get("BOT_MODE") or "paper"),
             "session": session,
             "cash": cash,
             "realized_pnl": pnl,
@@ -169,6 +191,7 @@ class Supervisor:
             "fills": self._fill_count(),
             "out": "" if self.out_dir is None else str(self.out_dir),
             "log": self.log_tail(),
+            "wallet": wallet_public(env),
         }
 
     def log_tail(self, limit: int = 40) -> str:
@@ -179,22 +202,29 @@ class Supervisor:
             if path.exists():
                 lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
                 if lines:
-                    return "\n".join(lines[-limit:])
+                    text = "\n".join(lines[-limit:])
+                    return redact_secrets(text, read_env(self.env_path))
         return ""
 
     def page(self) -> str:
         values = self.form_values()
         status = self.status()
-        return _PAGE.format(
-            capital=_esc(values["BOT_CAPITAL"]),
+        wallet = status["wallet"]
+        hints = wallet["hints"]
+        if wallet["signer"]:
+            signer = wallet["signer"]
+        elif hints["POLY_PRIVATE_KEY"] != "chưa lưu":
+            signer = "không suy ra được"
+        else:
+            signer = "chưa có"
+        signature = wallet["signature_type"]
+        html = _PAGE.format(
             split=_esc(values["BOT_SPLIT_SIZE"]),
+            markets=_esc(values["BOT_MAX_MARKETS"]),
+            capital=_esc(values["BOT_CAPITAL"]),
             clip=_esc(values["BOT_CLIP_SIZE"]),
             rungs=_esc(values["BOT_RUNGS"]),
-            fraction=_esc(values["BOT_MAX_LOSS_FRACTION"]),
             session=_esc(values["BOT_SESSION_STOP"]),
-            markets=_esc(values["BOT_MAX_MARKETS"]),
-            mode_paper="selected" if values["BOT_MODE"] == "paper" else "",
-            mode_live="selected" if values["BOT_MODE"] == "live" else "",
             floor=_esc(values["loss_floor"]),
             budget=_esc(values["loss_budget"]),
             run_state=_esc(status["state"]),
@@ -205,7 +235,23 @@ class Supervisor:
             run_floor=_esc(status["loss_floor"] or values["loss_floor"]),
             fills=_esc(str(status["fills"])),
             log=_esc(status["log"]),
+            signer=_esc(signer),
+            funder=_esc(wallet["funder"] or "chưa lưu"),
+            hint_key=_esc(hints["POLY_PRIVATE_KEY"]),
+            hint_api=_esc(hints["POLY_API_KEY"]),
+            hint_secret=_esc(hints["POLY_API_SECRET"]),
+            hint_pass=_esc(hints["POLY_API_PASSPHRASE"]),
+            hint_relayer=_esc(hints["RELAYER_API_KEY"]),
+            hint_relayer_address=_esc(hints["RELAYER_API_KEY_ADDRESS"]),
+            sig0="selected" if signature == "0" else "",
+            sig1="selected" if signature == "1" else "",
+            sig2="selected" if signature == "2" else "",
+            sig3="selected" if signature == "3" else "",
+            running_note=(
+                "Bot đang chạy — không đổi khóa." if self.running() else ""
+            ),
         )
+        return redact_secrets(html, read_env(self.env_path))
 
     def _settings(self, mode: str):
         env = read_env(self.env_path)
@@ -259,54 +305,113 @@ def make_handler(supervisor: Supervisor):
             return
 
         def do_GET(self) -> None:  # noqa: N802
-            if not _local(self.client_address):
-                self._send(403, "text/plain", b"local only")
-                return
-            if self.path.startswith("/status"):
-                body = json.dumps(supervisor.status()).encode("utf-8")
-                self._send(200, "application/json; charset=utf-8", body)
-                return
-            if self.path.startswith("/log"):
-                self._send(
-                    200,
-                    "text/plain; charset=utf-8",
-                    supervisor.log_tail().encode("utf-8"),
-                )
-                return
-            self._send(200, "text/html; charset=utf-8", supervisor.page().encode("utf-8"))
+            _handle_get(self, supervisor)
 
         def do_POST(self) -> None:  # noqa: N802
-            if not _local(self.client_address):
-                self._send(403, "text/plain", b"local only")
-                return
-            posted = _form(self)
-            try:
-                if self.path.startswith("/settings"):
-                    supervisor.save_form(posted)
-                elif self.path.startswith("/start"):
-                    mode = str(posted.get("mode") or "paper")
-                    confirmed = str(posted.get("confirm") or "") == "yes"
-                    supervisor.start(mode, confirmed=confirmed)
-                elif self.path.startswith("/stop"):
-                    supervisor.stop()
-                else:
-                    self._send(404, "text/plain", b"not found")
-                    return
-            except (ConfigError, DashboardError) as exc:
-                self._send(400, "text/plain; charset=utf-8", str(exc).encode("utf-8"))
-                return
-            self.send_response(303)
-            self.send_header("Location", "/")
-            self.end_headers()
-
-        def _send(self, code: int, content_type: str, body: bytes) -> None:
-            self.send_response(code)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            _handle_post(self, supervisor)
 
     return Handler
+
+
+def _handle_get(handler, supervisor: Supervisor) -> None:
+    if not _allowed(handler, supervisor):
+        return
+    if handler.path.startswith("/status"):
+        body = json.dumps(supervisor.status(), ensure_ascii=False).encode("utf-8")
+        _send(handler, supervisor, 200, "application/json; charset=utf-8", body)
+        return
+    if handler.path.startswith("/log"):
+        _send(
+            handler,
+            supervisor,
+            200,
+            "text/plain; charset=utf-8",
+            supervisor.log_tail().encode("utf-8"),
+        )
+        return
+    _send(
+        handler,
+        supervisor,
+        200,
+        "text/html; charset=utf-8",
+        supervisor.page().encode("utf-8"),
+    )
+
+
+def _handle_post(handler, supervisor: Supervisor) -> None:
+    if not _allowed(handler, supervisor):
+        return
+    posted = _form(handler)
+    try:
+        handled = _dispatch(supervisor, handler.path, posted)
+    except (ConfigError, DashboardError) as exc:
+        _send(handler, supervisor, 400, "text/plain; charset=utf-8", str(exc).encode("utf-8"))
+        return
+    if not handled:
+        _send(handler, supervisor, 404, "text/plain", b"not found")
+        return
+    handler.send_response(303)
+    handler.send_header("Location", "/")
+    handler.end_headers()
+
+
+def _dispatch(supervisor: Supervisor, path: str, posted: dict) -> bool:
+    if path.startswith("/settings"):
+        supervisor.save_form(posted)
+    elif path.startswith("/wallet/clear"):
+        supervisor.clear_wallet()
+    elif path.startswith("/wallet"):
+        supervisor.save_wallet(posted)
+    elif path.startswith("/start"):
+        mode = str(posted.get("mode") or "paper")
+        confirmed = str(posted.get("confirm") or "") == "yes"
+        supervisor.start(mode, confirmed=confirmed)
+    elif path.startswith("/stop"):
+        supervisor.stop()
+    else:
+        return False
+    return True
+
+
+def _allowed(handler, supervisor: Supervisor) -> bool:
+    client = handler.client_address[0] if handler.client_address else ""
+    if request_allowed(
+        client,
+        handler.headers.get("Host") or "",
+        handler.headers.get("Origin"),
+        handler.command,
+    ):
+        return True
+    _send(handler, supervisor, 403, "text/plain; charset=utf-8", b"local only")
+    return False
+
+
+def _send(handler, supervisor: Supervisor, code: int, content_type: str, body: bytes) -> None:
+    if "text" in content_type or "json" in content_type:
+        text = redact_secrets(
+            body.decode("utf-8", "replace"),
+            read_env(supervisor.env_path),
+        )
+        body = text.encode("utf-8")
+    handler.send_response(code)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def request_allowed(client_host: str, host_header: str, origin, method: str) -> bool:
+    """Local client, local Host, and a local Origin on any request that sends one.
+
+    A POST with no Origin is refused. That is the cross-site check for the forms.
+    """
+    if client_host not in {"127.0.0.1", "::1"}:
+        return False
+    if not _host_is_local(host_header):
+        return False
+    if origin is not None and str(origin).strip():
+        return _origin_is_local(str(origin))
+    return method.upper() != "POST"
 
 
 def serve(root: Path, host: str = HOST, port: int = PORT) -> None:
@@ -331,9 +436,37 @@ def _form(handler) -> dict[str, str]:
     return {key: values[-1] for key, values in parsed.items()}
 
 
-def _local(address) -> bool:
-    host = address[0] if address else ""
-    return host in {"127.0.0.1", "::1"}
+def _host_is_local(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    if not text or "@" in text:
+        return False
+    if text.startswith("["):
+        end = text.find("]")
+        if end < 0:
+            return False
+        name = text[: end + 1]
+        port = text[end + 1 :]
+        if port and not _port(port[1:] if port.startswith(":") else port):
+            return False
+        return name in {"[::1]"}
+    if text.count(":") > 1:
+        return False
+    name, separator, port = text.partition(":")
+    if separator and not _port(port):
+        return False
+    return name in _LOCAL_NAMES
+
+
+def _origin_is_local(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    if not text.startswith("http://"):
+        return False
+    host = text[len("http://") :].split("/", 1)[0]
+    return _host_is_local(host)
+
+
+def _port(value: str) -> bool:
+    return bool(value) and value.isdigit() and int(value) < 65536
 
 
 def _current_session(state: dict) -> str:
@@ -379,23 +512,24 @@ pre {{ background: #f4f4f4; padding: 0.8rem; max-height: 18rem; overflow: auto; 
 </head>
 <body>
 <h1>Split maker</h1>
-<p>Sàn lỗ hiện tại: <strong>{floor}</strong> (ngân sách lỗ {budget}). Khóa bí mật không hiện trên trang này.</p>
+<p>Trang chỉ lắng nghe 127.0.0.1. Khóa bí mật không được gửi lại trang này.</p>
+<h2>Cài đặt</h2>
 <form method="post" action="/settings">
-<label>Vốn BOT_CAPITAL <input name="BOT_CAPITAL" value="{capital}"></label>
-<label>Khối split BOT_SPLIT_SIZE <input name="BOT_SPLIT_SIZE" value="{split}"></label>
-<label>Khối mỗi bậc BOT_CLIP_SIZE <input name="BOT_CLIP_SIZE" value="{clip}"></label>
-<label>Số bậc BOT_RUNGS <input name="BOT_RUNGS" value="{rungs}"></label>
-<label>Tỷ lệ dừng lỗ BOT_MAX_LOSS_FRACTION <input name="BOT_MAX_LOSS_FRACTION" value="{fraction}"></label>
-<label>Dừng một phiên BOT_SESSION_STOP <input name="BOT_SESSION_STOP" value="{session}"></label>
-<label>Số phiên BOT_MAX_MARKETS <input name="BOT_MAX_MARKETS" value="{markets}"></label>
-<label>Chế độ BOT_MODE
-<select name="BOT_MODE">
-<option value="paper" {mode_paper}>paper</option>
-<option value="live" {mode_live}>live</option>
-</select>
-</label>
-<button type="submit">Lưu vào .env</button>
+<label>Khối split (pUSD) <input name="BOT_SPLIT_SIZE" value="{split}" inputmode="decimal"></label>
+<label>Số phiên <input name="BOT_MAX_MARKETS" value="{markets}" inputmode="numeric"></label>
+<button type="submit">Lưu</button>
 </form>
+<h3>Bot sẽ dùng</h3>
+<p>Tính từ khối split. Các số này chỉ để xem. Split 25: clip 5, 3 bậc, dừng phiên 6, vốn 59, sàn 47.20. Split 50: clip 5, 6 bậc, dừng phiên 12, vốn 118, sàn 94.40.</p>
+<ul>
+<li>Vốn: {capital} pUSD</li>
+<li>Clip mỗi bậc: {clip} cổ</li>
+<li>Số bậc mỗi phía: {rungs}</li>
+<li>Dừng một phiên: {session} pUSD</li>
+<li>Dừng ngày (20% vốn): ngân sách {budget}, sàn lỗ {floor}</li>
+</ul>
+<p>Paper dùng vốn = split × 59/25. Live, nếu đọc được số dư pUSD và .env không có BOT_CAPITAL, dùng số dư đó khi số dư đủ cho khối split. Dòng BOT_CAPITAL, BOT_CLIP_SIZE, BOT_RUNGS, BOT_MAX_LOSS_FRACTION, BOT_SESSION_STOP trong .env vẫn ghi đè, nhưng không có ô trên trang này.</p>
+<h2>Chạy</h2>
 <form method="post" action="/start">
 <input type="hidden" name="mode" value="paper">
 <button type="submit">Chạy paper</button>
@@ -407,6 +541,40 @@ pre {{ background: #f4f4f4; padding: 0.8rem; max-height: 18rem; overflow: auto; 
 </form>
 <form method="post" action="/stop">
 <button type="submit">Dừng</button>
+</form>
+<h2>Ví</h2>
+<p>{running_note}</p>
+<p>Địa chỉ ký (từ khóa riêng): <strong>{signer}</strong></p>
+<p>Funder đang dùng: <strong>{funder}</strong></p>
+<ul>
+<li>Khóa riêng: {hint_key}</li>
+<li>CLOB API key: {hint_api}</li>
+<li>CLOB API secret: {hint_secret}</li>
+<li>CLOB passphrase: {hint_pass}</li>
+<li>Relayer API key: {hint_relayer}</li>
+<li>Relayer API key address: {hint_relayer_address}</li>
+</ul>
+<form method="post" action="/wallet">
+<label>Khóa riêng POLY_PRIVATE_KEY <input type="password" name="POLY_PRIVATE_KEY" value="" autocomplete="off" spellcheck="false"></label>
+<label>Funder POLY_FUNDER <input type="text" name="POLY_FUNDER" value="" autocomplete="off" placeholder="để trống nếu giữ nguyên"></label>
+<label>Kiểu chữ ký POLY_SIGNATURE_TYPE
+<select name="POLY_SIGNATURE_TYPE">
+<option value="0" {sig0}>0 EOA</option>
+<option value="1" {sig1}>1 POLY_PROXY</option>
+<option value="2" {sig2}>2 GNOSIS_SAFE</option>
+<option value="3" {sig3}>3 POLY_1271</option>
+</select>
+</label>
+<label>CLOB API key <input type="password" name="POLY_API_KEY" value="" autocomplete="off"></label>
+<label>CLOB API secret <input type="password" name="POLY_API_SECRET" value="" autocomplete="off"></label>
+<label>CLOB passphrase <input type="password" name="POLY_API_PASSPHRASE" value="" autocomplete="off"></label>
+<label>Relayer API key <input type="password" name="RELAYER_API_KEY" value="" autocomplete="off"></label>
+<label>Relayer API key address <input type="password" name="RELAYER_API_KEY_ADDRESS" value="" autocomplete="off"></label>
+<button type="submit">Lưu ví</button>
+</form>
+<p>Ô để trống giữ giá trị cũ. Nút dưới xóa khóa, funder và các API key.</p>
+<form method="post" action="/wallet/clear">
+<button type="submit">Xóa khóa</button>
 </form>
 <h2>Trạng thái</h2>
 <ul>

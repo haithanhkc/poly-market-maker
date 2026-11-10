@@ -49,9 +49,11 @@ class Credentials:
         redacted = text
         for secret in (
             self.private_key,
+            self.api_key,
             self.api_secret,
             self.api_passphrase,
             self.relayer_api_key,
+            self.relayer_api_key_address,
         ):
             if secret:
                 redacted = redacted.replace(secret, "[redacted]")

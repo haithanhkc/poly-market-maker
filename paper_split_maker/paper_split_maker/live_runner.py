@@ -213,6 +213,31 @@ def _note_session_done(engine, market) -> None:
     engine.sessions_finished.add(market.market_id)
 
 
+def _apply_wallet_capital(config, creds, reader) -> None:
+    """Replace the split-based bankroll with pUSD when the wallet can fund it.
+
+    Called before the ledger is created. A failed read keeps the tuned capital.
+    The private key is not used and is not logged.
+    """
+    from paper_split_maker.envfile import apply_wallet_balance
+
+    if getattr(config, "capital_from_env", False):
+        return
+    if reader is None:
+        try:
+            from paper_split_maker.chain_send import pusd_balance_shares
+        except Exception:
+            return
+        reader = pusd_balance_shares
+    try:
+        balance = reader(creds.funder)
+    except Exception:
+        return
+    if balance is None:
+        return
+    apply_wallet_balance(config, balance)
+
+
 def run_confirmed_live(
     config: Config,
     creds: Credentials,
@@ -226,6 +251,7 @@ def run_confirmed_live(
     sleep=None,
     poster=None,
     read_chain_balance=False,
+    collateral_balance=None,
 ) -> dict:
     from paper_split_maker.live_clob import (
         build_client,
@@ -237,6 +263,8 @@ def run_confirmed_live(
 
     if duration_seconds <= 0:
         raise RuntimeError("duration_seconds must be positive")
+    if read_chain_balance:
+        _apply_wallet_capital(config, creds, collateral_balance)
     clock = now_s or time.time
     sleeper = sleep or time.sleep
     engine = open_engine(config, out_dir)

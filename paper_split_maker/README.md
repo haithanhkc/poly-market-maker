@@ -30,15 +30,30 @@ python -m paper_split_maker --config config.live.json --out ..\runs\live --max-m
 
 Use a new `--out` directory after changing capital or the loss fraction. Those values are locked into `state.json` and a resume will not loosen them. Do not put keys in the config. The process reads `POLY_PRIVATE_KEY`, `POLY_FUNDER`, and `POLY_SIGNATURE_TYPE` from the environment only when `--live` is set.
 
-`paper_split_maker/.env` overrides the JSON. `BOT_CAPITAL` sets the bankroll and the loss floor (`capital * (1 - BOT_MAX_LOSS_FRACTION)`). `BOT_SPLIT_SIZE` is the split for that run. See `.env.example`.
+`paper_split_maker/.env` overrides the JSON. `BOT_SPLIT_SIZE` is the split for that run. Clip size, rung count, and the loss stops are derived from it unless an advanced line is set. See `.env.example`.
+
+The shipped ladder posts about 60% of the split on each side (the unpaired cap), in clips of at least 5 shares. Rungs grow first, up to 10, and only then does the clip grow in steps of 5. The session stop is `split * 6/25`. Paper capital is `split * 59/25`, and the daily stop stays 20% of that capital. Split 25 → clip 5, 3 rungs, session stop 6, capital 59, daily budget 11.80, floor 47.20. Split 50 → clip 5, 6 rungs, session stop 12, capital 118, daily budget 23.60, floor 94.40.
+
+On a live run, when `BOT_CAPITAL` is not set and the pUSD balance can be read, that balance becomes the capital before `state.json` is created, so the 20% stop applies to the wallet. A balance below the split refuses the run. The dashboard never reads the chain. `BOT_CAPITAL`, `BOT_CLIP_SIZE`, `BOT_RUNGS`, `BOT_MAX_LOSS_FRACTION`, and `BOT_SESSION_STOP` still override the formula when present in `.env`. They are not on the dashboard.
 
 ## Bảng điều khiển (Windows)
 
-Sửa `paper_split_maker\.env` (copy từ `.env.example` nếu chưa có). Các dòng `BOT_*` là vốn, khối split, số bậc, tỷ lệ lỗ, số phiên và `BOT_MODE`. Không ghi khóa riêng vào config JSON. Khóa riêng nằm trong `.env` và không hiện trên bảng điều khiển.
+Copy `paper_split_maker\.env.example` thành `.env` nếu chưa có. Trang chỉ sửa hai ô: khối split (`BOT_SPLIT_SIZE`) và số phiên (`BOT_MAX_MARKETS`). Clip, số bậc, dừng một phiên và dừng ngày được tính từ khối split và hiện ở mục "Bot sẽ dùng" (chỉ đọc).
 
-Double-click `paper_split_maker\start_dashboard.bat`. File này tạo hoặc dùng `.venv`, cài dependency nếu thiếu, rồi mở trình duyệt tại `http://127.0.0.1:8765/`. Trang chỉ lắng nghe máy này.
+Công thức, cùng tỷ lệ với file mặc định:
 
-- **Lưu vào .env**: ghi các ô `BOT_*`. Các dòng khóa bí mật giữ nguyên.
+- Mỗi phía đăng khoảng 60% khối split, mỗi bậc ít nhất 5 cổ. Số bậc tăng trước (tối đa 10), sau đó clip mới tăng theo bước 5.
+- Dừng một phiên = split × 6/25.
+- Vốn paper = split × 59/25. Dừng ngày = 20% vốn đó.
+- Split 25: clip 5, 3 bậc, dừng phiên 6, vốn 59, ngân sách ngày 11.80, sàn 47.20.
+- Split 50: clip 5, 6 bậc, dừng phiên 12, vốn 118, ngân sách ngày 23.60, sàn 94.40.
+
+Live, nếu không có dòng `BOT_CAPITAL` và đọc được số dư pUSD, bot dùng số dư đó làm vốn (trước khi tạo `state.json`) khi số dư đủ cho khối split. Số dư thấp hơn khối split thì lần chạy bị từ chối. Trang không gọi chain. Muốn ghi đè, thêm trong `.env` (không có ô trên trang): `BOT_CAPITAL`, `BOT_CLIP_SIZE`, `BOT_RUNGS`, `BOT_MAX_LOSS_FRACTION`, `BOT_SESSION_STOP`.
+
+Double-click `paper_split_maker\start_dashboard.bat`. File này tạo hoặc dùng `.venv`, cài dependency nếu thiếu, rồi mở trình duyệt tại `http://127.0.0.1:8765/`. Server chỉ bind `127.0.0.1`. Request có Host hoặc Origin không phải localhost bị từ chối. Mọi thao tác ghi phải là POST.
+
+- **Lưu**: chỉ ghi split và số phiên. Không đụng khóa.
+- **Ví**: khóa riêng, funder, kiểu chữ ký (0 EOA, 1 POLY_PROXY, 2 GNOSIS_SAFE, 3 POLY_1271), CLOB API key / secret / passphrase, relayer API key và địa chỉ relayer. Ô khóa là kiểu password và để trống. Lưu ô trống thì giữ giá trị cũ. **Xóa khóa** xóa các khóa, funder và API key. Trang chỉ hiện "đã lưu" (và 4 ký tự cuối nếu chuỗi đủ dài), cộng địa chỉ ký suy ra từ khóa riêng và địa chỉ funder. Giá trị khóa không quay lại trang, log, JSON trạng thái hay câu trả lời API. Không đổi khóa khi bot đang chạy.
 - **Chạy paper**: xóa `kill.switch` cũ, tạo thư mục `runs\paper-<thời gian>`, không gửi lệnh.
 - **Chạy live**: phải tick "Tôi hiểu rủi ro live". Lệnh có `--live --yes-i-understand-live-risk`.
 - **Dừng**: ghi `kill.switch` và tắt process. Không chạy hai bot cùng lúc.
