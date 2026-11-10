@@ -1,0 +1,107 @@
+{
+  "label": "synthetic",
+  "description": "Symmetric synthetic book. Both asks are lifted after the displayed queue. This is a fixture, not a backtest and not evidence of live profit.",
+  "events": [
+    {
+      "type": "market_open",
+      "event_id": "demo-open",
+      "seq": 1,
+      "ts": 0,
+      "market_id": "demo-btc",
+      "condition_id": "0xsynthetic-demo",
+      "slug": "synthetic-btc-updown-5m",
+      "question": "Synthetic BTC up or down",
+      "up_token_id": "up-token",
+      "down_token_id": "down-token",
+      "up_label": "Up",
+      "down_label": "Down",
+      "up_index": 0,
+      "down_index": 1,
+      "end_ts": 300000,
+      "tick_size": "0.01",
+      "min_order_size": "5",
+      "accepting_orders": true,
+      "synthetic": true
+    },
+    {
+      "type": "book",
+      "event_id": "demo-book-up",
+      "seq": 2,
+      "ts": 0,
+      "market_id": "demo-btc",
+      "outcome": "up",
+      "bids": [["0.48", "100"]],
+      "asks": [["0.52", "10"]],
+      "hash": "up-h1"
+    },
+    {
+      "type": "book",
+      "event_id": "demo-book-down",
+      "seq": 3,
+      "ts": 0,
+      "market_id": "demo-btc",
+      "outcome": "down",
+      "bids": [["0.48", "100"]],
+      "asks": [["0.52", "10"]],
+      "hash": "down-h1"
+    },
+    {
+      "type": "heartbeat",
+      "event_id": "demo-hb-0",
+      "seq": 4,
+      "ts": 0
+    },
+    {
+      "type": "trade",
+      "event_id": "demo-trade-up-queue",
+      "seq": 5,
+      "ts": 300,
+      "market_id": "demo-btc",
+      "outcome": "up",
+      "price": "0.52",
+      "size": "10",
+      "taker_side": "BUY",
+      "trade_id": "demo-up-queue"
+    },
+    {
+      "type": "trade",
+      "event_id": "demo-trade-up-fill",
+      "seq": 6,
+      "ts": 301,
+      "market_id": "demo-btc",
+      "outcome": "up",
+      "price": "0.52",
+      "size": "5",
+      "taker_side": "BUY",
+      "trade_id": "demo-up-fill"
+    },
+    {
+      "type": "trade",
+      "event_id": "demo-trade-down-fill",
+      "seq": 7,
+      "ts": 302,
+      "market_id": "demo-btc",
+      "outcome": "down",
+      "price": "0.52",
+      "size": "15",
+      "taker_side": "BUY",
+      "trade_id": "demo-down-fill"
+    },
+    {
+      "type": "resolution",
+      "event_id": "demo-resolution",
+      "seq": 8,
+      "ts": 450,
+      "market_id": "demo-btc",
+      "source": "fixture",
+      "label": "synthetic-fixture",
+      "winner": "up"
+    },
+    {
+      "type": "heartbeat",
+      "event_id": "demo-hb-after-resolution",
+      "seq": 9,
+      "ts": 1000
+    }
+  ]
+}

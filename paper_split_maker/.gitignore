@@ -1,0 +1,13 @@
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+*.egg-info/
+
+# Run outputs. A new --out directory, the ledger, and the kill file stay local.
+runs/
+out/
+state.json
+kill.switch
+logs/
+*.jsonl
