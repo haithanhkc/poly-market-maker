@@ -32,21 +32,24 @@ Use a new `--out` directory after changing capital or the loss fraction. Those v
 
 `paper_split_maker/.env` overrides the JSON. `BOT_SPLIT_SIZE` is the split for that run. Clip size, rung count, and the loss stops are derived from it unless an advanced line is set. See `.env.example`.
 
-The shipped ladder posts about 60% of the split on each side (the unpaired cap), in clips of at least 5 shares. Rungs grow first, up to 10, and only then does the clip grow in steps of 5. The session stop is `split * 6/25`. Paper capital is `split * 59/25`, and the daily stop stays 20% of that capital. Split 25 → clip 5, 3 rungs, session stop 6, capital 59, daily budget 11.80, floor 47.20. Split 50 → clip 5, 6 rungs, session stop 12, capital 118, daily budget 23.60, floor 94.40.
+The derived ladder is scaled from bubblebust (3,488 splits of exactly 750). Each side may sell their mean heavy-side fill, 9.32% of the split, and never less than 5 shares. The clip is their modal 10-share print scaled by split/750, on a 5-share grid, and at least 5. Rungs are how many clips fit in that budget, at most 3 (their cheap side keeps a rung the rich side drops; loser shares average 1.48 times winner shares). Capital is 3 splits, because a position opened 293s before the session and merged 84s after the close overlaps the next two sessions. The session stop is their p95 session loss (8.828 pUSD) times split/750. The daily stop is their worst day (182.39 pUSD) divided by 3×750. The last 120s uses a 0.90 winner floor; their last-60s medians are 0.90 and 0.11. Quotes are not pulled 293s early: that lead is funded by the extra splits, and this engine still flattens in the last 5s. Split 25 and 50 both become clip 5, 1 rung, 5 shares per side, because 9.32% is under 5 shares. Split 25 → capital 75, session stop 0.294, daily budget about 6.08. Split 50 → capital 150, session stop 0.589, daily budget about 12.16.
 
-On a live run, when `BOT_CAPITAL` is not set and the pUSD balance can be read, that balance becomes the capital before `state.json` is created, so the 20% stop applies to the wallet. A balance below the split refuses the run. The dashboard never reads the chain. `BOT_CAPITAL`, `BOT_CLIP_SIZE`, `BOT_RUNGS`, `BOT_MAX_LOSS_FRACTION`, and `BOT_SESSION_STOP` still override the formula when present in `.env`. They are not on the dashboard.
+On a live run, when `BOT_CAPITAL` is not set and the pUSD balance can be read, that balance becomes the capital before `state.json` is created. A balance below the split refuses the run. The dashboard never reads the chain. `BOT_CAPITAL`, `BOT_CLIP_SIZE`, `BOT_RUNGS`, `BOT_MAX_LOSS_FRACTION`, and `BOT_SESSION_STOP` still override the formula when present in `.env`. They are not on the dashboard.
 
 ## Bảng điều khiển (Windows)
 
 Copy `paper_split_maker\.env.example` thành `.env` nếu chưa có. Trang chỉ sửa hai ô: khối split (`BOT_SPLIT_SIZE`) và số phiên (`BOT_MAX_MARKETS`). Clip, số bậc, dừng một phiên và dừng ngày được tính từ khối split và hiện ở mục "Bot sẽ dùng" (chỉ đọc).
 
-Công thức, cùng tỷ lệ với file mặc định:
+Công thức lấy từ lệnh của bubblebust (3.488 lần split, mỗi lần đúng 750), rồi nhân theo khối split của bạn. Tối thiểu 5 cổ.
 
-- Mỗi phía đăng khoảng 60% khối split, mỗi bậc ít nhất 5 cổ. Số bậc tăng trước (tối đa 10), sau đó clip mới tăng theo bước 5.
-- Dừng một phiên = split × 6/25.
-- Vốn paper = split × 59/25. Dừng ngày = 20% vốn đó.
-- Split 25: clip 5, 3 bậc, dừng phiên 6, vốn 59, ngân sách ngày 11.80, sàn 47.20.
-- Split 50: clip 5, 6 bậc, dừng phiên 12, vốn 118, ngân sách ngày 23.60, sàn 94.40.
+- Mỗi phía bán trung bình 9,32% split (phía bán nhiều hơn). Dưới 5 cổ thì nâng lên 5.
+- Clip hay gặp là 10 cổ trên 750, tức 10/750 của split, làm tròn xuống bội số của 5, và không dưới 5.
+- Số bậc = số clip vừa ngân sách đó, tối đa 3. Phía đắt bỏ một bậc: họ bán phía thua trung bình 1,48 lần phía thắng.
+- Vốn = 3 × split. Họ mở lệnh trước 293 giây và gộp 84 giây sau khi đóng, nên thường giữ 2 split, đôi khi 3.
+- Dừng một phiên = 8,828 × split/750 (p95 lỗ một phiên của họ).
+- Dừng ngày = 182,39 / (3 × 750) của vốn (ngày tệ nhất trong 13 ngày).
+- 120 giây cuối: winner không dưới 0,90. Median 60 giây cuối của họ là winner 0,90 và loser 0,11.
+- Split 25 và 50: clip 5, 1 bậc, 5 cổ mỗi phía. Vốn 75 và 150. Dừng phiên khoảng 0,294 và 0,589.
 
 Live, nếu không có dòng `BOT_CAPITAL` và đọc được số dư pUSD, bot dùng số dư đó làm vốn (trước khi tạo `state.json`) khi số dư đủ cho khối split. Số dư thấp hơn khối split thì lần chạy bị từ chối. Trang không gọi chain. Muốn ghi đè, thêm trong `.env` (không có ô trên trang): `BOT_CAPITAL`, `BOT_CLIP_SIZE`, `BOT_RUNGS`, `BOT_MAX_LOSS_FRACTION`, `BOT_SESSION_STOP`.
 
@@ -66,7 +69,7 @@ python -m paper_split_maker --redeem-pending ..\runs\live\redeem-pending.json
 
 ## Config
 
-Two files. Anything omitted uses the default in `paper_split_maker/config.py`.
+Two files. Anything omitted uses the default in `paper_split_maker/config.py`. A run from the dashboard or the CLI then replaces capital, clip, rungs, the per-side budget, the late window, and both loss stops with the split formula above. The table is what the JSON stores before that replacement.
 
 | Param | Live value | Meaning |
 | --- | --- | --- |

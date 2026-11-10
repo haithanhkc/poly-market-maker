@@ -83,38 +83,52 @@ def test_process_bot_value_overrides_the_file(tmp_path):
         max_markets=1,
     )
     assert settings.config.initial_capital == Decimal("70")
-    assert settings.config.loss_floor() == Decimal("56")
+    fraction = Decimal("182.3864") / Decimal("2250")
+    assert settings.config.max_loss_fraction == fraction
+    from paper_split_maker.config import q_loss_budget
+
+    assert settings.config.loss_floor() == Decimal("70") - q_loss_budget(
+        Decimal("70"), fraction
+    )
 
 
 def test_split_derives_clip_rungs_and_stops():
+    from paper_split_maker.envfile import derive_from_split
+
+    small = derive_from_split(Decimal("25"))
+    large = derive_from_split(Decimal("50"))
+    # 9.32% of 25 and of 50 is under 5 shares, so both sides stop at one minimum clip.
+    assert small.sell_shares == Decimal("5")
+    assert large.sell_shares == Decimal("5")
+    assert small.clip == Decimal("5")
+    assert large.clip == Decimal("5")
+    assert small.rungs == 1
+    assert large.rungs == 1
+    assert small.sell_fraction == Decimal("5") / Decimal("25")
+    assert large.sell_fraction == Decimal("5") / Decimal("50")
+    assert small.capital == Decimal("75")
+    assert large.capital == Decimal("150")
+    assert small.session_stop == Decimal("25") * Decimal("8.828") / Decimal("750")
+    assert large.session_stop == Decimal("50") * Decimal("8.828") / Decimal("750")
+    assert small.daily_fraction == Decimal("182.3864") / Decimal("2250")
+    assert small.late_window_seconds == 120
+    assert small.winner_min_price == Decimal("0.90")
+    # Their own 750 split keeps the 10-share clip and three rungs inside the 9.32% budget.
+    theirs = derive_from_split(Decimal("750"))
+    assert theirs.clip == Decimal("10")
+    assert theirs.rungs == 3
+    assert theirs.sell_shares == Decimal("65")
     config = load_config(ROOT / "config.paper.json")
-    small = apply_bot_env(config, {"BOT_SPLIT_SIZE": "25"}, max_markets=1)
-    assert small.config.initial_capital == Decimal("59")
-    assert small.config.clip_size == Decimal("5")
-    assert small.config.ladder_levels == 3
-    assert small.config.session_max_loss == Decimal("6")
-    assert small.config.max_loss_fraction == Decimal("0.20")
-    assert small.config.loss_floor() == Decimal("47.20")
-    assert small.config.loss_budget() == Decimal("11.80")
-    assert small.config.per_market_budget == Decimal("25")
-    assert small.config.capital_from_env is False
-    large = apply_bot_env(
-        config,
-        {"BOT_SPLIT_SIZE": "50", "BOT_MAX_MARKETS": "4"},
-        max_markets=1,
-    )
-    assert large.config.initial_capital == Decimal("118")
-    assert large.config.clip_size == Decimal("5")
-    assert large.config.ladder_levels == 6
-    assert large.config.session_max_loss == Decimal("12")
-    assert large.config.max_loss_fraction == Decimal("0.20")
-    assert large.config.loss_floor() == Decimal("94.40")
-    assert large.config.loss_budget() == Decimal("23.60")
-    assert large.config.per_market_budget == Decimal("50")
-    assert large.max_markets == 4
-    wide = apply_bot_env(config, {"BOT_SPLIT_SIZE": "200"}, max_markets=1)
-    assert wide.config.ladder_levels == 10
-    assert wide.config.clip_size == Decimal("10")
+    applied = apply_bot_env(config, {"BOT_SPLIT_SIZE": "25"}, max_markets=1)
+    assert applied.config.initial_capital == small.capital
+    assert applied.config.clip_size == small.clip
+    assert applied.config.ladder_levels == small.rungs
+    assert applied.config.max_unpaired_fraction == small.sell_fraction
+    assert applied.config.session_max_loss == small.session_stop
+    assert applied.config.max_loss_fraction == small.daily_fraction
+    assert applied.config.late_window_seconds == 120
+    assert applied.config.capital_from_env is False
+    assert applied.config.per_market_budget == Decimal("25")
 
 
 def test_wallet_balance_sets_capital_before_the_ledger(tmp_path):
@@ -150,7 +164,12 @@ def test_wallet_balance_sets_capital_before_the_ledger(tmp_path):
         collateral_balance=lambda funder: Decimal("80"),
     )
     assert Decimal(summary["initial_capital"]) == Decimal("80")
-    assert Decimal(summary["loss_floor"]) == Decimal("64")
+    from paper_split_maker.config import q_loss_budget
+
+    fraction = Decimal("182.3864") / Decimal("2250")
+    assert Decimal(summary["loss_floor"]) == Decimal("80") - q_loss_budget(
+        Decimal("80"), fraction
+    )
     assert not any(str(item).startswith("http") for item in summary.get("notes") or [])
     short = apply_bot_env(config, {"BOT_SPLIT_SIZE": "25"}, max_markets=1)
     with pytest.raises(ConfigError, match="below the split"):
@@ -519,11 +538,12 @@ def test_dashboard_paper_start_runs_three_sessions_offline(tmp_path):
         assert settings.config.live is False
         assert settings.config.split_clip == Decimal("25")
         assert settings.config.clip_size == Decimal("5")
-        assert settings.config.ladder_levels == 3
-        assert settings.config.loss_floor() == Decimal("47.20")
+        assert settings.config.ladder_levels == 1
+        assert settings.config.max_unpaired_fraction == Decimal("0.2")
+        assert settings.config.initial_capital == Decimal("75")
         engine = Engine.create(settings.config, out / "state.json", out / "logs")
         engine.mode = "paper"
-        _play(engine, 3)
+        _play(engine, 2)
         (out / "console.log").write_text(
             f"paper finished\n{key}\n", encoding="utf-8"
         )
@@ -534,19 +554,22 @@ def test_dashboard_paper_start_runs_three_sessions_offline(tmp_path):
     rendered = board.page()
     launch = (board.out_dir / "launch.json").read_text(encoding="utf-8")
     assert status["state"] == "stopped"
+    assert status["running"] is False
     assert status["mode"] == "paper"
-    assert status["fills"] == 3
-    assert status["loss_floor"] == "47.20"
-    assert Decimal(status["cash"]) == Decimal("51.50")
-    assert Decimal(status["realized_pnl"]) == Decimal("-7.50")
+    # Two 5-share fills at 0.50. A third crosses the daily floor, so the
+    # harness stops at two. Cash is the 75 bankroll minus 5 of locked loss.
+    assert status["fills"] == 2
+    assert status["loss_floor"] == "68.920454"
+    assert Decimal(status["cash"]) == Decimal("70")
+    assert Decimal(status["realized_pnl"]) == Decimal("-5")
     assert "paper finished" in status["log"]
     assert "[redacted]" in status["log"]
     for public in (status["log"], rendered, launch, json.dumps(status)):
         assert key not in public
     state = json.loads((board.out_dir / "state.json").read_text(encoding="utf-8"))
-    assert len(state["markets"]) == 3
+    assert len(state["markets"]) == 2
     sold = sum(Decimal(market["sold_up_shares"]) for market in state["markets"].values())
-    assert sold == Decimal("15")
+    assert sold == Decimal("10")
 
 
 def _exchange(port: int, method: str, path: str, body: str, headers: dict) -> tuple[int, str]:

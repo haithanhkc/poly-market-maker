@@ -1,9 +1,10 @@
 """BOT_* settings and wallet lines in .env.
 
 The dashboard edits the split and the session count. Clip size, rung count,
-and the loss stops are derived from that split unless an advanced BOT_* line
-overrides them. Wallet secrets are written only by the wallet form. Nothing
-in this module prints environment values.
+the per-side sell budget, and the loss stops are ratios measured from the
+bubblebust tape (split 750) and scaled to this split. An advanced BOT_* line
+still overrides the field it names. Wallet secrets are written only by the
+wallet form. Nothing in this module prints environment values.
 """
 
 from __future__ import annotations
@@ -45,15 +46,42 @@ WALLET_KEYS = SECRET_KEYS + (
     "POLY_SIGNATURE_TYPE",
 )
 
-# Shipped ladder at a 25 pUSD split: 59 bankroll, 6 session stop, 20% daily.
-# Multiply then divide so a 25 split stays Decimal("59"), not Decimal("59.00").
-_CAPITAL_NUM = Decimal("59")
-_CAPITAL_DEN = Decimal("25")
-_SESSION_NUM = Decimal("6")
-_SESSION_DEN = Decimal("25")
-_DAILY_FRACTION = Decimal("0.20")
-_POSTED_FRACTION = Decimal("0.60")
-_MAX_RUNGS = 10
+# Bubblebust (wallet 0x373b…), 3,488 splits, every one exactly 750 pUSD.
+# A split is opened a median 293s before the session and merged a median 84s
+# after the close, so two splits are open 72% of the time and three 24%.
+# Capital is three splits so the third one fits. The 15 seconds at four are ignored.
+_THEIR_SPLIT = Decimal("750")
+_CAPITAL_OVERLAP = Decimal("3")
+# Mean of max(Up shares, Down shares) / 750. This replaces the old 60% offer.
+_HEAVY_SIDE = Decimal("0.0932")
+# Modal full clip is 10 shares (then 5, then 15). 40% of prints are off that grid.
+_MODAL_CLIP = Decimal("10")
+# Cheap side keeps one more rung than the rich side. 3 and 2 is the mean
+# loser/winner share ratio of 1.48. Levels still cannot exceed the sell budget.
+_LADDER_LEVELS = 3
+# p95 of the per-session loss (proceeds + merge + redeem - 750), in pUSD.
+_SESSION_LOSS_P95 = Decimal("8.828")
+# Worst of the 13 days in the tape, in pUSD. Daily fraction is that over 3*750.
+_WORST_DAY = Decimal("182.3864")
+# Fills after 180s of the 300s session are often <=0.10 or >=0.90.
+# Last-60s prints: winner median 0.90, loser median 0.11.
+_LATE_WINDOW_SECONDS = 120
+_WINNER_MIN_PRICE = Decimal("0.90")
+
+
+@dataclass(frozen=True)
+class DerivedLadder:
+    """What one split implies. Shares are already on the 5-share grid."""
+
+    capital: Decimal
+    clip: Decimal
+    rungs: int
+    session_stop: Decimal
+    daily_fraction: Decimal
+    sell_fraction: Decimal
+    sell_shares: Decimal
+    late_window_seconds: int
+    winner_min_price: Decimal
 
 
 @dataclass
@@ -153,44 +181,61 @@ def merged_bot_env(env_path: Path, process_env: dict) -> dict[str, str]:
     return found
 
 
-def derive_from_split(split: Decimal) -> tuple[Decimal, Decimal, int, Decimal, Decimal]:
-    """Capital, clip, rungs, session stop, and the daily fraction for one split.
+def derive_from_split(split: Decimal) -> DerivedLadder:
+    """Scale the bubblebust tape onto ``split``.
 
-    Each side posts about 60% of the split, which is the unpaired cap of the
-    shipped ladder. Rungs are 5-share clips and grow first, up to 10. After
-    that the clip grows in steps of 5. A 25 split is 3 rungs of 5 (15 shares).
-    A 50 split is 6 rungs of 5 (30 shares).
-
-    Paper capital is split * 59/25, the shipped bankroll for a 25 split.
-    The session stop is split * 6/25. The daily stop stays 20% of capital.
-    A live pUSD balance, when one is supplied to ``apply_wallet_balance``,
-    replaces that capital only when it can fund the split.
+    Each side may sell about 9.32% of the split, the mean heavy-side fill on a
+    750 split. A budget below 5 shares is raised to 5, the exchange minimum.
+    The clip is 10/750 of the split, on the same 5-share grid, and at least 5.
+    Rungs are how many of those clips fit in the budget, and at most 3.
+    Capital is 3 splits. The session stop is their p95 session loss times
+    split/750. The daily stop is their worst day divided by 3*750.
     """
     if split <= 0:
         raise ConfigError("split must be > 0")
-    target = _posted_shares(split)
-    rungs = int(target / POLYMARKET_MIN_SIZE)
+    clip = _qdown_size(split * _MODAL_CLIP / _THEIR_SPLIT)
+    if clip < POLYMARKET_MIN_SIZE:
+        clip = POLYMARKET_MIN_SIZE if split >= POLYMARKET_MIN_SIZE else split
+    if clip > split:
+        clip = split
+    raw = split * _HEAVY_SIDE
+    if split >= POLYMARKET_MIN_SIZE and raw < POLYMARKET_MIN_SIZE:
+        budget = POLYMARKET_MIN_SIZE
+    else:
+        budget = _qdown_size(raw)
+        if budget < POLYMARKET_MIN_SIZE <= split:
+            budget = POLYMARKET_MIN_SIZE
+    if budget > split:
+        budget = split
+    rungs = int(budget / clip) if clip > 0 else 1
     if rungs < 1:
         rungs = 1
-    if rungs > _MAX_RUNGS:
-        rungs = _MAX_RUNGS
-    clip = _qdown_size(target / Decimal(rungs))
-    if clip < POLYMARKET_MIN_SIZE:
-        clip = POLYMARKET_MIN_SIZE
-    while rungs > 1 and clip * Decimal(rungs) > split:
+    if rungs > _LADDER_LEVELS:
+        rungs = _LADDER_LEVELS
+    while rungs > 1 and clip * Decimal(rungs) > budget:
         rungs -= 1
-    capital = split * _CAPITAL_NUM / _CAPITAL_DEN
-    session = split * _SESSION_NUM / _SESSION_DEN
+    session = split * _SESSION_LOSS_P95 / _THEIR_SPLIT
     if session <= 0:
         session = Decimal("0.01")
-    return capital, clip, rungs, session, _DAILY_FRACTION
+    daily = _WORST_DAY / (_CAPITAL_OVERLAP * _THEIR_SPLIT)
+    return DerivedLadder(
+        capital=split * _CAPITAL_OVERLAP,
+        clip=clip,
+        rungs=rungs,
+        session_stop=session,
+        daily_fraction=daily,
+        sell_fraction=budget / split,
+        sell_shares=budget,
+        late_window_seconds=_LATE_WINDOW_SECONDS,
+        winner_min_price=_WINNER_MIN_PRICE,
+    )
 
 
 def apply_wallet_balance(config: Config, balance: Decimal) -> None:
     """Use the wallet's pUSD as capital when no BOT_CAPITAL override is set.
 
     A balance below the split is refused so the ledger is not created with a
-    floor above the funds on hand. The 20% daily stop then applies to the
+    floor above the funds on hand. The measured daily stop then applies to the
     real balance. The dashboard does not call this; it has no chain access.
     """
     if getattr(config, "capital_from_env", False):
@@ -246,12 +291,16 @@ def _apply_derived(cfg: Config, env: dict) -> None:
     if cfg.split_clip <= 0:
         _apply_explicit(cfg, env)
         return
-    capital, clip, rungs, session, fraction = derive_from_split(cfg.split_clip)
-    cfg.initial_capital = capital
-    cfg.clip_size = clip
-    cfg.ladder_levels = rungs
-    cfg.session_max_loss = session
-    cfg.max_loss_fraction = fraction
+    derived = derive_from_split(cfg.split_clip)
+    cfg.initial_capital = derived.capital
+    cfg.clip_size = derived.clip
+    cfg.ladder_levels = derived.rungs
+    cfg.session_max_loss = derived.session_stop
+    cfg.max_loss_fraction = derived.daily_fraction
+    cfg.max_unpaired_fraction = derived.sell_fraction
+    cfg.late_window_seconds = derived.late_window_seconds
+    cfg.winner_min_price = derived.winner_min_price
+    cfg.ladder_spacing = Decimal("0.01")
     _apply_explicit(cfg, env)
 
 
@@ -286,15 +335,6 @@ def _apply_markets_and_mode(cfg: Config, env: dict, markets: int) -> int:
         raise ConfigError("BOT_MODE must be paper or live")
     cfg.live = folded == "live"
     return markets
-
-
-def _posted_shares(split: Decimal) -> Decimal:
-    target = _qdown_size(split * _POSTED_FRACTION)
-    if target >= POLYMARKET_MIN_SIZE:
-        return target
-    if split >= POLYMARKET_MIN_SIZE:
-        return POLYMARKET_MIN_SIZE
-    return split
 
 
 def _qdown_size(value: Decimal) -> Decimal:

@@ -62,6 +62,10 @@ class Supervisor:
             "BOT_MODE": mode,
             "loss_floor": _num(cfg.loss_floor()),
             "loss_budget": _num(cfg.loss_budget()),
+            "sell_shares": _num(cfg.max_unpaired_fraction * cfg.split_clip),
+            "sell_fraction": _num(cfg.max_unpaired_fraction),
+            "late_window": str(cfg.late_window_seconds),
+            "winner_min": _num(cfg.winner_min_price),
         }
 
     def save_form(self, posted: dict) -> None:
@@ -227,6 +231,10 @@ class Supervisor:
             session=_esc(values["BOT_SESSION_STOP"]),
             floor=_esc(values["loss_floor"]),
             budget=_esc(values["loss_budget"]),
+            offered=_esc(values["sell_shares"]),
+            sell_pct=_esc(values["sell_fraction"]),
+            late=_esc(values["late_window"]),
+            winner_px=_esc(values["winner_min"]),
             run_state=_esc(status["state"]),
             run_mode=_esc(status["mode"]),
             run_session=_esc(status["session"] or "—"),
@@ -520,15 +528,17 @@ pre {{ background: #f4f4f4; padding: 0.8rem; max-height: 18rem; overflow: auto; 
 <button type="submit">Lưu</button>
 </form>
 <h3>Bot sẽ dùng</h3>
-<p>Tính từ khối split. Các số này chỉ để xem. Split 25: clip 5, 3 bậc, dừng phiên 6, vốn 59, sàn 47.20. Split 50: clip 5, 6 bậc, dừng phiên 12, vốn 118, sàn 94.40.</p>
+<p>Tính từ khối split theo ví bubblebust (mỗi split của họ là 750). Mỗi phía bán trung bình 9.32% split, clip hay gặp là 10 cổ, và tối thiểu 5 cổ. Split 25 và 50 đều ra clip 5, một bậc, 5 cổ mỗi phía vì 9.32% nhỏ hơn 5 cổ.</p>
 <ul>
-<li>Vốn: {capital} pUSD</li>
+<li>Vốn: {capital} pUSD (3 split, vì họ giữ 2–3 split chồng nhau)</li>
+<li>Mỗi phía bán tối đa: {offered} cổ ({sell_pct} split)</li>
 <li>Clip mỗi bậc: {clip} cổ</li>
-<li>Số bậc mỗi phía: {rungs}</li>
+<li>Số bậc cùng lúc: {rungs}</li>
+<li>Cửa sổ cuối: {late}s, winner tối thiểu {winner_px}</li>
 <li>Dừng một phiên: {session} pUSD</li>
-<li>Dừng ngày (20% vốn): ngân sách {budget}, sàn lỗ {floor}</li>
+<li>Dừng ngày: ngân sách {budget}, sàn lỗ {floor}</li>
 </ul>
-<p>Paper dùng vốn = split × 59/25. Live, nếu đọc được số dư pUSD và .env không có BOT_CAPITAL, dùng số dư đó khi số dư đủ cho khối split. Dòng BOT_CAPITAL, BOT_CLIP_SIZE, BOT_RUNGS, BOT_MAX_LOSS_FRACTION, BOT_SESSION_STOP trong .env vẫn ghi đè, nhưng không có ô trên trang này.</p>
+<p>Live, nếu đọc được số dư pUSD và .env không có BOT_CAPITAL, dùng số dư đó làm vốn khi số dư đủ cho khối split. Dòng BOT_CAPITAL, BOT_CLIP_SIZE, BOT_RUNGS, BOT_MAX_LOSS_FRACTION, BOT_SESSION_STOP vẫn ghi đè, nhưng không có ô trên trang này.</p>
 <h2>Chạy</h2>
 <form method="post" action="/start">
 <input type="hidden" name="mode" value="paper">
