@@ -127,7 +127,7 @@ def test_paper_config_runs_three_sessions(tmp_path, capsys):
     logs = _play(engine, 3)
     assert engine.state.markets.keys() >= {"s0", "s1", "s2"}
     for market_id in ("s0", "s1", "s2"):
-        assert engine.state.markets[market_id].gross_split == Decimal("20")
+        assert engine.state.markets[market_id].gross_split == Decimal("25")
     text = (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8")
     assert "Traceback" not in text
     assert "Traceback" not in capsys.readouterr().err

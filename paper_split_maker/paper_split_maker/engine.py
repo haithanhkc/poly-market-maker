@@ -908,6 +908,10 @@ class Engine:
             self._skip(market, "cooldown")
             return
         if self.config.strategy == "ladder":
+            # Live splits on chain and leaves auto_split off. A paper ladder
+            # has no chain, so the same flag creates the pair in the ledger.
+            if self._quotes_possible(market) and not self.at_cap():
+                self._auto_split(market)
             self._quote_ladder(market)
             return
         if self._quotes_possible(market) and not self.at_cap():

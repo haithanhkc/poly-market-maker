@@ -70,7 +70,7 @@ def test_symmetric_demo_scenario_is_flat_to_slightly_positive(tmp_path):
         ROOT / "tests" / "fixtures" / "symmetric_demo.json",
     )
     assert summary["live_orders"] is False
-    assert Decimal(summary["cash"]) == Decimal("1000.20")
+    assert Decimal(summary["cash"]) == Decimal("59.20")
     assert Decimal(summary["realized_pnl"]) == Decimal("0.20")
     assert Decimal(summary["worst_terminal_equity"]) >= Decimal(summary["loss_floor"])
     assert Decimal(summary["rebate_estimate_unguaranteed"]) == Decimal("0.034944")

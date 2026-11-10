@@ -42,7 +42,7 @@ Two files. Anything omitted uses the default in `paper_split_maker/config.py`.
 
 | Param | Live value | Meaning |
 | --- | --- | --- |
-| `strategy` | ladder | `single` is the old one-order quote. `ladder` is the default live mode |
+| `strategy` | ladder | `single` is the old one-order quote. Both shipped configs use `ladder` |
 | `initial_capital` | 59 | Bankroll locked into the ledger |
 | `max_loss_fraction` | 0.20 | Daily loss stop at 11.80 (floor 47.20). Wide enough that a 5-share sell near mid is allowed |
 | `session_max_loss` | 6 | Stop one session after 6 pUSD of loss, then merge |
@@ -60,7 +60,7 @@ Two files. Anything omitted uses the default in `paper_split_maker/config.py`.
 | `kill_switch_file` | kill.switch | Stop file, created in the working directory |
 | `risk_fee_rate` | 0.07 | Fee used in the loss-floor check. Maker fee stays 0 |
 
-`config.paper.json` is the same engine with `"live"` omitted, capital 1000, and a 20 second paper window. It does not send orders.
+`config.paper.json` uses the same ladder, the same 59 pUSD bankroll, the same 25 split, and the same loss stops. It sets `"live": false`. The paper engine splits inside the ledger (`auto_split` true) because there is no chain. It does not send orders. The public paper window is 20 seconds.
 
 ## Migrate `config.live.run14.json`
 

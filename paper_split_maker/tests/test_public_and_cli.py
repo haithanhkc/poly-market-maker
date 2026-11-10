@@ -326,7 +326,7 @@ def test_cli_demo_is_idempotent_on_restart(tmp_path):
     assert second["realized_pnl"] == first["realized_pnl"]
     from decimal import Decimal
 
-    assert Decimal(second["loss_floor"]) == Decimal("970")
+    assert Decimal(second["loss_floor"]) == Decimal("47.20")
     assert (out / "logs" / "events.jsonl").exists()
     assert (out / "logs" / "events.csv").exists()
 

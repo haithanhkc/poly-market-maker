@@ -96,6 +96,12 @@
       "source": "fixture",
       "label": "synthetic-fixture",
       "winner": "up"
+    },
+    {
+      "type": "heartbeat",
+      "event_id": "demo-hb-after-resolution",
+      "seq": 9,
+      "ts": 1000
     }
   ]
 }
