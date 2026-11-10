@@ -8,8 +8,9 @@ import os
 import sys
 from pathlib import Path
 
-from paper_split_maker.config import ConfigError, load_config
+from paper_split_maker.config import ConfigError
 from paper_split_maker.credentials import load_credentials
+from paper_split_maker.envfile import prepare_run
 from paper_split_maker.live_gate import CONFIRMATION, live_gates
 from paper_split_maker.session import run_paper
 
@@ -64,8 +65,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
+def _load(args):
+    """JSON defaults, then .env, then BOT_* already set in the process."""
+    settings = prepare_run(args.config, os.environ, max_markets=args.max_markets)
+    args.max_markets = settings.max_markets
+    return settings.config
+
+
 def _run_paper(args) -> int:
-    config = load_config(args.config)
+    config = _load(args)
     if config.live:
         print("config has live:true. Refusing to trade without --live.")
         return 2
@@ -81,7 +89,7 @@ def _run_paper(args) -> int:
 
 
 def _run_live(args) -> int:
-    config = load_config(args.config)
+    config = _load(args)
     allowed, reason = live_gates(
         config_live=config.live,
         cli_live=True,

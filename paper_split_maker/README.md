@@ -30,6 +30,19 @@ python -m paper_split_maker --config config.live.json --out ..\runs\live --max-m
 
 Use a new `--out` directory after changing capital or the loss fraction. Those values are locked into `state.json` and a resume will not loosen them. Do not put keys in the config. The process reads `POLY_PRIVATE_KEY`, `POLY_FUNDER`, and `POLY_SIGNATURE_TYPE` from the environment only when `--live` is set.
 
+`paper_split_maker/.env` overrides the JSON. `BOT_CAPITAL` sets the bankroll and the loss floor (`capital * (1 - BOT_MAX_LOSS_FRACTION)`). `BOT_SPLIT_SIZE` is the split for that run. See `.env.example`.
+
+## Bảng điều khiển (Windows)
+
+Sửa `paper_split_maker\.env` (copy từ `.env.example` nếu chưa có). Các dòng `BOT_*` là vốn, khối split, số bậc, tỷ lệ lỗ, số phiên và `BOT_MODE`. Không ghi khóa riêng vào config JSON. Khóa riêng nằm trong `.env` và không hiện trên bảng điều khiển.
+
+Double-click `paper_split_maker\start_dashboard.bat`. File này tạo hoặc dùng `.venv`, cài dependency nếu thiếu, rồi mở trình duyệt tại `http://127.0.0.1:8765/`. Trang chỉ lắng nghe máy này.
+
+- **Lưu vào .env**: ghi các ô `BOT_*`. Các dòng khóa bí mật giữ nguyên.
+- **Chạy paper**: xóa `kill.switch` cũ, tạo thư mục `runs\paper-<thời gian>`, không gửi lệnh.
+- **Chạy live**: phải tick "Tôi hiểu rủi ro live". Lệnh có `--live --yes-i-understand-live-risk`.
+- **Dừng**: ghi `kill.switch` và tắt process. Không chạy hai bot cùng lúc.
+
 Retry a deferred redeem with the same program. This path loads keys and does not start a session:
 
 ```powershell
