@@ -358,9 +358,21 @@ _BOOL_FIELDS = {
 }
 
 
+def _apply_legacy_keys(data: dict) -> dict:
+    """Map run14-style names onto the current fields. Seconds win."""
+    data = dict(data)
+    if "split_lead_seconds" not in data and "pre_split_lead_ms" in data:
+        raw_ms = data["pre_split_lead_ms"]
+        if isinstance(raw_ms, bool) or not isinstance(raw_ms, (int, str)):
+            raise ConfigError("pre_split_lead_ms is not an integer")
+        data["split_lead_seconds"] = int(raw_ms) // 1000
+    return data
+
+
 def config_from_mapping(data: dict) -> Config:
     if not isinstance(data, dict):
         raise ConfigError("config must be an object")
+    data = _apply_legacy_keys(data)
     allowed = {item.name for item in fields(Config)}
     unknown = sorted(set(data) - allowed)
     if unknown:

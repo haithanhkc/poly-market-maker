@@ -58,7 +58,7 @@ def test_worst_case_formula_pins_inventory_orders_and_fee_reserve(tmp_path):
 def test_symmetric_demo_scenario_is_flat_to_slightly_positive(tmp_path):
     config = config_from_mapping(
         __import__("json").loads(
-            (ROOT / "config.example.json").read_text(encoding="utf-8")
+            (ROOT / "config.paper.json").read_text(encoding="utf-8")
         )
     )
     from paper_split_maker.session import run_demo

@@ -1,7 +1,9 @@
 """Bounded live session. Paper mode never imports this.
 
-The clock stops at duration_seconds. Shutdown calls cancel-all. A kill-switch
-file does the same. Inventory is quoted only after a split confirmation.
+One pass: split before the window opens, post maker sells on both legs,
+reprice when the book moves, unwind the other leg at the 1-P floor, then
+merge leftover pairs and redeem. Shutdown calls cancel-all. A kill-switch
+file does the same. max_runtime_seconds is the hard cap.
 """
 
 from __future__ import annotations

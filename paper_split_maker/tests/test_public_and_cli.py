@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from paper_split_maker.cli import main
-from paper_split_maker.config import Config
+import pytest
+
+from paper_split_maker.config import Config, ConfigError, load_config
 from paper_split_maker.normalize import (
     data_api_resolution_event,
     data_api_trade_events,
@@ -19,7 +20,7 @@ from paper_split_maker.public_client import (
     PublicReadClient,
     UrllibTransport,
 )
-from paper_split_maker.session import run_paper
+from paper_split_maker.session import run_demo, run_paper, run_replay
 from tests.helpers import make_engine
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -313,11 +314,12 @@ def test_paper_session_is_bounded_and_dedupes_trades(tmp_path):
 
 
 def test_cli_demo_is_idempotent_on_restart(tmp_path):
-    config = ROOT / "config.example.json"
+    config = load_config(ROOT / "config.paper.json")
     out = tmp_path / "demo"
-    assert main(["demo", "--config", str(config), "--out", str(out)]) == 0
+    scenario = ROOT / "paper_split_maker" / "scenarios" / "symmetric_demo.json"
+    run_demo(config, out, scenario)
     first = json.loads((out / "summary.json").read_text(encoding="utf-8"))
-    assert main(["demo", "--config", str(config), "--out", str(out)]) == 0
+    run_demo(config, out, scenario)
     second = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert second["resumed"] is True
     assert second["cash"] == first["cash"]
@@ -334,18 +336,12 @@ def test_cli_replay_refuses_unlabeled_scenario(tmp_path):
     scenario.write_text(
         json.dumps({"label": "production", "events": []}), encoding="utf-8"
     )
-    code = main(
-        [
-            "replay",
-            "--config",
-            str(ROOT / "config.example.json"),
-            "--scenario",
-            str(scenario),
-            "--out",
-            str(tmp_path / "out"),
-        ]
-    )
-    assert code == 2
+    with pytest.raises(ConfigError):
+        run_replay(
+            load_config(ROOT / "config.paper.json"),
+            scenario,
+            tmp_path / "out",
+        )
 
 
 def test_package_source_has_no_live_order_stack():

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from paper_split_maker.config import ConfigError, load_config
+from paper_split_maker.config import Config, ConfigError
 from paper_split_maker.historical import (
     LABEL,
     build_replay_events,
@@ -16,9 +16,19 @@ from paper_split_maker.historical import (
     run_historical,
     window_starts,
 )
-from paper_split_maker.cli import main
-
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _capital_200() -> Config:
+    """The old 200 USDC replay book. It is not a run config."""
+    return Config(
+        initial_capital=Decimal("200"),
+        per_market_budget=Decimal("8"),
+        split_clip=Decimal("5"),
+        min_pair_inventory=Decimal("5"),
+    )
+
+
 START = 1_700_000_000
 
 
@@ -158,7 +168,7 @@ def test_reconstructed_top_widens_a_tight_print_and_rejects_disagreement():
 
 
 def test_historical_replay_queue_fill_floor_and_decline(tmp_path: Path):
-    config = load_config(ROOT / "config.historical200.json")
+    config = _capital_200()
     assert config.loss_floor() == Decimal("194")
     assert config.initial_capital == Decimal("200")
     summary = run_historical(config, _snapshot(), tmp_path)
@@ -193,24 +203,13 @@ def test_unlabeled_snapshot_is_refused(tmp_path: Path):
         build_replay_events(snapshot)
 
 
-def test_cli_historical_replay(tmp_path: Path):
+def test_historical_replay_writes_the_csv(tmp_path: Path):
     snapshot = tmp_path / "snap.json"
     import json
 
     snapshot.write_text(json.dumps(_snapshot()), encoding="utf-8")
     out = tmp_path / "out"
-    code = main(
-        [
-            "historical-replay",
-            "--config",
-            str(ROOT / "config.historical200.json"),
-            "--snapshot",
-            str(snapshot),
-            "--out",
-            str(out),
-        ]
-    )
-    assert code == 0
+    run_historical(_capital_200(), load_historical_snapshot(snapshot), out)
     assert (out / "historical_results.csv").exists()
 
 

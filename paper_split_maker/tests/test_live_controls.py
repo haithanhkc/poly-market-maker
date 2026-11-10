@@ -20,7 +20,7 @@ from paper_split_maker.chain_send import (
     relayer_body,
 )
 from paper_split_maker.cli import main
-from paper_split_maker.config import Config, load_config
+from paper_split_maker.config import Config, config_from_mapping, load_config
 from paper_split_maker.credentials import load_credentials
 from paper_split_maker.engine import Engine
 from paper_split_maker.risk import reserved, worst_case_equity
@@ -62,21 +62,17 @@ def test_live_requires_all_three_gates(tmp_path):
         "confirmation_missing",
     )
     assert live_gates(config_live=True, cli_live=True, cli_yes=True)[0] is True
-    config = ROOT / "config.example.json"
+    config = ROOT / "config.paper.json"
     out = tmp_path / "out"
     code = main(
         [
-            "live",
             "--config",
             str(config),
             "--out",
             str(out),
-            "--duration-seconds",
-            "5",
             "--max-markets",
             "1",
             "--live",
-            "--dry-run",
             "--yes-i-understand-live-risk",
         ]
     )
@@ -501,7 +497,7 @@ def test_restart_cannot_loosen_session_or_pair_caps(tmp_path):
 
 
 def test_taker_repair_is_off_and_calldata_is_labeled():
-    engine_config = load_config(ROOT / "config.live.example.json")
+    engine_config = load_config(ROOT / "config.live.json")
     assert engine_config.taker_repair is False
     assert engine_config.live is True
     plan = split_plan("v1", "0x" + "11" * 32, "5")
@@ -544,38 +540,52 @@ def _quote_rows(engine):
     )
 
 
-def test_live_old200_quotes_like_the_historical_config(tmp_path):
-    live = load_config(ROOT / "config.live.old200.json")
-    old = load_config(ROOT / "config.historical200.json")
-    assert live.live is True
+def test_live_config_quotes_both_legs_and_holds_the_slot(tmp_path):
+    shipped = load_config(ROOT / "config.live.json")
+    assert shipped.live is True
+    assert shipped.loss_floor() == Decimal("29.10")
+    assert shipped.split_clip == Decimal("5")
+    assert shipped.max_open_markets == 1
+    assert shipped.entry_mode == "split_sell"
+    assert shipped.slices_per_side == 1
+    assert shipped.taker_repair is False
+    assert shipped.kill_switch_file == "kill.switch"
+    assert shipped.leg_unwind_seconds == 5
+    migrated = config_from_mapping(
+        {
+            "pre_split_lead_ms": 60_000,
+            "initial_capital": "30",
+            "per_market_budget": "30",
+        }
+    )
+    assert migrated.split_lead_seconds == 60
+    shared = dict(
+        initial_capital=Decimal("200"),
+        max_loss_fraction=Decimal("0.03"),
+        per_market_budget=Decimal("8"),
+        clip_size=Decimal("5"),
+        min_edge=Decimal("0.01"),
+        split_clip=Decimal("5"),
+        min_pair_inventory=Decimal("5"),
+        quote_cooldown_ms=500,
+        stop_quoting_before_expiry_ms=20_000,
+        cancel_latency_ms=500,
+        max_open_markets=1,
+        requote_min_ticks=1,
+        requote_min_interval_ms=500,
+        min_order_rest_seconds=15,
+        pair_min_edge=Decimal("0"),
+    )
+    live = Config(
+        live=True,
+        auto_split=False,
+        fill_mode="none",
+        kill_switch_file="kill.switch",
+        **shared,
+    )
+    old = Config(**shared)
     assert live.loss_floor() == Decimal("194")
     assert old.loss_floor() == Decimal("194")
-    for name in (
-        "initial_capital",
-        "max_loss_fraction",
-        "per_market_budget",
-        "clip_size",
-        "min_edge",
-        "skew_edge_per_share",
-        "skew_size_per_share",
-        "split_clip",
-        "min_pair_inventory",
-        "quote_cooldown_ms",
-        "stop_quoting_before_expiry_ms",
-        "cancel_latency_ms",
-    ):
-        assert getattr(live, name) == getattr(old, name)
-    assert live.slices_per_side == 1
-    assert live.slice_inside_tick is False
-    assert live.max_pair_loss == Decimal("1")
-    assert live.session_max_loss == Decimal("0")
-    assert live.max_open_markets == 1
-    assert live.requote_min_ticks == 1
-    assert live.requote_min_interval_ms == live.quote_cooldown_ms
-    assert live.taker_repair is False
-    assert live.kill_switch_file == "kill.switch"
-    assert live.auto_split is False
-    assert live.fill_mode == "none"
 
     def opened(config, path):
         engine = Engine.create(config, path / "state.json", path / "logs")
