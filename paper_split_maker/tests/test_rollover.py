@@ -8,6 +8,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from paper_split_maker.live_runner import (
+    _abandon_unconfirmed_splits,
     _confirm_splits,
     _consider_pre_split,
     _poll_public,
@@ -561,3 +562,74 @@ def test_expired_leftover_does_not_block_the_next_session(tmp_path, capsys):
     printed = capsys.readouterr().out
     assert "quote_skipped" in printed and "loss_budget" in printed
     assert "synthetic-m2" in printed
+
+
+def test_unconfirmed_split_releases_the_slot_for_the_next_session(tmp_path):
+    """A split that never confirms must not hold the only open-market slot."""
+    engine = make_engine(
+        tmp_path,
+        initial_capital=Decimal("59"),
+        max_loss_fraction=Decimal("0.20"),
+        per_market_budget=Decimal("25"),
+        split_clip=Decimal("25"),
+        max_open_markets=1,
+        auto_split=False,
+        split_confirm_timeout_ms=30_000,
+    )
+    open_s = OPEN0
+    slug = f"btc-updown-5m-{open_s}"
+    run(
+        engine,
+        [
+            market_event(
+                slug,
+                end_ts=(open_s + 300) * 1000,
+                slug=slug,
+                ts=open_s * 1000,
+            ),
+            {
+                "type": "split_pending",
+                "event_id": "pending",
+                "ts": open_s * 1000 + 1_000,
+                "market_id": slug,
+                "amount": "25",
+            },
+        ],
+    )
+    market = engine.state.markets[slug]
+    assert market.pending_split == Decimal("25")
+    notes: list[str] = []
+    _abandon_unconfirmed_splits(engine, open_s * 1000 + 1_000, notes)
+    assert market.pending_split == Decimal("25")
+    assert notes == []
+
+    class Reader:
+        def discover_btc_updown(self, *_args):
+            return []
+
+    creds = SimpleNamespace(redact=lambda text: text)
+    _consider_pre_split(
+        engine,
+        Reader(),
+        engine.config,
+        creds,
+        open_s * 1000 + 31_000,
+        notes,
+    )
+    assert slug not in engine.state.markets
+    assert notes
+    nxt = open_s + 300
+    nxt_slug = f"btc-updown-5m-{nxt}"
+    run(
+        engine,
+        [
+            market_event(
+                nxt_slug,
+                end_ts=(nxt + 300) * 1000,
+                slug=nxt_slug,
+                ts=open_s * 1000 + 31_000,
+            )
+        ],
+    )
+    assert nxt_slug in engine.state.markets
+    assert engine._holds_slot(engine.state.markets[nxt_slug]) is True

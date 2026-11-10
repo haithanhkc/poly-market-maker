@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 from decimal import Decimal
 from pathlib import Path
@@ -577,7 +578,6 @@ def test_accumulated_losses_and_restart_do_not_reset_the_floor(tmp_path):
                 },
             ],
         )
-        market = engine.state.markets[market_id]
         ups = [
             order
             for order in engine.state.orders.values()
@@ -969,6 +969,36 @@ def test_no_fill_mode_ignores_prints(tmp_path):
         ],
     )
     assert engine.state.markets["m1"].up == Decimal("20")
+
+
+def test_old_state_keeps_its_floor_and_ignores_removed_fields(tmp_path, capsys):
+    """A ledger written before the cleanup still loads, and the old floor stays."""
+    engine = make_engine(
+        tmp_path,
+        initial_capital=Decimal("30"),
+        max_loss_fraction=Decimal("0.03"),
+        per_market_budget=Decimal("30"),
+    )
+    run(engine, [market_event()])
+    path = tmp_path / "state.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["max_pair_loss"] = "0.01"
+    market = next(iter(raw["markets"].values()))
+    market["last_mid"] = "0.50"
+    market["last_mid_ts"] = 1
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    newer = Config(
+        initial_capital=Decimal("59"),
+        max_loss_fraction=Decimal("0.20"),
+        per_market_budget=Decimal("25"),
+    )
+    resumed = Engine.load(newer, path, tmp_path / "logs2")
+    assert resumed.state.loss_floor == engine.state.loss_floor
+    assert resumed.state.initial_capital == Decimal("30")
+    assert resumed.state.markets["m1"].up == engine.state.markets["m1"].up
+    printed = capsys.readouterr().out
+    assert "locked bankroll" in printed
+    assert "29.10" in printed
 
 
 def test_config_rejects_forbidden_and_loose_fraction():

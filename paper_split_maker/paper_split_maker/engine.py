@@ -31,7 +31,6 @@ from paper_split_maker.quotes import (
 from paper_split_maker.risk import (
     assert_ledger_invariants,
     best_case_equity,
-    conservative_fee,
     net_maker_proceeds,
     reserved,
     session_loss,
@@ -130,6 +129,17 @@ class Engine:
         else:
             state.session_max_loss = config.session_max_loss
         config.session_max_loss = state.session_max_loss
+        if (
+            state.initial_capital != config.initial_capital
+            or state.loss_floor != config.loss_floor()
+        ):
+            print(
+                "state.json keeps the locked bankroll "
+                f"{money(state.initial_capital)} and floor {money(state.loss_floor)}. "
+                "Use a new --out directory to trade "
+                f"{money(config.initial_capital)} with floor {money(config.loss_floor())}.",
+                flush=True,
+            )
         engine = cls(state, config, state_path, log_dir, resumed=True)
         engine.assert_invariants()
         return engine

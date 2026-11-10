@@ -267,7 +267,7 @@ def run_confirmed_live(
     deadline = clock() + _runtime_seconds(config)
     engine.read_chain_balance = bool(read_chain_balance)
     engine.resolution_reader = reader
-    engine.redeem_pending_path = str(Path(out_dir) / "redeem_pending.json")
+    engine.redeem_pending_path = str(Path(out_dir) / "redeem-pending.json")
     engine.chain_events = []
     engine.chain_worker = ChainWorker(engine, creds, notes)
     try:
@@ -799,10 +799,10 @@ def _confirm_splits(engine, creds, stamp: int, notes: list[str]) -> list[str]:
         engine.handle_event(
             {
                 "type": "split_confirmed",
-                "market_id": slug,
+                "market_id": market.market_id,
                 "amount": str(amount),
                 "ts": stamp,
-                "event_id": f"confirmed:{slug}:{ident}",
+                "event_id": f"confirmed:{market.market_id}:{ident}",
             }
         )
         # A confirmation that lands just after the open is still quotable.
@@ -818,6 +818,53 @@ def _confirm_splits(engine, creds, stamp: int, notes: list[str]) -> list[str]:
     return confirmed
 
 
+def _abandon_unconfirmed_splits(engine, stamp: int, notes: list[str]) -> None:
+    """Drop a split that is still unconfirmed after its own open plus the timeout.
+
+    The pre-split loop always looks at the next window, which has not started,
+    so a timeout measured from that future open never arrives. A pending split
+    left behind holds the only open-market slot and the next session cannot load.
+    """
+    timeout = int(getattr(engine.config, "split_confirm_timeout_ms", 0) or 0)
+    if timeout <= 0:
+        return
+    for market in list(engine.state.markets.values()):
+        if market.pending_split <= 0:
+            continue
+        open_s = _slug_open_s(market.slug) or _slug_open_s(market.market_id)
+        # Only a real unix end time implies an open. Synthetic ledgers use
+        # small end timestamps and must not be abandoned by this clock.
+        if open_s is None and market.end_ts_ms >= 1_000_000_000_000:
+            open_s = market.end_ts_ms // 1000 - 300
+        if open_s is None or stamp < open_s * 1000 + timeout:
+            continue
+        amount = market.pending_split
+        engine.handle_event(
+            {
+                "type": "split_abandoned",
+                "market_id": market.market_id,
+                "amount": str(amount),
+                "ts": stamp,
+                "event_id": f"abandon:{market.market_id}:{stamp}",
+            }
+        )
+        notes.append(
+            f"{market.slug or market.market_id} split was not confirmed "
+            f"within {timeout}ms of the open; not quoting it"
+        )
+        if (
+            market.pending_split <= 0
+            and market.gross_split <= 0
+            and market.up <= 0
+            and market.down <= 0
+            and not engine._working(market)
+        ):
+            market.session_stopped = True
+            market.status = "expired_unresolved"
+            market.reserve_active = False
+            market.accepting_orders = False
+
+
 def _consider_pre_split(
     engine, reader, config, creds, stamp: int, notes: list[str]
 ) -> None:
@@ -829,13 +876,12 @@ def _consider_pre_split(
     """
     from paper_split_maker.live_session import should_pre_split
 
+    _abandon_unconfirmed_splits(engine, stamp, notes)
+    for market_id in engine.retire_finished():
+        notes.append(f"retired unconfirmed session {market_id}")
     window = (stamp // 1000 // 300) * 300
     next_open = window + 300
     slug = f"btc-updown-5m-{next_open}"
-    if stamp >= next_open * 1000:
-        # This session has started. Never split it on the way in; the
-        # following window is handled once it is the upcoming one.
-        return
     lead_ms = _lead_ms(config)
     if stamp >= next_open * 1000 - lead_ms:
         _flatten_for_rollover(engine, next_open, stamp, lead_ms=lead_ms)
@@ -865,19 +911,6 @@ def _consider_pre_split(
         pending or slug in getattr(engine, "split_sent", set()),
         not engine.at_cap(),
     ):
-        if pending and stamp >= next_open * 1000 + config.split_confirm_timeout_ms:
-            engine.handle_event(
-                {
-                    "type": "split_abandoned",
-                    "market_id": existing.market_id,
-                    "amount": str(existing.pending_split),
-                    "ts": stamp,
-                    "event_id": f"abandon:{slug}",
-                }
-            )
-            notes.append(
-                f"{slug} split was not confirmed before quoting ended; not quoting it"
-            )
         return
     lookup_now = float(getattr(engine, "clock_now", 0) or (stamp / 1000))
     if _call_is_waiting(engine, "discovery", lookup_now):

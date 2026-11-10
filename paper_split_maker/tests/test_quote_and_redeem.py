@@ -304,7 +304,7 @@ def test_stale_feed_cancels_a_young_order_when_the_bid_trades_through(tmp_path):
 def test_chain_worker_does_not_block_the_split(tmp_path):
     engine = _rollover_engine(tmp_path)
     engine.chain_events = []
-    engine.redeem_pending_path = str(tmp_path / "redeem_pending.json")
+    engine.redeem_pending_path = str(tmp_path / "redeem-pending.json")
     creds = SimpleNamespace(funder=FUNDER, signature_type=3, redact=lambda text: text)
     started = threading.Event()
     release = threading.Event()
@@ -378,7 +378,7 @@ def test_short_pusd_balance_shrinks_the_split(tmp_path, monkeypatch):
 def test_redeem_no_market_found_is_deferred(tmp_path):
     engine = make_engine(tmp_path, redeem_max_attempts=3)
     engine.chain_events = []
-    engine.redeem_pending_path = str(tmp_path / "redeem_pending.json")
+    engine.redeem_pending_path = str(tmp_path / "redeem-pending.json")
     engine.redeem_resolved = lambda condition: True
     calls = []
 
@@ -403,7 +403,7 @@ def test_redeem_no_market_found_is_deferred(tmp_path):
         )
         assert len(calls) == 1
         assert engine.chain_events[-1]["kind"] == "redeem_deferred"
-        saved = json.loads((tmp_path / "redeem_pending.json").read_text(encoding="utf-8"))
+        saved = json.loads((tmp_path / "redeem-pending.json").read_text(encoding="utf-8"))
         assert saved and saved[0]["condition_id"].startswith("0x")
     finally:
         worker.stop.set()
@@ -476,7 +476,7 @@ def test_resolution_settled_requires_a_payout():
 
 
 def test_redeem_pending_subcommand_retries_a_resolved_market(tmp_path):
-    path = tmp_path / "redeem_pending.json"
+    path = tmp_path / "redeem-pending.json"
     condition = "0x" + "cd" * 32
     path.write_text(
         json.dumps(

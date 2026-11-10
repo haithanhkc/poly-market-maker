@@ -9,8 +9,6 @@ Splits pUSD into Up and Down, posts post-only sells, and merges what does not fi
 5. In the last 60 seconds a side at or above 0.90 is offered only at or above 0.90. A side at or below 0.10 joins the bid. Still post-only.
 6. If the other leg already filled at P and the bid pays `1 - P`, take that bid. Otherwise keep quoting. Merge leftovers at the stop, then redeem.
 
-A skipped quote is one line, `quote_skipped`, with the reason (`loss_budget`, `pair_floor`, `stale_feed`), price, budget, minimum size, and headroom.
-
 A skipped quote is one line: `quote_skipped <market> <side> <reason> ...` with the price, budget, minimum size, and headroom. Reasons include `loss_budget`, `pair_floor`, and `stale_feed`.
 
 ## Run (Windows PowerShell)

@@ -8,6 +8,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from paper_split_maker import cli, live_runner
+from paper_split_maker.live_clob import clob_number
 from paper_split_maker.chain_send import erc1155_balance, split_tokens_present
 from tests.helpers import both_books, make_engine, market_event, run
 
@@ -177,8 +178,8 @@ def test_sell_never_crosses_best_bid(tmp_path):
             assert order.price > Decimal("0.40")
 
 
-def test_run5e_cancel_pending_orders_stay_exposure(tmp_path):
-    """run5e: Down sells at 0.87-0.96 re-posted while cancels were pending."""
+def test_cancel_pending_orders_stay_exposure(tmp_path):
+    """Down sells re-posted while cancels are still pending stay inside the budget."""
     from paper_split_maker.quotes import Proposal
     from paper_split_maker.risk import worst_case_equity
     engine = make_engine(tmp_path, initial_capital=Decimal("30"), per_market_budget=Decimal("30"), clip_size=Decimal("30"))
@@ -205,6 +206,14 @@ def test_run5e_cancel_pending_orders_stay_exposure(tmp_path):
     assert total <= market.down
     assert loss <= Decimal("0.90")
     assert worst_case_equity(engine.state) >= engine.state.loss_floor
+
+
+def test_clob_number_snaps_to_the_tick_before_it_becomes_a_float():
+    assert clob_number("0.29", "0.01") == float("0.29")
+    assert clob_number("0.07", "0.01") == float("0.07")
+    assert clob_number("5", "0.01") == float("5")
+    assert clob_number("0.5014", "0.001") == float("0.501")
+    assert Decimal(str(clob_number("0.29", "0.01"))) == Decimal("0.29")
 
 
 def test_three_consecutive_markets_are_accepted(tmp_path):

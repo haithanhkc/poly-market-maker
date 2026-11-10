@@ -117,6 +117,23 @@ def _install_api_creds(client, creds: Credentials) -> None:
         client.set_api_creds(derive())
 
 
+def clob_number(value, quantum) -> float:
+    """Float the official client accepts, snapped onto the market quantum.
+
+    ``float(Decimal)`` can feed the client a binary value whose shortest
+    decimal is a different tick. Format the snapped decimal first.
+    """
+    from decimal import ROUND_HALF_EVEN, Decimal
+
+    number = Decimal(str(value))
+    step = Decimal(str(quantum))
+    if step <= 0:
+        step = Decimal("0.01")
+    units = (number / step).to_integral_value(rounding=ROUND_HALF_EVEN)
+    snapped = units * step
+    return float(format(snapped, "f"))
+
+
 def post_only_sells(client, orders: list[dict]) -> list[dict]:
     """Post maker sells one at a time so a 4xx rejects only that order."""
     from py_clob_client_v2 import (
@@ -131,8 +148,8 @@ def post_only_sells(client, orders: list[dict]) -> list[dict]:
         try:
             args = OrderArgs(
                 token_id=str(order["token_id"]),
-                price=float(order["price"]),
-                size=float(order["size"]),
+                price=clob_number(order["price"], order.get("tick_size") or "0.01"),
+                size=clob_number(order["size"], "0.01"),
                 side=Side.SELL,
             )
             options = PartialCreateOrderOptions(
@@ -181,8 +198,8 @@ def _post_orders(client, orders: list[dict], *, side_name: str, taker: bool) -> 
         try:
             args = OrderArgs(
                 token_id=str(order["token_id"]),
-                price=float(order["price"]),
-                size=float(order["size"]),
+                price=clob_number(order["price"], order.get("tick_size") or "0.01"),
+                size=clob_number(order["size"], "0.01"),
                 side=side,
             )
             options = PartialCreateOrderOptions(

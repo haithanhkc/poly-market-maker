@@ -92,10 +92,6 @@ def should_pre_split(
     return open_ms - lead_ms <= now_ms < open_ms
 
 
-def may_quote_unconfirmed(confirmed: bool) -> bool:
-    return confirmed
-
-
 @dataclass
 class LatencyLog:
     rows: list[dict] = field(default_factory=list)
