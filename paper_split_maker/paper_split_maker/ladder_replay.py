@@ -23,12 +23,17 @@ def replay_session(
     *,
     split: str = "25",
     end_ms: int = 300_000,
+    lead_seconds: int = 0,
 ) -> dict:
     """``prints`` are ``{sec, outcome, price, size}`` with outcome up/down.
 
-    ``winner`` is ``up`` or ``down``. Returns realized pnl and sell stats.
+    ``winner`` is ``up`` or ``down``. ``lead_seconds`` quotes that long before
+    the open, at a 0.50 book, and keeps pre-open prints on their own clock.
+    Returns realized pnl and sell stats.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    lead = max(0, int(lead_seconds))
+    end_ms = end_ms + lead * 1000
     engine = Engine.create(config, out_dir / "state.json", out_dir / "logs")
     engine.handle_event(
         {
@@ -63,11 +68,24 @@ def replay_session(
     )
     last = {"up": Decimal("0.50"), "down": Decimal("0.50")}
     sold = {"up": Decimal("0"), "down": Decimal("0")}
+    if lead:
+        # Rest at the pre-open 0.50 book before the first of their prints.
+        _book(engine, last, 2, 0)
+        engine.handle_event(
+            {
+                "type": "heartbeat",
+                "event_id": "preopen",
+                "ts": 2,
+                "market_id": "m1",
+            }
+        )
     for index, item in enumerate(prints):
         sec = int(item["sec"])
-        if sec < 0:
+        if lead == 0 and sec < 0:
             sec = 0
-        ts = sec * 1000
+        ts = (sec + lead) * 1000
+        if ts < 0:
+            ts = 0
         if ts >= end_ms:
             ts = end_ms - 1
         outcome = str(item["outcome"])

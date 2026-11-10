@@ -66,6 +66,8 @@ class Supervisor:
             "sell_fraction": _num(cfg.max_unpaired_fraction),
             "late_window": str(cfg.late_window_seconds),
             "winner_min": _num(cfg.winner_min_price),
+            "split_lead": str(cfg.split_lead_seconds),
+            "sell_cap": _num(cfg.session_sell_fraction),
         }
 
     def save_form(self, posted: dict) -> None:
@@ -235,6 +237,8 @@ class Supervisor:
             sell_pct=_esc(values["sell_fraction"]),
             late=_esc(values["late_window"]),
             winner_px=_esc(values["winner_min"]),
+            lead=_esc(values["split_lead"]),
+            sell_cap=_esc(values["sell_cap"]),
             run_state=_esc(status["state"]),
             run_mode=_esc(status["mode"]),
             run_session=_esc(status["session"] or "—"),
@@ -535,6 +539,8 @@ pre {{ background: #f4f4f4; padding: 0.8rem; max-height: 18rem; overflow: auto; 
 <li>Clip mỗi bậc: {clip} cổ</li>
 <li>Số bậc cùng lúc: {rungs}</li>
 <li>Cửa sổ cuối: {late}s, winner tối thiểu {winner_px}</li>
+<li>Tách phiên sau trước {lead}s, và vẫn rao phiên này đến vài giây cuối</li>
+<li>Dừng bán thêm khi đã bán {sell_cap} khối split (cả hai phía)</li>
 <li>Dừng một phiên: {session} pUSD</li>
 <li>Dừng ngày: ngân sách {budget}, sàn lỗ {floor}</li>
 </ul>

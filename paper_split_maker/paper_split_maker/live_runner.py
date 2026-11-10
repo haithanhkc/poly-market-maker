@@ -693,8 +693,12 @@ def _poll_public(
         for market in engine.state.markets.values()
         if market.status == "open"
     ]
+    # One market per pass. Two or three open sessions must not double the book rate.
+    to_poll = open_markets
+    if len(open_markets) > 1:
+        to_poll = [_stalest_market(open_markets)]
     failed = 0
-    for market in open_markets:
+    for market in to_poll:
         book_label = f"book:{market.market_id}"
         if _call_is_waiting(engine, book_label, poll_now):
             # Keep the last book. A retry wait is not a dead feed.
@@ -732,7 +736,10 @@ def _poll_public(
         if not market_ok:
             failed += 1
     _poll_resolutions(engine, reader, stamp, notes)
-    feed_down = bool(open_markets) and failed == len(open_markets)
+    # A failed poll of one session does not mark the others down.
+    feed_down = bool(to_poll) and failed == len(to_poll) and len(to_poll) == len(
+        open_markets
+    )
     engine.handle_event(
         {
             "type": "feed",
@@ -1293,24 +1300,45 @@ def _unwind_failed_posts(engine, stamp: int, notes: list[str]) -> None:
             _note_session_done(engine, market)
 
 
-def _flatten_for_rollover(engine, next_open_s: int, stamp: int, *, lead_ms: int) -> None:
-    """Cancel and merge the session that ends as the next one opens.
+def _stalest_market(markets):
+    """The open market whose book has gone longest without a message."""
 
-    Capital equal to one split cannot fund the next split until this returns
-    to cash. Two cancel events let a zero-latency cancel promote before the
+    def age(market) -> int:
+        marks = []
+        for outcome in ("up", "down"):
+            seen = market.book(outcome).received_ms
+            if seen >= 0:
+                marks.append(seen)
+        if not marks:
+            return -1
+        return min(marks)
+
+    return min(markets, key=age)
+
+
+def _flatten_for_rollover(engine, next_open_s: int, stamp: int, *, lead_ms: int) -> None:
+    """Merge a session that has ended, or that must fund a one-split bankroll.
+
+    The pre-split lead does not pull quotes while cash can still fund the next
+    split. A bankroll equal to one split cannot, so that session is merged in
+    the lead. Two cancel events let a zero-latency cancel promote before the
     merge; live cancels still wait for the exchange confirm on a later pass.
-    The current session is left quoted until this lead window.
     """
     from paper_split_maker.decimal_utils import qdown
     from paper_split_maker.risk import reserved
 
     end_ms = next_open_s * 1000
-    rolling = stamp >= end_ms - max(lead_ms, 0)
+    stop_ms = int(engine.config.stop_quoting_before_expiry_ms)
+    short_cash = engine.state.cash < engine.config.split_clip
+    in_lead = stamp >= end_ms - max(lead_ms, 0)
     for market in list(engine.state.markets.values()):
         if market.status == "redeemed" or market.end_ts_ms > end_ms:
             continue
-        ended = market.end_ts_ms <= stamp
-        if not ended and not rolling:
+        ended = stamp >= market.end_ts_ms
+        in_stop = stamp >= market.end_ts_ms - stop_ms
+        # Only the session that ends at this open is in the way of the next split.
+        blocks_next = in_lead and short_cash and market.end_ts_ms <= end_ms
+        if not ended and not in_stop and not blocks_next:
             continue
         if (
             market.up == 0

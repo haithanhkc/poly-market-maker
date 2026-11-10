@@ -67,6 +67,14 @@ _WORST_DAY = Decimal("182.3864")
 # Last-60s prints: winner median 0.90, loser median 0.11.
 _LATE_WINDOW_SECONDS = 120
 _WINNER_MIN_PRICE = Decimal("0.90")
+# They split a median 293s before the open. 300s is the whole previous window,
+# so the next market is prepared as soon as that window starts.
+_SPLIT_LEAD_SECONDS = 300
+# Previous (merging), current (quoting), and next (pre-open) at once.
+_OPEN_MARKETS = 3
+# Train-set 90th percentile of shares sold / 750, on the days before the
+# last three. Past this, more size made the high-volume days worse.
+_SESSION_SELL_FRACTION = Decimal("0.35")
 
 
 @dataclass(frozen=True)
@@ -301,6 +309,10 @@ def _apply_derived(cfg: Config, env: dict) -> None:
     cfg.late_window_seconds = derived.late_window_seconds
     cfg.winner_min_price = derived.winner_min_price
     cfg.ladder_spacing = Decimal("0.01")
+    cfg.split_lead_seconds = _SPLIT_LEAD_SECONDS
+    cfg.max_open_markets = _OPEN_MARKETS
+    cfg.session_sell_fraction = _SESSION_SELL_FRACTION
+    cfg.queue_priority = True
     _apply_explicit(cfg, env)
 
 
@@ -321,6 +333,9 @@ def _apply_explicit(cfg: Config, env: dict) -> None:
     session = _present(env, "BOT_SESSION_STOP")
     if session is not None:
         cfg.session_max_loss = _decimal("BOT_SESSION_STOP", session)
+    lead = _present(env, "BOT_SPLIT_LEAD")
+    if lead is not None:
+        cfg.split_lead_seconds = _integer("BOT_SPLIT_LEAD", lead)
 
 
 def _apply_markets_and_mode(cfg: Config, env: dict, markets: int) -> int:

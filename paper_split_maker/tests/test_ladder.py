@@ -277,3 +277,82 @@ def test_replay_sells_the_loser_and_posts_more_than_the_tight_book(tmp_path):
     assert result["sold_down"] + result["sold_up"] > single["sold_down"] + single[
         "sold_up"
     ]
+
+
+def test_queue_priority_keeps_a_rung_until_the_price_moves_a_tick(tmp_path):
+    engine = _engine(tmp_path, queue_priority=True, min_order_rest_seconds=0)
+    _arm(engine)
+    _quote(engine, [("up", "0.49", "0.51"), ("down", "0.49", "0.51")], 10_000)
+    before = _prices(engine, "up")
+    assert before
+    # Half a tick of noise is not a reason to lose the queue.
+    _quote(engine, [("up", "0.49", "0.51"), ("down", "0.49", "0.51")], 11_000)
+    assert _prices(engine, "up") == before
+    resting = [
+        order
+        for order in engine.state.orders.values()
+        if order.outcome == "up" and order.status in {"queued", "live"}
+    ]
+    assert resting
+    assert all(order.status != "cancel_requested" for order in resting)
+
+
+def test_a_bid_that_reaches_the_rung_is_pulled(tmp_path):
+    engine = _engine(tmp_path, queue_priority=True, min_order_rest_seconds=30)
+    _arm(engine)
+    _quote(engine, [("up", "0.49", "0.51"), ("down", "0.49", "0.51")], 10_000)
+    order = next(
+        item
+        for item in engine.state.orders.values()
+        if item.outcome == "up" and item.status in {"queued", "live"}
+    )
+    _quote(
+        engine,
+        [("up", str(order.price), "0.99"), ("down", "0.01", "0.02")],
+        12_000,
+    )
+    assert order.status in {"cancel_requested", "cancelled"}
+
+
+def test_matched_sell_stays_at_or_above_one_minus_the_other_fill(tmp_path):
+    engine = _engine(tmp_path, queue_priority=True, pair_min_edge=Decimal("0"))
+    _arm(engine)
+    _quote(engine, [("up", "0.39", "0.41"), ("down", "0.59", "0.61")], 10_000)
+    down = next(
+        item
+        for item in engine.state.orders.values()
+        if item.outcome == "down" and item.status in {"queued", "live"}
+    )
+    run(
+        engine,
+        [
+            {
+                "type": "trade",
+                "event_id": "fill-down",
+                "ts": 11_000,
+                "trade_ts": 11_000,
+                "market_id": "m1",
+                "outcome": "down",
+                "price": format(down.price, "f"),
+                "size": "5",
+                "taker_side": "BUY",
+                "trade_id": "fill-down",
+            }
+        ],
+    )
+    _quote(engine, [("up", "0.39", "0.41"), ("down", "0.59", "0.61")], 12_000)
+    up_prices = _prices(engine, "up")
+    if up_prices:
+        assert min(up_prices) + down.price >= Decimal("1")
+
+
+def test_preopen_lead_does_not_end_the_session_early(tmp_path):
+    engine = _engine(
+        tmp_path,
+        split_lead_seconds=300,
+        stop_quoting_before_expiry_ms=5_000,
+    )
+    _arm(engine)
+    _quote(engine, [("up", "0.49", "0.51"), ("down", "0.49", "0.51")], 10_000)
+    assert _prices(engine, "up")
+    assert engine._preclose_ms(engine.state.markets["m1"]) == 300_000 - 5_000

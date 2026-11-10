@@ -470,6 +470,14 @@ def ladder_plan(
     prices = _rung_prices(market, config, bid, ask, mid, other, late)
     if prices is None:
         return [_no("uncertain_book", outcome)]
+    if config.queue_priority and prices:
+        # A matched sell below 1 - the other side's average locks a loss.
+        # 89% of their losing sessions had a pair sum under 1.
+        floor = pair_edge_floor(market, outcome, config)
+        if floor is not None:
+            tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
+            raised = ceil_tick(floor, tick)
+            prices = [price for price in prices if price >= raised]
     if not prices:
         return [_no("no_edge", outcome)]
     losing = other is not None and mid + config.skew_mid_gap < other

@@ -98,7 +98,15 @@ class Config:
     # Live books are stale only after this long with no message, not on a quiet book.
     stale_feed_seconds: int = 10
     # Split the next session this many seconds before it opens.
-    split_lead_seconds: int = 45
+    # Quoting of the current session stops on stop_quoting_before_expiry_ms,
+    # not on this lead. 300s is one full window, which is their pre-open split.
+    split_lead_seconds: int = 300
+    # Stop new sells after both sides together have sold this fraction of the
+    # split. 0 leaves it off. Their train-set 90th percentile is about 0.35.
+    session_sell_fraction: Decimal = Decimal("0")
+    # When set, a resting rung is cancelled only if the new price is at least
+    # one tick away or the bid has reached the order.
+    queue_priority: bool = False
     # Hard stop for a live run. The duration flag does not cut a session off.
     max_runtime_seconds: int = 2400
     # Give up on a redeem after this many attempts and leave it for redeem-pending.
@@ -200,6 +208,8 @@ class Config:
             raise ConfigError("stale_feed_seconds must be at least 1")
         if self.split_lead_seconds < 0:
             raise ConfigError("split_lead_seconds must be non-negative")
+        if self.session_sell_fraction < 0 or self.session_sell_fraction > 1:
+            raise ConfigError("session_sell_fraction must be in [0, 1]")
         if self.max_runtime_seconds <= 0:
             raise ConfigError("max_runtime_seconds must be positive")
         if self.redeem_max_attempts < 1:
@@ -283,6 +293,7 @@ _DECIMAL_FIELDS = {
     "requote_vol_k",
     "requote_size_threshold",
     "pair_min_edge",
+    "session_sell_fraction",
     "max_unpaired_fraction",
     "ladder_spacing",
     "skew_mid_gap",
@@ -317,6 +328,7 @@ _INT_FIELDS = {
 }
 _BOOL_FIELDS = {
     "trade_through_fills",
+    "queue_priority",
     "auto_split",
     "merge_when_idle",
     "live",

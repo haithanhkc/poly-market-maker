@@ -1142,14 +1142,11 @@ class Engine:
         return band
 
     def _preclose_ms(self, market: Market) -> int:
-        """When this session's quotes are pulled for the close or the next split."""
-        stop = market.end_ts_ms - int(self.config.stop_quoting_before_expiry_ms)
-        lead = int(self.config.split_lead_seconds) * 1000
-        if lead > 0:
-            lead_stop = market.end_ts_ms - lead
-            if lead_stop < stop:
-                stop = lead_stop
-        return stop
+        """When this session's quotes are pulled.
+
+        The pre-split lead prepares the next market. It does not end this one.
+        """
+        return market.end_ts_ms - int(self.config.stop_quoting_before_expiry_ms)
 
     def _place_proposals(self, market: Market, proposals: list[Proposal]) -> None:
         for proposal in proposals:
@@ -1421,10 +1418,21 @@ class Engine:
         tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
         return qdown(bid, tick) >= floor
 
+    def _sells_capped(self, market: Market) -> bool:
+        """True once both sides together have sold the session share cap."""
+        fraction = self.config.session_sell_fraction
+        if fraction <= 0 or self.config.split_clip <= 0:
+            return False
+        sold = market.sold_up_shares + market.sold_down_shares
+        return sold >= fraction * self.config.split_clip
+
     def _quote_ladder(self, market: Market) -> None:
-        """Post the ladder, then drop a rung only after it has rested."""
+        """Post the ladder. A capped session keeps what is already resting."""
         if self._in_cooldown(market):
             self._skip(market, "cooldown")
+            return
+        if self._sells_capped(market):
+            self._skip(market, "session_sell_cap")
             return
         plans: list[Proposal] = []
         for outcome in ("up", "down"):
@@ -1450,6 +1458,40 @@ class Engine:
                 self._skip(market, item.reason, item.outcome, item.price)
 
     def _sync_ladder(self, market: Market, plans: list[Proposal]) -> None:
+        if self.config.queue_priority:
+            self._sync_ladder_keep_queue(market, plans)
+            return
+        self._sync_ladder_loose(market, plans)
+
+    def _sync_ladder_keep_queue(self, market: Market, plans: list[Proposal]) -> None:
+        """Keep a resting rung unless the target moved by a tick or the bid reached it."""
+        wanted = [item for item in plans if item.reason == "ok" and item.price > 0]
+        tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
+        for order in list(self._working(market)):
+            bid = market.book(order.outcome).best_bid()
+            adverse = bid is not None and bid >= order.price
+            prices = [
+                item.price for item in wanted if item.outcome == order.outcome
+            ]
+            moved = True
+            if prices:
+                inside = min(prices)
+                # A higher rung of the same ladder is not a price change.
+                on_ladder = False
+                for step in range(self.config.ladder_levels + 1):
+                    rung = inside + tick * step
+                    if abs(order.price - rung) < tick / Decimal(100):
+                        on_ladder = True
+                        break
+                nearest = min(abs(order.price - item) for item in prices)
+                moved = not on_ladder and nearest >= tick
+            if not adverse and not moved:
+                continue
+            self._request_cancel(
+                market, order, "adverse" if adverse else "requote"
+            )
+
+    def _sync_ladder_loose(self, market: Market, plans: list[Proposal]) -> None:
         wanted = [item for item in plans if item.reason == "ok" and item.price > 0]
         rest_ms = int(self.config.min_order_rest_seconds) * 1000
         for order in list(self._working(market)):

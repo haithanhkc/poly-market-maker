@@ -127,6 +127,10 @@ def test_split_derives_clip_rungs_and_stops():
     assert applied.config.session_max_loss == small.session_stop
     assert applied.config.max_loss_fraction == small.daily_fraction
     assert applied.config.late_window_seconds == 120
+    assert applied.config.split_lead_seconds == 300
+    assert applied.config.max_open_markets == 3
+    assert applied.config.session_sell_fraction == Decimal("0.35")
+    assert applied.config.queue_priority is True
     assert applied.config.capital_from_env is False
     assert applied.config.per_market_budget == Decimal("25")
 
