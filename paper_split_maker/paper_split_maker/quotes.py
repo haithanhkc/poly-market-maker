@@ -376,3 +376,160 @@ def propose(state: State, market: Market, outcome: str, config: Config) -> Propo
         required_edge=required_edge,
         repair=repair,
     )
+
+
+def _mid(market: Market, outcome: str) -> Decimal | None:
+    book = market.book(outcome)
+    bid, ask = book.best_bid(), book.best_ask()
+    if bid is None or ask is None or ask <= bid:
+        return None
+    return (bid + ask) / 2
+
+
+def _rung_prices(
+    market: Market,
+    config: Config,
+    bid: Decimal,
+    ask: Decimal,
+    mid: Decimal,
+    other_mid: Decimal | None,
+    late: bool,
+) -> list[Decimal] | None:
+    """Post-only prices. None means the book is too wide to quote."""
+    tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
+    spacing = config.ladder_spacing if config.ladder_spacing > tick else tick
+    touch = ceil_tick(bid + tick, tick)
+    if touch >= 1 or touch > config.max_price:
+        return []
+    winner_px = config.winner_min_price
+    losing = other_mid is not None and mid + config.skew_mid_gap < other_mid
+    winning = other_mid is not None and other_mid + config.skew_mid_gap < mid
+    if late and mid >= winner_px:
+        price = touch if touch > winner_px else ceil_tick(winner_px, tick)
+        if price <= bid or price >= 1 or price > config.max_price:
+            return []
+        return [price]
+    if late and (mid <= Decimal("1") - winner_px or losing):
+        prices = [touch]
+        nxt = ceil_tick(touch + spacing, tick)
+        if config.ladder_levels > 1 and nxt < 1 and nxt <= config.max_price:
+            prices.append(nxt)
+        return prices
+    if ask - bid > config.max_spread:
+        return None
+    inside = ceil_tick(mid if mid > touch else touch, tick)
+    levels = config.ladder_levels
+    if losing:
+        inside = touch
+    elif winning:
+        inside = ceil_tick(inside + spacing, tick)
+        levels = 1 if levels < 2 else levels - 1
+    prices = []
+    price = inside
+    guard = 0
+    while len(prices) < levels and price < 1 and guard < 12:
+        if price > bid and price <= config.max_price:
+            prices.append(price)
+        price = ceil_tick(price + spacing, tick)
+        guard += 1
+    return prices
+
+
+def _clip_rungs(
+    state: State,
+    market: Market,
+    outcome: str,
+    config: Config,
+    prices: list[Decimal],
+    fair: Decimal,
+    repair: bool,
+) -> list[Proposal]:
+    """Give each rung one clip, inside first, until inventory or the budget ends."""
+    free = market.inventory(outcome) - reserved(state, market, outcome)
+    minimum = (
+        market.min_order_size
+        if market.min_order_size > config.min_order_size
+        else config.min_order_size
+    )
+    if free < minimum:
+        return []
+    usable = [
+        price
+        for price in prices
+        if _room(market, outcome, price, config, free) >= minimum
+    ]
+    if not usable:
+        return []
+    left = free
+    posted: list[Proposal] = []
+    for price in usable:
+        room = _room(market, outcome, price, config, left)
+        if room < minimum or left < minimum:
+            break
+        size = config.clip_size if config.clip_size < room else room
+        if size > left:
+            size = left
+        size = qdown(size, config.order_size_quantum)
+        if size < minimum:
+            break
+        posted.append(
+            Proposal(
+                outcome=outcome,
+                price=price,
+                size=size,
+                fair=fair,
+                required_edge=config.min_edge,
+                repair=repair,
+            )
+        )
+        left -= size
+    return posted
+
+
+def _room(
+    market: Market,
+    outcome: str,
+    price: Decimal,
+    config: Config,
+    free: Decimal,
+) -> Decimal:
+    cap = free
+    allowed = unpaired_sell_room(market, outcome, price, config)
+    if allowed is not None and allowed < cap:
+        cap = allowed
+    if cap < 0:
+        return ZERO
+    return cap
+
+
+def ladder_plan(
+    state: State, market: Market, outcome: str, config: Config
+) -> list[Proposal]:
+    """Maker rungs for ``strategy=ladder``. One non-ok row when nothing posts.
+
+    The cheap side joins the touch. The rich side steps back one spacing and
+    drops a level. In the last minute a side at or above ``winner_min_price``
+    is offered only there, and a side at or below ``1 - winner_min_price``
+    joins the bid. Every rung stays strictly above the bid.
+    """
+    book = market.book(outcome)
+    bid, ask = book.best_bid(), book.best_ask()
+    if bid is None or ask is None or ask <= bid:
+        return [_no("uncertain_book", outcome)]
+    mid = (bid + ask) / 2
+    other = _mid(market, _other(outcome))
+    left_ms = market.end_ts_ms - state.now_ms
+    late = (
+        config.late_window_seconds > 0
+        and 0 <= left_ms <= config.late_window_seconds * 1000
+    )
+    prices = _rung_prices(market, config, bid, ask, mid, other, late)
+    if prices is None:
+        return [_no("uncertain_book", outcome)]
+    if not prices:
+        return [_no("no_edge", outcome)]
+    losing = other is not None and mid + config.skew_mid_gap < other
+    posted = _clip_rungs(state, market, outcome, config, prices, mid, losing)
+    if posted:
+        return posted
+    return [_no("pair_floor", outcome)]

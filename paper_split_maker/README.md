@@ -1,12 +1,15 @@
 # BTC 5-minute split maker
 
-Splits pUSD into Up and Down, posts post-only sells on both legs, reprices as the book moves, and flattens before the window ends.
+Splits pUSD into Up and Down, posts post-only sells, and merges what does not fill. `config.live.json` uses `strategy: ladder`.
 
-1. Split in the lead before the session opens (`split_lead_seconds`, default 45). Windows that have already opened are skipped.
-2. Post a maker sell on each leg. `slices_per_side` is 1. Set it to 2 or 3 later for a small ladder; the quote path already takes that count.
-3. Reprice only after `min_order_rest_seconds` and only when the target moved by more than `max(2 ticks, requote_vol_k * short-window stdev)`.
-4. After one leg fills at P, the other leg's floor is `1 - P` (plus the taker fee when `leg_fee_buffer` is true). If the best bid covers that floor, sell as a taker. Otherwise rest post-only at `max(floor, best ask - 1 tick)` and reprice. A post-only reject that says the order crosses the book is retried as a taker when the bid covers the floor. Partial fills use the filled size.
-5. Merge leftover pairs. Redeem after the market settles. A pair that cannot meet the loss budget is held until the stop window so a later legal price can still be posted. A book older than `stale_feed_seconds` is logged as `quote_skipped` and is not merged.
+1. Split a few seconds before the session opens (`split_lead_seconds` 8). A window that has already opened is skipped. One open market, so the previous pair is merged in the last 5 seconds rather than held across the next split.
+2. Post a 3-level post-only ladder on each side, 0.01 apart, one 5-share clip per rung, around that side's own mid.
+3. Reprice after `min_order_rest_seconds` (5) when the mid has moved by more than half a spacing.
+4. The cheaper side (mid at least `skew_mid_gap` below the other) joins the touch and keeps all three rungs. The richer side steps one cent back and drops a rung.
+5. In the last 60 seconds a side at or above 0.90 is offered only at or above 0.90. A side at or below 0.10 joins the bid. Still post-only.
+6. If the other leg already filled at P and the bid pays `1 - P`, take that bid. Otherwise keep quoting. Merge leftovers at the stop, then redeem.
+
+A skipped quote is one line, `quote_skipped`, with the reason (`loss_budget`, `pair_floor`, `stale_feed`), price, budget, minimum size, and headroom.
 
 A skipped quote is one line: `quote_skipped <market> <side> <reason> ...` with the price, budget, minimum size, and headroom. Reasons include `loss_budget`, `pair_floor`, and `stale_feed`.
 
@@ -41,26 +44,22 @@ Two files. Anything omitted uses the default in `paper_split_maker/config.py`.
 
 | Param | Live value | Meaning |
 | --- | --- | --- |
-| `initial_capital` | 30 | Bankroll locked into the ledger |
-| `max_loss_fraction` | 0.03 | Loss budget. Floor is 29.10. A new split or a new sell that would break the floor is skipped |
-| `split_clip` / `clip_size` | 5 | Shares split, and the size of each sell |
+| `strategy` | ladder | `single` is the old one-order quote. `ladder` is the default live mode |
+| `initial_capital` | 59 | Bankroll locked into the ledger |
+| `max_loss_fraction` | 0.20 | Daily loss stop at 11.80 (floor 47.20). Wide enough that a 5-share sell near mid is allowed |
+| `session_max_loss` | 6 | Stop one session after 6 pUSD of loss, then merge |
+| `split_clip` / `clip_size` | 25 / 5 | One split per session, 5 shares per rung |
+| `ladder_levels` / `ladder_spacing` | 3 / 0.01 | Rungs per side, one cent apart |
+| `skew_mid_gap` | 0.04 | How far a mid must lag before that side joins the touch |
+| `late_window_seconds` / `winner_min_price` | 60 / 0.90 | Last-minute winner floor and loser dump |
+| `max_unpaired_fraction` | 0.60 | The cheap side may lead by 15 shares of a 25 split |
+| `pair_min_edge` | 0 | Pairs are not required to clear 1.01. The loss caps are the limit |
 | `max_open_markets` | 1 | One session at a time |
-| `pair_min_edge` | 0.01 | A matched pair of sells must clear `1 + edge` |
-| `max_unpaired_fraction` | 0.5 | Cap on size that is not matched by the other leg |
-| `split_lead_seconds` | 45 | Split this many seconds before the window opens |
-| `stop_quoting_before_expiry_ms` | 20000 | Stop quoting and flatten in the last 20s |
-| `close_improve_seconds` | 90 | Step the ask toward the bid, never through the pair floor |
-| `min_order_rest_seconds` | 20 | Minimum time before a replace |
-| `requote_vol_k` / `requote_vol_window_ms` | 1 / 30000 | Replace only if the move beats this volatility band |
+| `split_lead_seconds` | 8 | Split this many seconds before the open, after the previous merge |
+| `stop_quoting_before_expiry_ms` | 5000 | Flatten in the last 5s so the last minute still quotes |
+| `min_order_rest_seconds` | 5 | Minimum time before a replace |
 | `stale_feed_seconds` | 10 | Skip quoting when the book is older than this |
-| `sell_ready_timeout_seconds` | 30 | If posts keep erroring after the open, cancel and merge |
-| `leg_unwind_seconds` | 5 | Repeat the other-leg bid check |
-| `leg_fee_buffer` | true | Lift the other-leg floor by the taker fee |
-| `allow_loss_unwind` | false | Do not sell through the floor |
-| `max_unwind_loss` | 0.50 | Cap if loss unwind is turned on, and only in the last `unwind_loss_before_expiry_seconds` |
-| `max_runtime_seconds` | 2400 | Hard stop. Does not cut a session off early |
 | `kill_switch_file` | kill.switch | Stop file, created in the working directory |
-| `slices_per_side` | 1 | Ladder depth. Raise later for more price levels |
 | `risk_fee_rate` | 0.07 | Fee used in the loss-floor check. Maker fee stays 0 |
 
 `config.paper.json` is the same engine with `"live"` omitted, capital 1000, and a 20 second paper window. It does not send orders.
@@ -75,9 +74,9 @@ That file lives only on the operator PC. It is not in this repo. Copy the values
 | `stale_after_ms` | Paper book age. Live uses `stale_feed_seconds` |
 | `market_slugs` | Delete it. A placeholder such as `no-initial-discovery-placeholder` is ignored; the bot discovers `btc-updown-5m-<open>` |
 | `entry_mode` | Keep `split_sell` |
-| `max_loss_fraction` `0.034` | Still valid. The shipped file uses `0.03` (budget 0.90, floor 29.10). 3.4% of 30 is about 1.02, which is what a 5-share sell near 0.80 needs |
-| `slices_per_side` | Leave at 1 until you want a ladder |
+| `max_loss_fraction` `0.034` | That 0.90–1.02 budget blocks a 5-share sell below about 0.80. The shipped file uses `0.20` on 59 pUSD (budget 11.80, floor 47.20) plus `session_max_loss` 6 |
+| `strategy` | Set `ladder`. `slices_per_side` stays 1; depth is `ladder_levels` |
 | `vol_pause_move`, `btc_pause_move`, `taker_repair`, `session_max_loss`, `max_pair_loss` | Still accepted. Leave them out. They default off. The loss budget, the pair edge, and the other-leg unwind replace them |
 | `config.live.run5.json`, `run13`, `run15`, `old30`, `old200` | Removed from the repo. Do not point `--config` at them |
 
-A 5-share sell fits the 0.90 budget only when the price is about 0.82 or higher before fees, and about 0.85 to 0.86 once the 7% risk fee and the reserves are included. Below that the log says `quote_skipped ... loss_budget` and the pair is held.
+A 3% budget on a 30 pUSD account (0.90) only fits a 5-share sell near 0.82 or higher. The ladder mode needs the wider daily budget above, or the mid quotes never post. Use a new `--out` directory so the old 29.10 floor is not locked in.

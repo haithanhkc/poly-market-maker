@@ -543,8 +543,13 @@ def _quote_rows(engine):
 def test_live_config_quotes_both_legs_and_holds_the_slot(tmp_path):
     shipped = load_config(ROOT / "config.live.json")
     assert shipped.live is True
-    assert shipped.loss_floor() == Decimal("29.10")
-    assert shipped.split_clip == Decimal("5")
+    assert shipped.strategy == "ladder"
+    assert shipped.initial_capital == Decimal("59")
+    assert shipped.loss_floor() == Decimal("47.20")
+    assert shipped.loss_budget() == Decimal("11.80")
+    assert shipped.split_clip == Decimal("25")
+    assert shipped.session_max_loss == Decimal("6")
+    assert shipped.ladder_levels == 3
     assert shipped.max_open_markets == 1
     assert shipped.entry_mode == "split_sell"
     assert shipped.slices_per_side == 1

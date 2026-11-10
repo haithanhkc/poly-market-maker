@@ -25,6 +25,7 @@ from paper_split_maker.models import (
 from paper_split_maker.quotes import (
     Proposal,
     binding_sell_floor,
+    ladder_plan,
     ladder_prices,
     propose,
 )
@@ -567,7 +568,7 @@ class Engine:
         # Reprice when the leftover leg's own book moves. The other side's
         # book does not change this bid.
         naked = self._naked_leg(market)
-        if naked is not None and naked[0] == outcome:
+        if naked is not None and naked[0] == outcome and self._should_unwind(market):
             self._complete_leg(market)
 
     def _on_trade(self, event: dict) -> None:
@@ -885,7 +886,7 @@ class Engine:
             return
         # The leftover leg is managed through the close window. A stop-window
         # cancel must not pull it before it can be sold at breakeven.
-        if self._complete_leg(market):
+        if self._should_unwind(market) and self._complete_leg(market):
             return
         if self._in_stop_window(market):
             self._cancel_market(market, "near_expiry")
@@ -906,6 +907,9 @@ class Engine:
             return
         if self._in_cooldown(market):
             self._skip(market, "cooldown")
+            return
+        if self.config.strategy == "ladder":
+            self._quote_ladder(market)
             return
         if self._quotes_possible(market) and not self.at_cap():
             self._auto_split(market)
@@ -1165,7 +1169,8 @@ class Engine:
     def _preclose_ms(self, market: Market) -> int:
         """When this session's quotes are pulled for the close or the next split."""
         stop = market.end_ts_ms - int(self.config.stop_quoting_before_expiry_ms)
-        lead = int(self.config.pre_split_lead_ms)
+        seconds = int(self.config.split_lead_seconds)
+        lead = seconds * 1000 if seconds > 0 else int(self.config.pre_split_lead_ms)
         if lead > 0:
             lead_stop = market.end_ts_ms - lead
             if lead_stop < stop:
@@ -1550,6 +1555,90 @@ class Engine:
             self.leg_since.pop(market.market_id, None)
             return
         self.leg_since.setdefault(market.market_id, self.state.now_ms)
+
+    def _should_unwind(self, market: Market) -> bool:
+        """Single mode always flattens a naked leg. Ladder mode takes it only
+        when the bid already pays ``1 - P``, so the cheap side can keep quoting.
+        """
+        if self.config.strategy != "ladder":
+            return True
+        return self._bid_covers_leg(market)
+
+    def _bid_covers_leg(self, market: Market) -> bool:
+        naked = self._naked_leg(market)
+        if naked is None:
+            return False
+        outcome, gap = naked
+        bid = market.book(outcome).best_bid()
+        if bid is None:
+            return False
+        floor = self._leg_floor(market, outcome, gap)
+        tick = market.tick_size if market.tick_size > 0 else Decimal("0.01")
+        return qdown(bid, tick) >= floor
+
+    def _quote_ladder(self, market: Market) -> None:
+        """Post the ladder, then drop a rung only after it has rested."""
+        if self._in_cooldown(market):
+            self._skip(market, "cooldown")
+            return
+        plans: list[Proposal] = []
+        for outcome in ("up", "down"):
+            plans.extend(ladder_plan(self.state, market, outcome, self.config))
+        self._sync_ladder(market, plans)
+        if not self.config.live:
+            self._promote()
+        for item in plans:
+            if item.reason != "ok" or item.price <= 0 or item.size <= 0:
+                continue
+            if self._working_near(market, item.outcome, item.price):
+                continue
+            self._place_one(market, item, item.price, False)
+        if any(item.reason == "ok" for item in plans):
+            return
+        unsold = market.sold_up_shares <= 0 and market.sold_down_shares <= 0
+        if unsold and self._wait_for_sell(market):
+            self._skip(market, "waiting_for_price")
+        elif not self._working(market) and self.config.merge_when_idle:
+            self._merge_free(market, "idle_no_edge")
+        for item in plans:
+            if item.reason != "ok":
+                self._skip(market, item.reason, item.outcome, item.price)
+
+    def _sync_ladder(self, market: Market, plans: list[Proposal]) -> None:
+        wanted = [item for item in plans if item.reason == "ok" and item.price > 0]
+        rest_ms = int(self.config.min_order_rest_seconds) * 1000
+        for order in list(self._working(market)):
+            start = order.live_ts if order.live_ts is not None else order.submit_ts
+            if self.state.now_ms - start < rest_ms:
+                continue
+            band = self.config.ladder_spacing / 2
+            widened = self.config.requote_vol_k * self._mid_stdev(market, order.outcome)
+            if widened > band:
+                band = widened
+            near = [
+                item
+                for item in wanted
+                if item.outcome == order.outcome and abs(item.price - order.price) <= band
+            ]
+            if not near:
+                if self._requote_allowed(market):
+                    self._request_cancel(market, order, "requote")
+                    market.last_requote_ts = self.state.now_ms
+                continue
+            wanted_size = max(item.size for item in near)
+            if (
+                abs(order.remaining - wanted_size) > self.config.requote_size_threshold
+                and self._requote_allowed(market)
+            ):
+                self._request_cancel(market, order, "requote")
+                market.last_requote_ts = self.state.now_ms
+
+    def _working_near(self, market: Market, outcome: str, price: Decimal) -> bool:
+        band = self.config.ladder_spacing / 2
+        return any(
+            order.outcome == outcome and abs(order.price - price) <= band
+            for order in self._working(market, outcome)
+        )
 
     def _naked_leg(self, market: Market) -> Optional[tuple[str, Decimal]]:
         gap = market.sold_down_shares - market.sold_up_shares

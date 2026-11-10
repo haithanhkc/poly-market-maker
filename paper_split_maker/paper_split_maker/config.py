@@ -113,6 +113,17 @@ class Config:
     # split_sell quotes both outcomes after a split. buy_pair_arb buys both
     # asks only when they sum to 1 - pair_min_edge, then merges.
     entry_mode: str = "split_sell"
+    # single keeps one maker sell per side. ladder posts a few post-only
+    # rungs around the mid and skews size toward the side that is falling.
+    strategy: str = "single"
+    ladder_levels: int = 3
+    ladder_spacing: Decimal = Decimal("0.01")
+    # Join the touch on a side once its mid is this far below the other.
+    skew_mid_gap: Decimal = Decimal("0.04")
+    # In this many seconds before the stop, the winner rests at or above
+    # winner_min_price and the loser joins the bid. Still post-only.
+    late_window_seconds: int = 60
+    winner_min_price: Decimal = Decimal("0.90")
     # After one sell leg fills, keep checking the other leg for this long.
     # A bid at or above 1 - fill_price is taken immediately; this is the
     # backstop that repeats that check and then allows a capped loss.
@@ -226,6 +237,18 @@ class Config:
             raise ConfigError("redeem_max_attempts must be at least 1")
         if self.entry_mode not in ("split_sell", "buy_pair_arb"):
             raise ConfigError("entry_mode must be split_sell or buy_pair_arb")
+        if self.strategy not in ("single", "ladder"):
+            raise ConfigError("strategy must be single or ladder")
+        if self.ladder_levels < 1:
+            raise ConfigError("ladder_levels must be at least 1")
+        if self.ladder_spacing <= 0:
+            raise ConfigError("ladder_spacing must be positive")
+        if self.skew_mid_gap < 0:
+            raise ConfigError("skew_mid_gap must be non-negative")
+        if self.late_window_seconds < 0:
+            raise ConfigError("late_window_seconds must be non-negative")
+        if self.winner_min_price <= 0 or self.winner_min_price >= 1:
+            raise ConfigError("winner_min_price must sit inside (0, 1)")
         if self.leg_unwind_seconds < 0:
             raise ConfigError("leg_unwind_seconds must be non-negative")
         if self.max_unwind_loss < 0:
@@ -313,6 +336,9 @@ _DECIMAL_FIELDS = {
     "pair_min_edge",
     "max_unpaired_fraction",
     "max_unwind_loss",
+    "ladder_spacing",
+    "skew_mid_gap",
+    "winner_min_price",
     "taker_repair_max_usdc",
     "max_fee_gwei",
     "priority_fee_gwei",
@@ -340,6 +366,8 @@ _INT_FIELDS = {
     "redeem_max_attempts",
     "leg_unwind_seconds",
     "unwind_loss_before_expiry_seconds",
+    "ladder_levels",
+    "late_window_seconds",
     "vol_pause_window_ms",
     "vol_pause_hold_ms",
     "pre_split_lead_ms",
@@ -397,7 +425,7 @@ def config_from_mapping(data: dict) -> Config:
             kwargs[key] = value
         elif key == "fill_mode":
             kwargs[key] = str(value)
-        elif key == "entry_mode":
+        elif key in ("entry_mode", "strategy"):
             kwargs[key] = str(value)
         elif key == "poll_interval_seconds":
             kwargs[key] = float(value)
