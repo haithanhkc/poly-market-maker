@@ -215,23 +215,40 @@ def run_paper(
 
 
 def _discover_due(engine, reader, config, stamp: int, max_markets: int, note, opened_slugs: set[str]) -> int:
-    """Load the next session during its pre-open lead. A window already open is skipped."""
+    """Load the next session during its pre-open lead.
+
+    Split mode skips a window that has already opened. ``dual_bid`` also loads
+    the current window while it is still inside the quote stop, because that
+    mode bids during the round.
+    """
     series = str(getattr(config, "series_slug", "") or "btc-updown-5m")
     window = window_seconds(series)
     now_s = stamp // 1000
     current = (now_s // window) * window
     lead = int(getattr(config, "split_lead_seconds", 0) or 0)
-    note(f"{series}-{current} already started; waiting for the next session")
+    current_slug = f"{series}-{current}"
+    want_current = False
+    if getattr(config, "strategy", "") == "dual_bid":
+        stop = int(getattr(config, "dual_bid_stop_seconds", 275) or 275)
+        start = int(getattr(config, "dual_bid_start_seconds", 8) or 8)
+        age = now_s - current
+        if 0 <= age <= stop:
+            want_current = True
+            note(
+                f"{current_slug} is open; dual_bid quotes from +{start}s until +{stop}s"
+            )
+    if not want_current:
+        note(f"{series}-{current} already started; waiting for the next session")
     due = _due_slugs(series, window, now_s, lead, max_markets)
-    if not due:
+    explicit = [str(item) for item in (config.market_slugs or []) if str(item)]
+    slugs = explicit or (([current_slug] if want_current else []) + due)
+    if not slugs:
         if lead <= 0:
             note("split_lead_seconds is 0; no upcoming session is loaded")
         else:
             nxt = current + window
             note(f"next session {series}-{nxt} opens in {nxt - now_s}s; lead is {lead}s")
         return len(opened_slugs)
-    explicit = [str(item) for item in (config.market_slugs or []) if str(item)]
-    slugs = explicit or due
     try:
         payloads = reader.discover_btc_updown(now_s, max(len(slugs), 1), slugs, series=series)
     except PublicDataError as exc:

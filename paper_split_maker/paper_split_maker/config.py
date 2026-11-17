@@ -115,7 +115,21 @@ class Config:
     redeem_max_attempts: int = 5
     # single keeps one maker sell per side. ladder posts a few post-only
     # rungs around the mid and skews size toward the side that is falling.
+    # dual_bid buys both outcomes during the open round and holds them.
     strategy: str = "single"
+    # dual_bid quotes this many seconds after the round opens, and pulls
+    # every bid at the stop. 8s and 275s sit in the 5-10s and 270-285s windows.
+    dual_bid_start_seconds: int = 8
+    dual_bid_stop_seconds: int = 275
+    dual_bid_levels: int = 6
+    dual_bid_clip: Decimal = Decimal("5")
+    dual_bid_max_clip: Decimal = Decimal("24")
+    dual_bid_requote_ms: int = 1500
+    target_pair_cost: Decimal = Decimal("0.97")
+    pair_cost_stop: Decimal = Decimal("1")
+    min_share_balance: Decimal = Decimal("0.85")
+    min_bid_price: Decimal = Decimal("0.10")
+    round_budget: Decimal = Decimal("25")
     ladder_levels: int = 3
     ladder_spacing: Decimal = Decimal("0.01")
     # Join the touch on a side once its mid is this far below the other.
@@ -216,8 +230,28 @@ class Config:
             raise ConfigError("max_runtime_seconds must be positive")
         if self.redeem_max_attempts < 1:
             raise ConfigError("redeem_max_attempts must be at least 1")
-        if self.strategy not in ("single", "ladder"):
-            raise ConfigError("strategy must be single or ladder")
+        if self.strategy not in ("single", "ladder", "dual_bid"):
+            raise ConfigError("strategy must be single, ladder, or dual_bid")
+        if self.dual_bid_start_seconds < 0 or self.dual_bid_stop_seconds <= self.dual_bid_start_seconds:
+            raise ConfigError("dual_bid quote window is invalid")
+        if self.dual_bid_levels < 1 or self.dual_bid_levels > 20:
+            raise ConfigError("dual_bid_levels must be from 1 to 20")
+        if self.dual_bid_clip <= 0 or self.dual_bid_max_clip < self.dual_bid_clip:
+            raise ConfigError("dual_bid clip sizes are invalid")
+        if self.dual_bid_max_clip > 100:
+            raise ConfigError("dual_bid_max_clip must be at most 100")
+        if self.dual_bid_requote_ms < 0:
+            raise ConfigError("dual_bid_requote_ms must be non-negative")
+        if self.target_pair_cost <= 0 or self.target_pair_cost > 1:
+            raise ConfigError("target_pair_cost must be in (0, 1]")
+        if self.pair_cost_stop < self.target_pair_cost or self.pair_cost_stop > Decimal("2"):
+            raise ConfigError("pair_cost_stop must sit between the target and 2")
+        if self.min_share_balance <= 0 or self.min_share_balance > 1:
+            raise ConfigError("min_share_balance must be in (0, 1]")
+        if self.min_bid_price <= 0 or self.min_bid_price >= 1:
+            raise ConfigError("min_bid_price must sit inside (0, 1)")
+        if self.round_budget <= 0:
+            raise ConfigError("round_budget must be positive")
         if self.series_slug not in {"btc-updown-5m", "btc-updown-15m", "btc-updown-1h"}:
             raise ConfigError(
                 "series_slug must be btc-updown-5m, btc-updown-15m, or btc-updown-1h"
@@ -306,6 +340,13 @@ _DECIMAL_FIELDS = {
     "winner_min_price",
     "max_fee_gwei",
     "priority_fee_gwei",
+    "dual_bid_clip",
+    "dual_bid_max_clip",
+    "target_pair_cost",
+    "pair_cost_stop",
+    "min_share_balance",
+    "min_bid_price",
+    "round_budget",
 }
 _INT_FIELDS = {
     "stale_after_ms",
@@ -331,6 +372,10 @@ _INT_FIELDS = {
     "late_window_seconds",
     "split_confirm_timeout_ms",
     "gas_limit",
+    "dual_bid_start_seconds",
+    "dual_bid_stop_seconds",
+    "dual_bid_levels",
+    "dual_bid_requote_ms",
 }
 _BOOL_FIELDS = {
     "trade_through_fills",

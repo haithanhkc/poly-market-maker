@@ -478,9 +478,19 @@ def _shutdown_live(engine, client, creds, notes: list[str], cancel_all) -> None:
 def _send_new_quotes(
     engine, client, post_only_sells, creds, notes: list[str], *, _retry: bool = True
 ) -> None:
+    if getattr(engine.config, "strategy", "") == "dual_bid":
+        message = "dual_bid is paper-only; no order was sent"
+        if message not in notes:
+            notes.append(message)
+        return
     pending = []
     for order in engine.state.orders.values():
         if order.status != "queued" or getattr(order, "sent", False):
+            continue
+        if getattr(order, "side", "sell") == "buy":
+            message = "skipped a buy order; live posting is sells only"
+            if message not in notes:
+                notes.append(message)
             continue
         market = engine.state.markets[order.market_id]
         token = market.up_token_id if order.outcome == "up" else market.down_token_id

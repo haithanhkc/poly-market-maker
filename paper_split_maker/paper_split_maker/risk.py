@@ -60,8 +60,11 @@ def working_orders(
 
 
 def reserved(state: State, market: Market, outcome: str) -> Decimal:
+    """Shares a working sell still holds. A resting bid does not reserve inventory."""
     total = ZERO
     for order in working_orders(state, market.market_id):
+        if getattr(order, "side", "sell") == "buy":
+            continue
         if order.outcome == outcome:
             total += order.remaining
     return total
@@ -118,8 +121,23 @@ def market_contribution(
         return ZERO
     up_terms = ZERO
     down_terms = ZERO
+    buy_up = ZERO
+    buy_down = ZERO
+    buy_cost = ZERO
     orders = working_orders(state, market.market_id, extra)
     for order in orders:
+        if getattr(order, "side", "sell") == "buy":
+            # A cancel we already requested does not fill in the paper model.
+            if order.status == "cancel_requested":
+                continue
+            if order.outcome == "up":
+                buy_up += order.remaining
+            elif order.outcome == "down":
+                buy_down += order.remaining
+            else:
+                raise InvariantError(f"bad outcome {order.outcome}")
+            buy_cost += floor_cash(order.remaining * order.price)
+            continue
         # The other side's planned ask covers this price, so resolution still
         # pays about 1 for the pair. Do not value those shares as a total loss.
         size = ZERO if _pair_planned(state, market, order) else order.remaining
@@ -130,8 +148,8 @@ def market_contribution(
             down_terms += term
         else:
             raise InvariantError(f"bad outcome {order.outcome}")
-    value_up = market.up + up_terms
-    value_down = market.down + down_terms
+    value_up = market.up + up_terms + buy_up
+    value_down = market.down + down_terms + buy_down
     known = (
         market.status == "resolved"
         and market.winner in ("up", "down")
@@ -145,6 +163,9 @@ def market_contribution(
         value = value_up if value_up <= value_down else value_down
     if market.reserve_active:
         value -= market.operational_reserve_amount
+    # Resting bids spend cash whichever side wins. The tokens are already in
+    # the two branches above, so the worse branch keeps the hedge.
+    value -= buy_cost
     return value
 
 
@@ -183,6 +204,8 @@ def best_case_equity(state: State) -> Decimal:
         up_proceeds = ZERO
         down_proceeds = ZERO
         for order in working_orders(state, market.market_id):
+            if getattr(order, "side", "sell") == "buy":
+                continue
             proceeds = net_maker_proceeds(
                 order.remaining, order.price, state.maker_fee_rate
             )

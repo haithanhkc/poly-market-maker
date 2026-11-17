@@ -40,6 +40,12 @@ class LevelBook:
                 return size
         return ZERO
 
+    def bid_size_at(self, price: Decimal) -> Decimal:
+        for level, size in self.bids:
+            if level == price:
+                return size
+        return ZERO
+
     def to_dict(self) -> dict:
         return {
             "ts_ms": self.ts_ms,
@@ -100,6 +106,13 @@ class Market:
     sold_up_proceeds: Decimal = ZERO
     sold_down_shares: Decimal = ZERO
     sold_down_proceeds: Decimal = ZERO
+    bought_up_shares: Decimal = ZERO
+    bought_up_cost: Decimal = ZERO
+    bought_down_shares: Decimal = ZERO
+    bought_down_cost: Decimal = ZERO
+    buy_up_fills: int = 0
+    buy_down_fills: int = 0
+    quoted_as: str = ""
     session_stopped: bool = False
     pause_until_ms: int = 0
     last_requote_ts: int = -(10**18)
@@ -149,6 +162,13 @@ class Market:
             "sold_up_proceeds": money(self.sold_up_proceeds),
             "sold_down_shares": money(self.sold_down_shares),
             "sold_down_proceeds": money(self.sold_down_proceeds),
+            "bought_up_shares": money(self.bought_up_shares),
+            "bought_up_cost": money(self.bought_up_cost),
+            "bought_down_shares": money(self.bought_down_shares),
+            "bought_down_cost": money(self.bought_down_cost),
+            "buy_up_fills": self.buy_up_fills,
+            "buy_down_fills": self.buy_down_fills,
+            "quoted_as": self.quoted_as,
             "session_stopped": self.session_stopped,
             "pause_until_ms": self.pause_until_ms,
             "last_requote_ts": self.last_requote_ts,
@@ -194,6 +214,13 @@ class Market:
             sold_up_proceeds=_d(data.get("sold_up_proceeds", "0")),
             sold_down_shares=_d(data.get("sold_down_shares", "0")),
             sold_down_proceeds=_d(data.get("sold_down_proceeds", "0")),
+            bought_up_shares=_d(data.get("bought_up_shares", "0")),
+            bought_up_cost=_d(data.get("bought_up_cost", "0")),
+            bought_down_shares=_d(data.get("bought_down_shares", "0")),
+            bought_down_cost=_d(data.get("bought_down_cost", "0")),
+            buy_up_fills=int(data.get("buy_up_fills", 0)),
+            buy_down_fills=int(data.get("buy_down_fills", 0)),
+            quoted_as=str(data.get("quoted_as") or ""),
             session_stopped=bool(data.get("session_stopped", False)),
             pause_until_ms=int(data.get("pause_until_ms", 0)),
             last_requote_ts=int(data.get("last_requote_ts", -(10**18))),
@@ -217,12 +244,14 @@ class Order:
     cancel_ready_ts: Optional[int] = None
     risk_reducing: bool = False
     exchange_id: str = ""
+    side: str = "sell"
 
     def to_dict(self) -> dict:
         return {
             "order_id": self.order_id,
             "market_id": self.market_id,
             "outcome": self.outcome,
+            "side": self.side,
             "price": money(self.price),
             "size": money(self.size),
             "remaining": money(self.remaining),
@@ -242,6 +271,7 @@ class Order:
             order_id=data["order_id"],
             market_id=data["market_id"],
             outcome=data["outcome"],
+            side=str(data.get("side") or "sell"),
             price=_d(data["price"]),
             size=_d(data["size"]),
             remaining=_d(data["remaining"]),

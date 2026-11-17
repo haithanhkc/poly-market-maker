@@ -98,7 +98,7 @@ def build_summary(
                 "orders": orders,
             }
         )
-    return {
+    summary = {
         "mode": mode,
         "resumed": resumed,
         "live_orders": mode == "live",
@@ -135,6 +135,16 @@ def build_summary(
         "disclaimer_en": DISCLAIMER_EN,
         "disclaimer_vi": DISCLAIMER_VI,
     }
+    return _with_rounds(summary, state)
+
+
+def _with_rounds(summary: dict, state: State) -> dict:
+    from paper_split_maker.dual_bid import dual_summary
+
+    block = dual_summary(state.markets.values())
+    if block:
+        summary.update(block)
+    return summary
 
 
 def write_summary(directory: Path, summary: dict) -> Path:

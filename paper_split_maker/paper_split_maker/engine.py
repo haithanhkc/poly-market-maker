@@ -12,8 +12,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
+from paper_split_maker.chain_data import window_seconds
 from paper_split_maker.config import Config
-from paper_split_maker.decimal_utils import ONE, ZERO, ceil_tick, money, on_grid, qdown
+from paper_split_maker.decimal_utils import ONE, ZERO, ceil_tick, floor_cash, money, on_grid, qdown
+from paper_split_maker.dual_bid import plan_bids, quote_phase, round_open_ms
 from paper_split_maker.logs import LogWriter
 from paper_split_maker.models import (
     WORKING_ORDER_STATUSES,
@@ -31,6 +33,7 @@ from paper_split_maker.quotes import (
 from paper_split_maker.risk import (
     assert_ledger_invariants,
     best_case_equity,
+    conservative_fee,
     net_maker_proceeds,
     reserved,
     session_loss,
@@ -567,6 +570,8 @@ class Engine:
         book.received_ms = self.state.now_ms
         self._record_mid(market, outcome)
         self._emit(kind="book", market=market, outcome=outcome, reason="ok")
+        if self.config.strategy == "dual_bid":
+            return
         # Reprice when the leftover leg's own book moves. The other side's
         # book does not change this bid.
         naked = self._naked_leg(market)
@@ -612,7 +617,8 @@ class Engine:
         if outcome not in {"up", "down"}:
             self._emit(kind="trade_ignored", market=market, reason="bad_outcome")
             return
-        if str(event.get("taker_side") or "").upper() != "BUY":
+        taker = str(event.get("taker_side") or "").upper()
+        if taker not in {"BUY", "SELL"}:
             self._emit(
                 kind="trade_ignored",
                 market=market,
@@ -630,9 +636,14 @@ class Engine:
         if volume <= 0:
             self._emit(kind="trade_ignored", market=market, reason="dust")
             return
+        if taker == "SELL":
+            self._fill_bids(market, outcome, price, volume, trade_ts)
+            return
         resting = []
         for order in self.state.orders.values():
             if order.market_id != market.market_id or order.outcome != outcome:
+                continue
+            if getattr(order, "side", "sell") == "buy":
                 continue
             if order.status not in {"live", "cancel_requested"}:
                 continue
@@ -706,6 +717,73 @@ class Engine:
             return
         self._apply_fill(market, order, size, synthetic=True)
 
+    def _fill_bids(
+        self,
+        market: Market,
+        outcome: str,
+        price: Decimal,
+        volume: Decimal,
+        trade_ts: int,
+    ) -> None:
+        """SELL prints fill our bids after the queue, or when price trades through."""
+        resting = []
+        for order in self.state.orders.values():
+            if order.market_id != market.market_id or order.outcome != outcome:
+                continue
+            if getattr(order, "side", "sell") != "buy":
+                continue
+            if order.status != "live":
+                continue
+            if order.live_ts is None or trade_ts < order.live_ts:
+                continue
+            if price > order.price:
+                continue
+            resting.append(order)
+        resting.sort(key=lambda order: (-order.price, order.submit_ts, order.order_id))
+        if not resting:
+            self._emit(
+                kind="trade_ignored",
+                market=market,
+                outcome=outcome,
+                price=price,
+                size=volume,
+                reason="no_resting_order",
+            )
+            return
+        for order in resting:
+            if volume <= 0:
+                break
+            if price < order.price:
+                if order.queue_ahead > 0:
+                    cleared = order.queue_ahead
+                    order.queue_ahead = ZERO
+                    self._emit(
+                        kind="queue_consume",
+                        market=market,
+                        order=order,
+                        size=cleared,
+                        reason="trade_through",
+                    )
+            elif order.queue_ahead > 0:
+                used = order.queue_ahead if order.queue_ahead < volume else volume
+                order.queue_ahead -= used
+                volume -= used
+                self._emit(
+                    kind="queue_consume",
+                    market=market,
+                    order=order,
+                    size=used,
+                    reason="queue_ahead",
+                )
+            if volume <= 0 or order.remaining <= 0:
+                continue
+            fill = order.remaining if order.remaining < volume else volume
+            fill = qdown(fill, Decimal("0.000001"))
+            if fill <= 0:
+                continue
+            self._apply_fill(market, order, fill, synthetic=False)
+            volume -= fill
+
     def _apply_fill(
         self,
         market: Market,
@@ -715,6 +793,9 @@ class Engine:
         synthetic: bool,
         source: str = "model",
     ) -> None:
+        if getattr(order, "side", "sell") == "buy":
+            self._apply_buy_fill(market, order, size, source=source)
+            return
         proceeds = net_maker_proceeds(size, order.price, self.state.maker_fee_rate)
         self.state.cash += proceeds
         market.net_cash_flow += proceeds
@@ -752,6 +833,47 @@ class Engine:
                 if synthetic
                 else ("exchange_fill" if source == "exchange" else "queue_model_fill")
             ),
+        )
+
+    def _apply_buy_fill(
+        self, market: Market, order: Order, size: Decimal, *, source: str = "model"
+    ) -> None:
+        gross = floor_cash(size * order.price)
+        fee = conservative_fee(size, order.price, self.state.maker_fee_rate)
+        cost = gross + fee
+        if cost > self.state.cash:
+            self._emit(
+                kind="reject",
+                market=market,
+                order=order,
+                size=size,
+                reason="insufficient_cash",
+            )
+            return
+        self.state.cash -= cost
+        market.net_cash_flow -= cost
+        if order.outcome == "up":
+            market.up += size
+            market.bought_up_shares += size
+            market.bought_up_cost += cost
+            market.buy_up_fills += 1
+        else:
+            market.down += size
+            market.bought_down_shares += size
+            market.bought_down_cost += cost
+            market.buy_down_fills += 1
+        order.remaining -= size
+        if order.remaining <= 0:
+            order.remaining = ZERO
+            order.status = "filled"
+        market.last_action_ts = self.state.now_ms
+        self._emit(
+            kind="fill",
+            market=market,
+            order=order,
+            size=size,
+            price=order.price,
+            reason="exchange_fill" if source == "exchange" else "queue_model_fill",
         )
 
     def _on_resolution(self, event: dict) -> None:
@@ -849,7 +971,157 @@ class Engine:
             market, "manual_cancel", outcome=str(outcome) if outcome else None
         )
 
+    def _decide_dual_bid(self, market: Market) -> None:
+        """Buy both sides during the round. Never split, sell, or merge."""
+        if market.status == "redeemed":
+            return
+        market.quoted_as = "dual_bid"
+        self._check_kill_switch()
+        self._check_realized_loss()
+        if self.state.killed:
+            self._cancel_market(market, "killed")
+            self._skip(market, "killed")
+            return
+        if self.state.mismatch_stop:
+            self.state.mismatch_stop = False
+        self._refresh_expiry(market)
+        if market.status == "resolved":
+            self._cancel_market(market, "resolved")
+            self._try_redeem(market)
+            return
+        if market.status == "expired_unresolved":
+            self._cancel_market(market, "expired_unresolved")
+            self._merge_free(market, "expired_unresolved")
+            self._skip(market, "expired_unresolved")
+            return
+        if not self._feeds_ok(market):
+            reason = "disconnected" if not self.state.feed_up else "stale_feed"
+            self._cancel_market(market, reason)
+            self._skip(market, reason)
+            return
+        if not market.accepting_orders:
+            self._cancel_market(market, "not_accepting")
+            self._skip(market, "not_accepting")
+            return
+        if self.state.now_ms < market.pause_until_ms:
+            self._cancel_market(market, "reject_pause")
+            self._skip(market, "reject_pause")
+            return
+        window = window_seconds(self.config.series_slug)
+        open_ms = round_open_ms(market.slug, market.end_ts_ms, window)
+        phase = quote_phase(
+            self.state.now_ms,
+            open_ms,
+            self.config.dual_bid_start_seconds,
+            self.config.dual_bid_stop_seconds,
+        )
+        if phase != "open":
+            self._cancel_market(market, "quote_window")
+            self._skip(market, "before_open" if phase == "before" else "quote_window_closed")
+            return
+        if (
+            self._working_bids(market)
+            and self.state.now_ms
+            < market.last_requote_ts + self.config.dual_bid_requote_ms
+        ):
+            return
+        self._sync_dual_bids(market)
+        market.last_requote_ts = self.state.now_ms
+
+    def _working_bids(self, market: Market) -> list[Order]:
+        return [
+            order
+            for order in self.state.orders.values()
+            if order.market_id == market.market_id
+            and getattr(order, "side", "sell") == "buy"
+            and order.status in WORKING_ORDER_STATUSES
+        ]
+
+    def _sync_dual_bids(self, market: Market) -> None:
+        cap = self.config.round_budget
+        if self.config.per_market_budget < cap:
+            cap = self.config.per_market_budget
+        spent = market.bought_up_cost + market.bought_down_cost
+        left = cap - spent
+        if left < 0:
+            left = ZERO
+        tick = market.tick_size if market.tick_size > 0 else self.config.default_tick
+        desired = plan_bids(
+            up_bids=market.up_book.bids,
+            up_ask=market.up_book.best_ask(),
+            down_bids=market.down_book.bids,
+            down_ask=market.down_book.best_ask(),
+            tick=tick,
+            levels=self.config.dual_bid_levels,
+            clip=self.config.dual_bid_clip,
+            max_clip=self.config.dual_bid_max_clip,
+            min_price=self.config.min_bid_price,
+            up_shares=market.bought_up_shares,
+            up_cost=market.bought_up_cost,
+            down_shares=market.bought_down_shares,
+            down_cost=market.bought_down_cost,
+            target_pair_cost=self.config.target_pair_cost,
+            pair_cost_stop=self.config.pair_cost_stop,
+            min_share_balance=self.config.min_share_balance,
+            budget_left=left,
+        )
+        wanted = {(bid.outcome, bid.price): bid for bid in desired}
+        for order in self._working_bids(market):
+            bid = wanted.get((order.outcome, order.price))
+            if (
+                bid is not None
+                and bid.size == order.size
+                and order.status != "cancel_requested"
+            ):
+                wanted.pop((order.outcome, order.price))
+                continue
+            self._request_cancel(market, order, "reprice")
+        placed = False
+        for bid in wanted.values():
+            if self._place_bid(market, bid):
+                placed = True
+        if not placed and not self._working_bids(market):
+            self._skip(market, "no_bid")
+
+    def _place_bid(self, market: Market, bid) -> bool:
+        notional = floor_cash(bid.size * bid.price)
+        if notional <= 0 or self.state.cash < notional:
+            self._skip(market, "cash", bid.outcome, bid.price)
+            return False
+        self.state.order_seq += 1
+        probe = Order(
+            order_id=f"{market.market_id}-{bid.outcome}-bid-{self.state.order_seq}",
+            market_id=market.market_id,
+            outcome=bid.outcome,
+            price=bid.price,
+            size=bid.size,
+            remaining=bid.size,
+            queue_ahead=bid.queue_ahead if bid.queue_ahead > 0 else ZERO,
+            status="queued",
+            submit_ts=self.state.now_ms,
+            side="buy",
+        )
+        if worst_case_equity(self.state, extra=[probe]) < self.state.loss_floor:
+            self.state.order_seq -= 1
+            self._skip(market, "loss_budget", bid.outcome, bid.price)
+            return False
+        self.state.orders[probe.order_id] = probe
+        market.last_action_ts = self.state.now_ms
+        self._skip_once.clear()
+        self._emit(
+            kind="quote_submit",
+            market=market,
+            order=probe,
+            size=bid.size,
+            price=bid.price,
+            reason="dual_bid",
+        )
+        return True
+
     def _decide(self, market: Market) -> None:
+        if self.config.strategy == "dual_bid":
+            self._decide_dual_bid(market)
+            return
         if market.status == "redeemed":
             return
         self._check_kill_switch()

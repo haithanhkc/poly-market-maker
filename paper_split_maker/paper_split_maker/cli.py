@@ -43,6 +43,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="paper poll window; live uses max_runtime_seconds in the config",
     )
+    parser.add_argument(
+        "--strategy",
+        choices=("single", "ladder", "dual_bid"),
+        default=None,
+        help="override the config strategy; dual_bid is paper-only",
+    )
     parser.add_argument("--live", action="store_true")
     parser.add_argument(
         "--check-connection",
@@ -79,8 +85,16 @@ def _load(args):
     return settings.config
 
 
+def _apply_strategy(config, args):
+    choice = getattr(args, "strategy", None)
+    if choice:
+        config.strategy = choice
+        config.validate()
+    return config
+
+
 def _run_paper(args) -> int:
-    config = _load(args)
+    config = _apply_strategy(_load(args), args)
     if config.live:
         print("config has live:true. Refusing to trade without --live.")
         return 2
@@ -114,7 +128,10 @@ def _credential_env(config_path: Path | None) -> dict:
 
 
 def _run_live(args) -> int:
-    config = _load(args)
+    config = _apply_strategy(_load(args), args)
+    if config.strategy == "dual_bid":
+        print("dual_bid is paper-only and does not send orders.")
+        return 2
     allowed, reason = live_gates(
         config_live=config.live,
         cli_live=True,

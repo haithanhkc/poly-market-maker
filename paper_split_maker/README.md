@@ -29,6 +29,16 @@ python -m paper_split_maker --config config.paper.json --out ..\runs\paper --max
 
 That command does not send orders. Paper reads `PREDICT_NETWORK` and `PREDICT_API_KEY` from `.env` (or the process environment) and uses them for the public book. `mainnet` calls `https://api.predict.fun` with the `x-api-key` header. Leaving the network unset stays on testnet, which has no `btc-updown-5m` series. Discovery errors, the round count, and `opened` are printed on stderr and stored in `summary.json`. A window that has already started is skipped; the next one is loaded during `split_lead_seconds` (300 unless `BOT_SPLIT_LEAD` is set).
 
+`strategy=dual_bid` is a separate paper mode. It does not split or sell. After the round opens it posts a post-only bid ladder on Up and on Down, refreshes it with the book, and holds the shares until resolution. New bids start at `dual_bid_start_seconds` (8) and are pulled at `dual_bid_stop_seconds` (275). A bid is placed only when the other side's average price plus that bid is at most `target_pair_cost` (0.97). The heavier side stops when the share balance `min/max` is below 0.85 or the matched pair cost reaches 1. Prices under 0.10 are skipped. Each round is capped by `round_budget` (25 USDT) and by the existing account loss floor. The ladder session-loss number is not applied here; it is sized for the sell strategy and is smaller than one bid.
+
+Fills are modeled from the public trade prints the paper loop already polls (`/v1/markets/{id}/matches` and the order book), not from a private user channel and not from `wss://ws.predict.fun/ws`. Our bid is last in the queue that was displayed at that price when we posted. A SELL print at our price consumes that queue and then fills us at our bid. A SELL print below our price treats the queue as already swept and can fill us at our bid. BUY prints do not fill bids. Maker fee is 0 in this model, and a cancel we have requested does not fill. `config.paper.json` polls every 2 seconds, and `dual_bid_requote_ms` is 1500, so this command reprices on that 2-second poll. That is not the venue matching engine.
+
+```powershell
+python -m paper_split_maker --config config.paper.json --strategy dual_bid --out runs\x --max-markets 5 --duration-seconds 1800
+```
+
+`summary.json` then has one `rounds` row per session (fills per side, average prices, pair cost, matched shares, balance, excess, PnL, winner) and a `round_totals` object. PnL is filled in when the round redeems. The command does not send orders. `--live` with `dual_bid` is refused.
+
 Check the key, the login, and the USDT balance without placing an order. The JSON it prints does not contain the key or the JWT:
 
 ```powershell
@@ -95,7 +105,7 @@ Two files. Anything omitted uses the default in `paper_split_maker/config.py`. A
 
 | Param | Live value | Meaning |
 | --- | --- | --- |
-| `strategy` | ladder | `single` is the old one-order quote. Both shipped configs use `ladder` |
+| `strategy` | ladder | `single` is the old one-order quote. `dual_bid` is the paper buy-both mode. Both shipped configs use `ladder` |
 | `initial_capital` | 59 | Bankroll locked into the ledger |
 | `max_loss_fraction` | 0.20 | Daily loss stop at 11.80 (floor 47.20). Wide enough that a 5-share sell near mid is allowed |
 | `session_max_loss` | 6 | Stop one session after 6 USDT of loss, then merge |
