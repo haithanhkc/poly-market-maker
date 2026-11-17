@@ -1,5 +1,6 @@
 # Optional. Paper mode does not need these.
-py-clob-client-v2
+# predict-sdk signs orders and sends split, merge, and redeem on BNB.
+predict-sdk
 web3
 websockets
-polymarket
+eth-account

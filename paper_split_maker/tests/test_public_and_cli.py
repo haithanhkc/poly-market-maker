@@ -15,7 +15,6 @@ from paper_split_maker.normalize import (
     gamma_market_event,
 )
 from paper_split_maker.public_client import (
-    GAMMA,
     PublicDataError,
     PublicReadClient,
     UrllibTransport,
@@ -227,18 +226,18 @@ class MapTransport:
 
     def get_json(self, url: str):
         self.urls.append(url)
-        if url.startswith(GAMMA):
-            return _gamma(endDate="2030-01-01T00:00:00Z")
-        if "/book?" in url:
+        if "/rounds?" in url:
+            return {"data": [_active_round()]}
+        if "/orderbook" in url:
             return {
-                "timestamp": "1700000003000",
-                "hash": "book-1",
-                "bids": [{"price": "0.48", "size": "100"}],
-                "asks": [{"price": "0.52", "size": "10"}],
-                "tick_size": "0.01",
-                "min_order_size": "5",
+                "data": {
+                    "marketId": 11,
+                    "updateTimestampMs": 1700000003000,
+                    "bids": [["0.48", "100"]],
+                    "asks": [["0.52", "10"]],
+                }
             }
-        if "/v2/trades?" in url:
+        if "/matches" in url:
             self.trade_calls += 1
             if self.trade_calls == 1:
                 return {"data": []}
@@ -262,9 +261,33 @@ class MapTransport:
                     },
                 ]
             }
-        if "/v2/resolutions?" in url:
-            return {"data": []}
+        if url.rstrip("/").endswith("/markets/11"):
+            return {"data": {"id": 11, "status": "OPEN"}}
         raise PublicDataError("unexpected url", status=404)
+
+
+def _active_round():
+    """The window that contains the paper clock 1700000000."""
+    start = (1_700_000_000 // 300) * 300
+    return {
+        "startsAt": start,
+        "endsAt": 1_893_456_000,
+        "isNegRisk": False,
+        "isYieldBearing": False,
+        "markets": [
+            {
+                "id": 11,
+                "conditionId": "0xabc",
+                "decimalPrecision": 2,
+                "feeRateBps": 200,
+                "tradingStatus": "OPEN",
+                "outcomes": [
+                    {"name": "Up", "indexSet": 1, "onChainId": "111"},
+                    {"name": "Down", "indexSet": 2, "onChainId": "222"},
+                ],
+            }
+        ],
+    }
 
 
 def test_paper_session_is_bounded_and_dedupes_trades(tmp_path):

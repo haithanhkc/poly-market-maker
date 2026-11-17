@@ -14,11 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from paper_split_maker.chain_data import (
-    encode_split,
-    position_target,
-    shares_to_base_units,
-)
+from paper_split_maker.chain_data import position_plan, window_seconds
 from paper_split_maker.config import Config
 from paper_split_maker.credentials import Credentials
 from paper_split_maker.engine import is_post_only_cross
@@ -168,6 +164,14 @@ def _lead_ms(config) -> int:
     return int(getattr(config, "split_lead_seconds", 0) or 0) * 1000
 
 
+def _series_name(config) -> str:
+    return str(getattr(config, "series_slug", "") or "btc-updown-5m")
+
+
+def _window_s(config) -> int:
+    return window_seconds(_series_name(config))
+
+
 def _runtime_seconds(config) -> int:
     """Hard wall-clock cap. The duration flag must not end a session early."""
     runtime = int(getattr(config, "max_runtime_seconds", 2400) or 2400)
@@ -214,7 +218,7 @@ def _note_session_done(engine, market) -> None:
 
 
 def _apply_wallet_capital(config, creds, reader) -> None:
-    """Replace the split-based bankroll with pUSD when the wallet can fund it.
+    """Replace the split-based bankroll with USDT when the wallet can fund it.
 
     Called before the ledger is created. A failed read keeps the tuned capital.
     The private key is not used and is not logged.
@@ -225,10 +229,13 @@ def _apply_wallet_capital(config, creds, reader) -> None:
         return
     if reader is None:
         try:
-            from paper_split_maker.chain_send import pusd_balance_shares
+            from paper_split_maker.chain_send import collateral_balance_shares
         except Exception:
             return
-        reader = pusd_balance_shares
+        network = getattr(creds, "network", "testnet")
+        reader = lambda owner, _network=network: collateral_balance_shares(
+            owner, network=_network
+        )
     try:
         balance = reader(creds.funder)
     except Exception:
@@ -278,7 +285,12 @@ def run_confirmed_live(
     ws_queue: queue.Queue = queue.Queue()
     ws_stop = threading.Event()
     ws_assets: list[str] = []
-    ws_thread = None if client is not None else _start_market_ws(ws_assets, ws_queue, ws_stop)
+    ws_thread = None if client is not None else _start_market_ws(
+        ws_assets,
+        ws_queue,
+        ws_stop,
+        network=getattr(creds, "network", "testnet"),
+    )
     notes = [
         "Live session on the configured funder. Orders are post-only sells.",
         describe_user_subscribe(creds.funder, max_markets),
@@ -469,12 +481,17 @@ def _send_new_quotes(
             continue
         market = engine.state.markets[order.market_id]
         token = market.up_token_id if order.outcome == "up" else market.down_token_id
+        route = (getattr(engine, "market_routes", {}) or {}).get(order.market_id, {})
         pending.append(
             {
                 "token_id": token,
                 "price": str(order.price),
                 "size": str(order.remaining),
                 "tick_size": str(market.tick_size),
+                "fee_rate_bps": int(route.get("fee_rate_bps") or 0),
+                "is_neg_risk": bool(route.get("neg_risk")),
+                "is_yield_bearing": bool(route.get("yield_bearing")),
+                "decimal_precision": int(route.get("decimal_precision") or 2),
                 "order": order,
             }
         )
@@ -519,6 +536,10 @@ def _post_quote_batch(engine, client, sender, pending, creds, notes: list[str]) 
                     "price": item["price"],
                     "size": item["size"],
                     "tick_size": item["tick_size"],
+                    "fee_rate_bps": item.get("fee_rate_bps") or 0,
+                    "is_neg_risk": bool(item.get("is_neg_risk")),
+                    "is_yield_bearing": bool(item.get("is_yield_bearing")),
+                    "decimal_precision": item.get("decimal_precision") or 2,
                 }
                 for item in pending
             ],
@@ -652,9 +673,11 @@ def _poll_public(
     from paper_split_maker.normalize import clob_book_event
 
     now_s = stamp // 1000
-    window = (now_s // 300) * 300
-    next_open = window + 300
-    current_slug = f"btc-updown-5m-{window}"
+    window_s = _window_s(config)
+    series = _series_name(config)
+    window = (now_s // window_s) * window_s
+    next_open = window + window_s
+    current_slug = f"{series}-{window}"
     if current_slug not in engine.state.markets and _market_by_slug(engine, current_slug) is None:
         _note_skipped_start(engine, current_slug, notes)
     _forget_missed_sessions(engine, stamp, notes)
@@ -810,7 +833,10 @@ def _confirm_splits(engine, creds, stamp: int, notes: list[str]) -> list[str]:
         settled_ids = getattr(engine, "split_settled", set())
         settled = slug in settled_ids or market.market_id in settled_ids
         try:
-            ok = settled or (creds.signature_type == 0 and eoa_confirmed(ident))
+            ok = settled or (
+                creds.signature_type == 0
+                and eoa_confirmed(ident, network=getattr(creds, "network", "testnet"))
+            )
         except Exception as exc:
             notes.append(creds.redact(f"split receipt failed: {exc}"))
             ok = False
@@ -870,7 +896,7 @@ def _abandon_unconfirmed_splits(engine, stamp: int, notes: list[str]) -> None:
         # Only a real unix end time implies an open. Synthetic ledgers use
         # small end timestamps and must not be abandoned by this clock.
         if open_s is None and market.end_ts_ms >= 1_000_000_000_000:
-            open_s = market.end_ts_ms // 1000 - 300
+            open_s = market.end_ts_ms // 1000 - _window_s(engine.config)
         if open_s is None or stamp < open_s * 1000 + timeout:
             continue
         amount = market.pending_split
@@ -914,9 +940,11 @@ def _consider_pre_split(
     _abandon_unconfirmed_splits(engine, stamp, notes)
     for market_id in engine.retire_finished():
         notes.append(f"retired unconfirmed session {market_id}")
-    window = (stamp // 1000 // 300) * 300
-    next_open = window + 300
-    slug = f"btc-updown-5m-{next_open}"
+    window_s = _window_s(config)
+    series = _series_name(config)
+    window = (stamp // 1000 // window_s) * window_s
+    next_open = window + window_s
+    slug = f"{series}-{next_open}"
     lead_ms = _lead_ms(config)
     if stamp >= next_open * 1000 - lead_ms:
         _flatten_for_rollover(engine, next_open, stamp, lead_ms=lead_ms)
@@ -988,10 +1016,10 @@ def _consider_pre_split(
         )
         if amount < minimum:
             notes.append(
-                f"{slug} not split; pUSD balance {available} is below the minimum"
+                f"{slug} not split; USDT balance {available} is below the minimum"
             )
             return
-        notes.append(f"{slug} split sized to the pUSD balance {amount}")
+        notes.append(f"{slug} split sized to the USDT balance {amount}")
     split_now = float(getattr(engine, "clock_now", 0) or (stamp / 1000))
     if _call_is_waiting(engine, "split", split_now):
         return
@@ -1015,10 +1043,11 @@ def _consider_pre_split(
             market.condition_id,
             str(amount),
             version,
-            bool(found[0].get("negRisk")),
+            bool(found[0].get("negRisk") or found[0].get("isNegRisk")),
             config.gas_limit,
             str(config.max_fee_gwei),
             str(config.priority_fee_gwei),
+            yield_bearing=bool(found[0].get("isYieldBearing")),
         )
     except Exception as exc:
         _record_call_failure(
@@ -1106,18 +1135,21 @@ def _candidate_slugs(config, now_s: int, max_markets: int) -> list[str]:
     slugs are honored only while they are still in the future; ``_load_market``
     drops one that has already started.
     """
+    series = _series_name(config)
+    prefix = series + "-"
     configured = []
     now_ms = int(now_s) * 1000
     for slug in config.market_slugs:
         text = str(slug)
         tail = text.rsplit("-", 1)[-1]
-        if text.startswith("btc-updown-5m-") and tail.isdigit():
+        if text.startswith(prefix) and tail.isdigit():
             if int(tail) * 1000 > now_ms:
                 configured.append(text)
     if configured:
         return configured[: max(max_markets, 1)]
-    start = (int(now_s) // 300) * 300
-    return [f"btc-updown-5m-{start + 300}"]
+    window_s = _window_s(config)
+    start = (int(now_s) // window_s) * window_s
+    return [f"{series}-{start + window_s}"]
 
 
 def _slug_open_s(slug: str):
@@ -1434,26 +1466,43 @@ def _forget_market(engine, market_id: str) -> None:
 
 def _remember_route(engine, market_id: str, payload: dict, condition_id: str) -> None:
     routes = getattr(engine, "market_routes", {})
+    if not isinstance(routes, dict):
+        routes = {}
     routes[market_id] = {
-        "version": str(payload.get("version") or "v1"),
-        "neg_risk": bool(payload.get("negRisk")),
+        "version": "predict",
+        "neg_risk": bool(payload.get("negRisk") or payload.get("isNegRisk")),
+        "yield_bearing": bool(
+            payload.get("isYieldBearing") or payload.get("yieldBearing")
+        ),
         "condition_id": condition_id,
+        "fee_rate_bps": int(payload.get("feeRateBps") or 0),
+        "decimal_precision": int(payload.get("decimalPrecision") or 2),
+        "predict_market_id": _predict_market_id(payload),
     }
     engine.market_routes = routes
 
 
+def _predict_market_id(payload: dict) -> str:
+    raw = payload.get("predictMarketId")
+    if raw is None and str(payload.get("id") or "").isdigit():
+        raw = payload.get("id")
+    return "" if raw is None else str(raw)
+
+
 def _remember_assets(engine, asset_ids: list[str]) -> None:
     wanted = []
+    routes = getattr(engine, "market_routes", {}) or {}
     for market in engine.state.markets.values():
-        for token in (market.up_token_id, market.down_token_id):
-            if token and token not in wanted:
-                wanted.append(token)
+        route = routes.get(market.market_id) or {}
+        ident = str(route.get("predict_market_id") or "")
+        if ident and ident not in wanted:
+            wanted.append(ident)
     if wanted != list(asset_ids):
         asset_ids[:] = wanted
 
 
 def _collateral_shares(engine, creds, notes: list[str]):
-    """On-chain pUSD, when a reader is configured. None means use the ledger cash.
+    """On-chain USDT, when a reader is configured. None means use the ledger cash.
 
     The live CLI turns the RPC read on. Tests inject ``collateral_balance``
     and never open a socket.
@@ -1467,12 +1516,13 @@ def _collateral_shares(engine, creds, notes: list[str]):
         if callable(fn):
             value = fn()
         else:
-            from paper_split_maker.chain_send import pusd_balance_shares
+            from paper_split_maker.chain_send import collateral_balance_shares
 
-            value = pusd_balance_shares(creds.funder)
+            network = getattr(creds, "network", "testnet")
+            value = collateral_balance_shares(creds.funder, network=network)
         return Decimal(str(value))
     except Exception as exc:
-        text = creds.redact(f"pUSD balance read failed: {exc}")
+        text = creds.redact(f"USDT balance read failed: {exc}")
         notes.append(text)
         _log_exchange_error(engine, "collateral", text)
         return None
@@ -1514,6 +1564,7 @@ def _flush_chain(engine, creds, notes: list[str]) -> None:
                 engine.config.gas_limit,
                 str(engine.config.max_fee_gwei),
                 str(engine.config.priority_fee_gwei),
+                yield_bearing=bool(route.get("yield_bearing")),
             )
             notes.append(f"{item['action']} submitted for {item['market_id']}")
         except Exception as exc:
@@ -1605,6 +1656,7 @@ class ChainWorker:
                 self.engine.config.gas_limit,
                 str(self.engine.config.max_fee_gwei),
                 str(self.engine.config.priority_fee_gwei),
+                yield_bearing=bool(route.get("yield_bearing")),
             )
         except Exception as exc:
             text = self.creds.redact(f"{action} failed: {exc}")
@@ -1813,12 +1865,22 @@ def drain_market_ws(engine, ws_queue, stamp: int, creds=None, notes: list[str] |
 
 
 def apply_market_frame(engine, frame, stamp: int, seq: int = 0) -> int:
-    from paper_split_maker.normalize import clob_book_event
+    from paper_split_maker.feeds import heartbeat_reply
+    from paper_split_maker.normalize import clob_book_event, complement_levels
+    from paper_split_maker.public_client import yes_book
 
     frames = frame if isinstance(frame, list) else [frame]
     applied = 0
     for item in frames:
         if not isinstance(item, dict):
+            continue
+        if heartbeat_reply(item) is not None:
+            continue
+        topic = str(item.get("topic") or "")
+        if topic.startswith("predictOrderbook/"):
+            applied += _apply_predict_book(
+                engine, item, stamp, seq + applied, clob_book_event, complement_levels, yes_book
+            )
             continue
         asset = str(item.get("asset_id") or "")
         market = None
@@ -1854,7 +1916,51 @@ def apply_market_frame(engine, frame, stamp: int, seq: int = 0) -> int:
     return applied
 
 
-def _start_market_ws(asset_ids: list[str], out_queue, stop) -> threading.Thread | None:
+def _apply_predict_book(engine, item, stamp, seq, clob_book_event, complement_levels, yes_book) -> int:
+    market_id = str(item.get("topic") or "").split("/", 1)[-1]
+    market = None
+    route = {}
+    routes = getattr(engine, "market_routes", {}) or {}
+    for candidate in engine.state.markets.values():
+        stored = routes.get(candidate.market_id) or {}
+        if str(stored.get("predict_market_id") or "") == market_id:
+            market = candidate
+            route = stored
+            break
+    if market is None:
+        return 0
+    try:
+        book = yes_book(item if "bids" in item or "asks" in item else {"data": item.get("data")})
+    except Exception:
+        return 0
+    precision = int(route.get("decimal_precision") or 2)
+    sides = {
+        "up": book,
+        "down": {
+            "timestamp": book.get("timestamp"),
+            "hash": f"{book.get('hash')}:down",
+            "bids": complement_levels(book.get("asks") or [], precision),
+            "asks": complement_levels(book.get("bids") or [], precision),
+        },
+    }
+    applied = 0
+    for outcome, payload in sides.items():
+        event = clob_book_event(
+            market.market_id,
+            outcome,
+            payload,
+            event_id=f"ws:{market.market_id}:{outcome}:{payload.get('hash')}:{stamp}:{seq}:{applied}",
+        )
+        if event is None:
+            continue
+        event["book_ts"] = event["ts"]
+        event["ts"] = stamp
+        engine.handle_event(event)
+        applied += 1
+    return applied
+
+
+def _start_market_ws(asset_ids: list[str], out_queue, stop, network: str = "testnet") -> threading.Thread | None:
     try:
         import websockets
     except ImportError:
@@ -1863,30 +1969,38 @@ def _start_market_ws(asset_ids: list[str], out_queue, stop) -> threading.Thread 
     def _run() -> None:
         import asyncio
 
-        from paper_split_maker.feeds import MARKET_WS, market_subscribe
+        from paper_split_maker.feeds import heartbeat_reply, market_subscriptions, market_ws
 
         async def loop() -> None:
             while not stop.is_set():
-                current = list(asset_ids)
+                current = [str(item) for item in asset_ids if str(item)]
                 if not current:
                     await asyncio.sleep(0.2)
                     continue
                 try:
-                    async with websockets.connect(MARKET_WS, ping_interval=None) as ws:
-                        await ws.send(json.dumps(market_subscribe(current)))
+                    async with websockets.connect(
+                        market_ws(network), ping_interval=None
+                    ) as ws:
+                        for message in market_subscriptions(current):
+                            await ws.send(json.dumps(message))
                         subscribed = list(current)
-                        next_ping = time.time() + 10
                         while not stop.is_set() and list(asset_ids) == subscribed:
-                            if time.time() >= next_ping:
-                                await ws.send("PING")
-                                next_ping = time.time() + 10
                             try:
                                 raw = await asyncio.wait_for(ws.recv(), timeout=1)
                             except asyncio.TimeoutError:
                                 continue
-                            if raw in {"PING", "PONG"}:
+                            if isinstance(raw, str):
+                                try:
+                                    parsed = json.loads(raw)
+                                except json.JSONDecodeError:
+                                    continue
+                            else:
+                                parsed = raw
+                            reply = heartbeat_reply(parsed) if isinstance(parsed, dict) else None
+                            if reply is not None:
+                                await ws.send(json.dumps(reply))
                                 continue
-                            out_queue.put(raw)
+                            out_queue.put(parsed)
                 except Exception as exc:
                     if stop.is_set():
                         return
@@ -1898,19 +2012,23 @@ def _start_market_ws(asset_ids: list[str], out_queue, stop) -> threading.Thread 
 
         asyncio.run(loop())
 
-    thread = threading.Thread(target=_run, name="polymarket-market-ws", daemon=True)
+    thread = threading.Thread(target=_run, name="predict-market-ws", daemon=True)
     thread.start()
     return thread
 
 
 def split_plan(
-    version: str, condition_id: str, shares: str, neg_risk: bool = False
+    version: str,
+    condition_id: str,
+    shares: str,
+    neg_risk: bool = False,
+    yield_bearing: bool = False,
 ) -> dict:
-    base = shares_to_base_units(shares)
-    return {
-        "action": "split",
-        "target": position_target(version, neg_risk),
-        "data": encode_split(version, condition_id, base),
-        "amount": shares,
-        "confirmed": False,
-    }
+    del version
+    return position_plan(
+        "split",
+        condition_id,
+        shares,
+        is_neg_risk=neg_risk,
+        is_yield_bearing=yield_bearing,
+    )

@@ -1,5 +1,6 @@
 {
   "live": true,
+  "series_slug": "btc-updown-5m",
   "strategy": "ladder",
   "initial_capital": "59",
   "max_loss_fraction": "0.20",

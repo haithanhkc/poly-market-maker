@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m paper_split_maker",
         description=(
-            "Split pUSD, post maker sells on Up and Down, reprice, "
+            "Split USDT, post maker sells on Up and Down, reprice, "
             "unwind a filled leg, then merge or redeem. "
             "Paper unless --live, --yes-i-understand-live-risk, and "
             "live:true are all set."
@@ -88,6 +88,23 @@ def _run_paper(args) -> int:
     return 0
 
 
+def _credential_env(config_path: Path | None) -> dict:
+    """Process env first, then PREDICT_* lines from the .env beside the config.
+
+    Values are not printed. A variable already set in the process wins.
+    """
+    env = dict(os.environ)
+    if config_path is None:
+        return env
+    from paper_split_maker.envfile import read_env
+
+    file_env = read_env(Path(config_path).resolve().parent / ".env")
+    for key, value in file_env.items():
+        if key.startswith("PREDICT_") and not str(env.get(key) or "").strip():
+            env[key] = value
+    return env
+
+
 def _run_live(args) -> int:
     config = _load(args)
     allowed, reason = live_gates(
@@ -109,7 +126,7 @@ def _run_live(args) -> int:
         print(f"live mode refused: {reason}. Staying paper-only.")
         return 2
     duration = args.duration_seconds or int(config.max_runtime_seconds)
-    creds = load_credentials(dict(os.environ))
+    creds = load_credentials(_credential_env(args.config))
     banner = {
         "mode": "live",
         "loss_floor": str(config.loss_floor()),
@@ -143,7 +160,7 @@ def _redeem_pending(path: Path) -> int:
     from paper_split_maker.live_runner import redeem_pending_once
     from paper_split_maker.normalize import resolution_settled
 
-    creds = load_credentials(dict(os.environ))
+    creds = load_credentials(_credential_env(args.config))
 
     def resolved(condition_id: str) -> bool:
         from paper_split_maker.public_client import PublicReadClient

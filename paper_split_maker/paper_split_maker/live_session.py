@@ -150,20 +150,16 @@ class LiveController:
     def plan_split(
         self, market_id: str, amount: Decimal, version: str, condition_id: str
     ) -> dict:
-        from paper_split_maker.chain_data import (
-            encode_split,
-            position_target,
-            shares_to_base_units,
-        )
+        from paper_split_maker.chain_data import position_plan
 
-        base = shares_to_base_units(str(amount))
-        plan = {
-            "action": "split",
-            "market_id": market_id,
-            "amount": str(amount),
-            "target": position_target(version, False),
-            "data": encode_split(version, condition_id, base),
-            "dry_run": self.dry_run,
-        }
+        plan = position_plan(
+            "split",
+            condition_id,
+            str(amount),
+            is_neg_risk=False,
+            is_yield_bearing=False,
+        )
+        plan["market_id"] = market_id
+        plan["dry_run"] = self.dry_run
         self.gateway.split(plan)
         return plan

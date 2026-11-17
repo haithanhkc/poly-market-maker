@@ -16,8 +16,9 @@ from pathlib import Path
 from paper_split_maker.config import Config, ConfigError
 from paper_split_maker.decimal_utils import D, qdown
 
-# Polymarket's BTC 5-minute book rejects a sell smaller than this.
-POLYMARKET_MIN_SIZE = Decimal("5")
+# The ladder never posts under 5 shares. predict.fun itself accepts a 1-share
+# sell and a buy worth at least 1 USDT; the 5-share grid is the strategy.
+LADDER_MIN_SHARES = Decimal("5")
 
 BOT_KEYS = (
     "BOT_CAPITAL",
@@ -32,18 +33,14 @@ BOT_KEYS = (
 
 # Returned only as "đã lưu" plus, for a long value, its last 4 characters.
 SECRET_KEYS = (
-    "POLY_PRIVATE_KEY",
-    "POLY_API_KEY",
-    "POLY_API_SECRET",
-    "POLY_API_PASSPHRASE",
-    "RELAYER_API_KEY",
-    "RELAYER_API_KEY_ADDRESS",
+    "PREDICT_PRIVATE_KEY",
+    "PREDICT_API_KEY",
 )
 
-# The live runner reads these. Funder and signature type are not secrets.
+# The live runner reads these. The account address and network are not secrets.
 WALLET_KEYS = SECRET_KEYS + (
-    "POLY_FUNDER",
-    "POLY_SIGNATURE_TYPE",
+    "PREDICT_ACCOUNT",
+    "PREDICT_NETWORK",
 )
 
 # Bubblebust (wallet 0x373b…), 3,488 splits, every one exactly 750 pUSD.
@@ -132,9 +129,9 @@ def write_wallet_values(path: Path, updates: dict) -> None:
 
 
 def clear_wallet_values(path: Path) -> None:
-    """Remove every wallet secret and the funder. Signature type goes back to EOA."""
+    """Remove the key, the API key, and the Predict account. Network goes back to testnet."""
     blank = {key: "" for key in WALLET_KEYS}
-    blank["POLY_SIGNATURE_TYPE"] = "0"
+    blank["PREDICT_NETWORK"] = "testnet"
     _write_keys(path, blank, allowed=WALLET_KEYS, skip_blank=False)
 
 
@@ -170,12 +167,15 @@ def wallet_public(env: dict) -> dict:
     from paper_split_maker.wallet_address import signer_address
 
     hints = {key: saved_hint(str(env.get(key) or "")) for key in SECRET_KEYS}
-    funder = str(env.get("POLY_FUNDER") or "").strip()
-    signature = str(env.get("POLY_SIGNATURE_TYPE") or "0").strip() or "0"
+    account = str(env.get("PREDICT_ACCOUNT") or "").strip()
+    network = str(env.get("PREDICT_NETWORK") or "testnet").strip() or "testnet"
+    signer = signer_address(str(env.get("PREDICT_PRIVATE_KEY") or ""))
     return {
-        "funder": funder,
-        "signer": signer_address(str(env.get("POLY_PRIVATE_KEY") or "")),
-        "signature_type": signature,
+        "funder": account or signer,
+        "signer": signer,
+        "network": network,
+        "signature_type": "0",
+        "predict_account": account,
         "hints": hints,
     }
 
@@ -202,17 +202,17 @@ def derive_from_split(split: Decimal) -> DerivedLadder:
     if split <= 0:
         raise ConfigError("split must be > 0")
     clip = _qdown_size(split * _MODAL_CLIP / _THEIR_SPLIT)
-    if clip < POLYMARKET_MIN_SIZE:
-        clip = POLYMARKET_MIN_SIZE if split >= POLYMARKET_MIN_SIZE else split
+    if clip < LADDER_MIN_SHARES:
+        clip = LADDER_MIN_SHARES if split >= LADDER_MIN_SHARES else split
     if clip > split:
         clip = split
     raw = split * _HEAVY_SIDE
-    if split >= POLYMARKET_MIN_SIZE and raw < POLYMARKET_MIN_SIZE:
-        budget = POLYMARKET_MIN_SIZE
+    if split >= LADDER_MIN_SHARES and raw < LADDER_MIN_SHARES:
+        budget = LADDER_MIN_SHARES
     else:
         budget = _qdown_size(raw)
-        if budget < POLYMARKET_MIN_SIZE <= split:
-            budget = POLYMARKET_MIN_SIZE
+        if budget < LADDER_MIN_SHARES <= split:
+            budget = LADDER_MIN_SHARES
     if budget > split:
         budget = split
     rungs = int(budget / clip) if clip > 0 else 1
@@ -240,7 +240,7 @@ def derive_from_split(split: Decimal) -> DerivedLadder:
 
 
 def apply_wallet_balance(config: Config, balance: Decimal) -> None:
-    """Use the wallet's pUSD as capital when no BOT_CAPITAL override is set.
+    """Use the wallet's USDT as capital when no BOT_CAPITAL override is set.
 
     A balance below the split is refused so the ledger is not created with a
     floor above the funds on hand. The measured daily stop then applies to the
@@ -250,7 +250,7 @@ def apply_wallet_balance(config: Config, balance: Decimal) -> None:
         return
     amount = D(balance)
     if amount < config.split_clip:
-        raise ConfigError("pUSD balance is below the split")
+        raise ConfigError("USDT balance is below the split")
     config.initial_capital = amount
     if config.per_market_budget > config.initial_capital:
         config.per_market_budget = config.initial_capital
@@ -353,7 +353,7 @@ def _apply_markets_and_mode(cfg: Config, env: dict, markets: int) -> int:
 
 
 def _qdown_size(value: Decimal) -> Decimal:
-    return qdown(value, POLYMARKET_MIN_SIZE)
+    return qdown(value, LADDER_MIN_SHARES)
 
 
 def _present(env: dict, name: str) -> str | None:
@@ -415,12 +415,12 @@ def _check_wallet(updates: dict[str, str]) -> None:
     for key, value in updates.items():
         if "\n" in value or "\r" in value:
             raise ConfigError("a wallet value cannot span lines")
-        if key == "POLY_PRIVATE_KEY" and not _is_hex_key(value):
-            raise ConfigError("POLY_PRIVATE_KEY must be a 32-byte hex key")
-        if key in {"POLY_FUNDER", "RELAYER_API_KEY_ADDRESS"} and not _is_address(value):
-            raise ConfigError(f"{key} must be an address")
-        if key == "POLY_SIGNATURE_TYPE" and value not in {"0", "1", "2", "3"}:
-            raise ConfigError("POLY_SIGNATURE_TYPE must be 0, 1, 2, or 3")
+        if key == "PREDICT_PRIVATE_KEY" and not _is_hex_key(value):
+            raise ConfigError("PREDICT_PRIVATE_KEY must be a 32-byte hex key")
+        if key == "PREDICT_ACCOUNT" and value and not _is_address(value):
+            raise ConfigError("PREDICT_ACCOUNT must be an address")
+        if key == "PREDICT_NETWORK" and value not in {"testnet", "mainnet"}:
+            raise ConfigError("PREDICT_NETWORK must be testnet or mainnet")
 
 
 def _is_hex_key(value: str) -> bool:
@@ -449,8 +449,8 @@ def _check_sizes(config: Config) -> None:
     if config.split_clip > config.initial_capital:
         raise ConfigError("split must be <= capital")
     minimum = (
-        POLYMARKET_MIN_SIZE
-        if POLYMARKET_MIN_SIZE > config.min_order_size
+        LADDER_MIN_SHARES
+        if LADDER_MIN_SHARES > config.min_order_size
         else config.min_order_size
     )
     if config.split_clip < minimum or config.clip_size < minimum:

@@ -26,8 +26,9 @@ def _fake_rpc(balances):
 
 
 def test_erc1155_balance_and_split_tokens_present():
-    rpc = _fake_rpc({11: 5_000_000, 22: 5_000_000})
-    assert erc1155_balance(FUNDER, "11", rpc) == 5_000_000
+    need = 5 * 10**18
+    rpc = _fake_rpc({11: need, 22: need})
+    assert erc1155_balance(FUNDER, "11", rpc) == need
     assert split_tokens_present(FUNDER, "11", "22", Decimal("5"), rpc)
     assert not split_tokens_present(FUNDER, "11", "33", Decimal("5"), rpc)
     assert not split_tokens_present(FUNDER, "11", "22", Decimal("6"), rpc)

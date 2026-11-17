@@ -449,3 +449,33 @@ def events_from_ws_message(
 
 def price_on_tick(price: Decimal, tick: Decimal) -> bool:
     return on_grid(price, tick)
+
+
+def complement_price(price, precision: int = 2) -> str:
+    """No price of a Yes price at the market's decimal precision.
+
+    A plain ``1 - price`` can leave a binary residue. The factor keeps the
+    two prices adding to exactly 1.
+    """
+    from decimal import ROUND_HALF_EVEN
+
+    factor = Decimal(10) ** int(precision)
+    units = (D(price) * factor).to_integral_value(rounding=ROUND_HALF_EVEN)
+    flipped = factor - units
+    return format(flipped / factor, "f")
+
+
+def complement_levels(levels, precision: int = 2) -> list[dict]:
+    """Flip one side of the Yes book onto the No axis. Sizes stay put."""
+    flipped = []
+    for item in levels or []:
+        if isinstance(item, dict):
+            price, size = item.get("price"), item.get("size")
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            price, size = item[0], item[1]
+        else:
+            continue
+        flipped.append(
+            {"price": complement_price(price, precision), "size": str(size)}
+        )
+    return flipped

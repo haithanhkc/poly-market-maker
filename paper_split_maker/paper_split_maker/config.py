@@ -76,6 +76,8 @@ class Config:
     market_slugs: tuple[str, ...] = ()
     # Live is off unless this is true AND the CLI flag AND the risk confirmation.
     live: bool = False
+    # Recurring predict.fun series. 5m, 15m, and 1h are the BTC up/down books.
+    series_slug: str = "btc-updown-5m"
     # 0 disables the per-session cap. The aggregate floor still applies.
     session_max_loss: Decimal = Decimal("0")
     # 0 cancels on any price change. 1 cancels only after a full tick.
@@ -216,6 +218,10 @@ class Config:
             raise ConfigError("redeem_max_attempts must be at least 1")
         if self.strategy not in ("single", "ladder"):
             raise ConfigError("strategy must be single or ladder")
+        if self.series_slug not in {"btc-updown-5m", "btc-updown-15m", "btc-updown-1h"}:
+            raise ConfigError(
+                "series_slug must be btc-updown-5m, btc-updown-15m, or btc-updown-1h"
+            )
         if self.ladder_levels < 1:
             raise ConfigError("ladder_levels must be at least 1")
         if self.ladder_spacing <= 0:
@@ -364,6 +370,10 @@ def config_from_mapping(data: dict) -> Config:
             kwargs[key] = str(value)
         elif key == "strategy":
             kwargs[key] = str(value)
+        elif key == "series_slug":
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError("series_slug must be a string")
+            kwargs[key] = value.strip()
         elif key == "poll_interval_seconds":
             kwargs[key] = float(value)
         elif key == "market_slugs":

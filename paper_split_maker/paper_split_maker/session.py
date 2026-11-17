@@ -106,6 +106,7 @@ def run_paper(
             int(started),
             max_markets,
             list(config.market_slugs) or None,
+            series=getattr(config, "series_slug", None),
         )
     except PublicDataError as exc:
         public_ok = False
