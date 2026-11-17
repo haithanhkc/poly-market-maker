@@ -100,6 +100,10 @@ def build_summary(
                 "bids_posted": market.bids_posted,
                 "bids_skipped": dict(market.skip_counts),
                 "trades_seen": market.trades_seen,
+                "trades_ok": market.trade_fetches_ok,
+                "trades_failed": market.trade_fetches_failed,
+                "trades_http": market.trade_fetch_status,
+                "trades_returned": market.trades_returned,
                 "orders": orders,
             }
         )

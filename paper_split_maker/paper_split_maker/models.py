@@ -117,6 +117,10 @@ class Market:
     book_fetches_failed: int = 0
     bids_posted: int = 0
     trades_seen: int = 0
+    trade_fetches_ok: int = 0
+    trade_fetches_failed: int = 0
+    trade_fetch_status: int = 0
+    trades_returned: int = 0
     skip_counts: dict = field(default_factory=dict)
     session_stopped: bool = False
     pause_until_ms: int = 0
@@ -178,6 +182,10 @@ class Market:
             "book_fetches_failed": self.book_fetches_failed,
             "bids_posted": self.bids_posted,
             "trades_seen": self.trades_seen,
+            "trade_fetches_ok": self.trade_fetches_ok,
+            "trade_fetches_failed": self.trade_fetches_failed,
+            "trade_fetch_status": self.trade_fetch_status,
+            "trades_returned": self.trades_returned,
             "skip_counts": dict(self.skip_counts),
             "session_stopped": self.session_stopped,
             "pause_until_ms": self.pause_until_ms,
@@ -235,6 +243,10 @@ class Market:
             book_fetches_failed=int(data.get("book_fetches_failed", 0)),
             bids_posted=int(data.get("bids_posted", 0)),
             trades_seen=int(data.get("trades_seen", 0)),
+            trade_fetches_ok=int(data.get("trade_fetches_ok", 0)),
+            trade_fetches_failed=int(data.get("trade_fetches_failed", 0)),
+            trade_fetch_status=int(data.get("trade_fetch_status", 0)),
+            trades_returned=int(data.get("trades_returned", 0)),
             skip_counts={
                 str(key): int(value)
                 for key, value in (data.get("skip_counts") or {}).items()

@@ -3,9 +3,10 @@
 This mode does not split, sell, or merge. It posts post-only bids on both
 outcomes after the round opens and keeps the tokens until resolution.
 
-Paper fills are not the venue matcher. The session already polls
-``GET /v1/markets/{id}/orderbook`` and ``GET /v1/markets/{id}/matches``
-(with ``x-api-key`` on mainnet). Those prints drive the model below.
+Paper fills are not the venue matcher. The session polls
+``GET /v1/markets/{id}/orderbook`` and ``GET /v1/orders/matches?marketId=``
+(with ``x-api-key`` on mainnet). ``/v1/markets/{id}/matches`` is not a
+route. Those prints drive the model below.
 The websocket at ``wss://ws.predict.fun/ws`` is not used for paper fills.
 
 Assumptions, all of which can disagree with the real book:
@@ -270,6 +271,10 @@ def round_report(market: Market) -> dict:
         "bids_posted": market.bids_posted,
         "bids_skipped": dict(market.skip_counts),
         "trades_seen": market.trades_seen,
+        "trades_ok": market.trade_fetches_ok,
+        "trades_failed": market.trade_fetches_failed,
+        "trades_http": market.trade_fetch_status,
+        "trades_returned": market.trades_returned,
     }
 
 
@@ -295,6 +300,9 @@ def dual_summary(markets) -> dict | None:
     books_failed = 0
     bids_posted = 0
     trades_seen = 0
+    trades_ok = 0
+    trades_failed = 0
+    trades_returned = 0
     skipped: dict[str, int] = {}
     for market in chosen:
         matched += (
@@ -308,6 +316,9 @@ def dual_summary(markets) -> dict | None:
         books_failed += market.book_fetches_failed
         bids_posted += market.bids_posted
         trades_seen += market.trades_seen
+        trades_ok += market.trade_fetches_ok
+        trades_failed += market.trade_fetches_failed
+        trades_returned += market.trades_returned
         for key, count in market.skip_counts.items():
             skipped[str(key)] = skipped.get(str(key), 0) + int(count)
         if market.status == "redeemed":
@@ -328,5 +339,8 @@ def dual_summary(markets) -> dict | None:
             "bids_posted": bids_posted,
             "bids_skipped": skipped,
             "trades_seen": trades_seen,
+            "trades_ok": trades_ok,
+            "trades_failed": trades_failed,
+            "trades_returned": trades_returned,
         },
     }

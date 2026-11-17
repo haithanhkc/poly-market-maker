@@ -10,7 +10,7 @@ from pathlib import Path
 from paper_split_maker.cli import _apply_strategy, main
 from paper_split_maker.config import Config, load_config
 from paper_split_maker.dual_bid import allow_bid, clip_for, plan_bids
-from paper_split_maker.public_client import PublicReadClient
+from paper_split_maker.public_client import PublicDataError, PublicReadClient
 from paper_split_maker.session import run_paper
 from tests.helpers import book_event, make_engine, market_event, run
 
@@ -286,7 +286,9 @@ def test_round_budget_and_loss_floor(tmp_path):
     )
     run(blocked, [_open()])
     _quote(blocked, QUOTE)
-    assert _bids(blocked) == []
+    # A flat ladder is not a loss. The round budget is what limits it.
+    assert _bids(blocked)
+    assert blocked.state.markets["m1"].skip_counts.get("loss_budget", 0) == 0
 
 
 def test_hold_redeem_pnl(tmp_path):
@@ -580,6 +582,259 @@ def test_zero_update_timestamp_still_quotes(tmp_path):
     assert current["books_failed"] == 0
     assert current["books_ok"] >= 2
     assert current["bids_posted"] >= 1
+
+
+def test_flat_ladder_is_not_a_loss_and_heavy_side_still_is(tmp_path):
+    """Resting bids do not spend the account floor until they add to a fill."""
+    engine = _engine(
+        tmp_path,
+        initial_capital=Decimal("75"),
+        max_loss_fraction=Decimal("0.08"),
+        dual_bid_levels=6,
+        round_budget=Decimal("40"),
+        per_market_budget=Decimal("40"),
+        global_rounding_reserve=Decimal("0"),
+    )
+    run(engine, [_open()])
+    run(
+        engine,
+        [
+            book_event(
+                "m1", "up", "0.48", "0.52", ts=QUOTE, bid_size="1", digest="up-open"
+            ),
+            book_event(
+                "m1", "down", "0.04", "0.08", ts=QUOTE, bid_size="1", digest="down-quiet"
+            ),
+            {"type": "heartbeat", "event_id": "hb-open", "ts": QUOTE, "market_id": "m1"},
+        ],
+    )
+    market = engine.state.markets["m1"]
+    assert market.bids_posted == 6
+    assert market.skip_counts.get("loss_budget", 0) == 0
+    # Ten Up and nine Down still clear the 0.85 balance, and Up is heavier.
+    # Cash plus the matched 9 is on the floor, so another Up bid crosses it.
+    for order in list(engine.state.orders.values()):
+        order.status = "cancelled"
+    market.up = Decimal("10")
+    market.down = Decimal("9")
+    market.bought_up_shares = Decimal("10")
+    market.bought_up_cost = Decimal("4")
+    market.bought_down_shares = Decimal("9")
+    market.bought_down_cost = Decimal("4")
+    engine.state.cash = Decimal("60")
+    run(
+        engine,
+        [
+            book_event(
+                "m1", "up", "0.40", "0.46", ts=QUOTE + 2_000, bid_size="1", digest="up-heavy"
+            ),
+            book_event(
+                "m1",
+                "down",
+                "0.40",
+                "0.46",
+                ts=QUOTE + 2_000,
+                bid_size="1",
+                digest="down-hedge",
+            ),
+            {
+                "type": "heartbeat",
+                "event_id": "hb-hedge",
+                "ts": QUOTE + 2_000,
+                "market_id": "m1",
+            },
+        ],
+    )
+    assert market.skip_counts.get("loss_budget", 0) >= 1
+    assert any(
+        order.outcome == "down" and getattr(order, "side", "") == "buy"
+        for order in engine.state.orders.values()
+        if order.status in {"queued", "live"}
+    )
+    assert not any(
+        order.outcome == "up" and order.status in {"queued", "live"}
+        for order in engine.state.orders.values()
+    )
+
+
+def test_orders_matches_parses_mainnet_shape():
+    fixture = json.loads(
+        (ROOT / "tests" / "fixtures" / "predict_match.json").read_text(encoding="utf-8")
+    )
+    complement = {
+        "success": True,
+        "cursor": None,
+        "data": [
+            {
+                "settlementId": "settle-bid-down",
+                "transactionHash": "0xbid",
+                "executedAt": "2023-11-14T22:13:23.000Z",
+                "amountFilled": "5000000000000000000",
+                "priceExecuted": "520000000000000000",
+                "taker": {
+                    "quoteType": "Bid",
+                    "outcome": {"name": "Down", "indexSet": 2},
+                },
+            }
+        ],
+    }
+    seen = []
+
+    class _Transport:
+        def __init__(self):
+            self.calls = 0
+
+        def get_json(self, url: str):
+            seen.append(url)
+            self.calls += 1
+            if self.calls == 1:
+                return fixture
+            return complement
+
+    client = PublicReadClient(_Transport(), network="mainnet", api_key="not-a-real-key")
+    client._by_condition["0xabc"] = {
+        "market_id": "9001",
+        "up_token": "111",
+        "down_token": "222",
+    }
+    first = client.fetch_trades("0xabc")
+    assert "/v1/orders/matches?" in seen[0]
+    assert "marketId=9001" in seen[0]
+    assert "/markets/9001/matches" not in seen[0]
+    assert "not-a-real-key" not in seen[0]
+    row = first["data"][0]
+    assert row["token_id"] == "111"
+    assert row["side"] == "SELL"
+    assert Decimal(row["price"]) == Decimal("0.4")
+    assert Decimal(row["size"]) == Decimal("20")
+    assert client.last_trade_fetch == {"ok": True, "status": 200, "rows": 1}
+    second = client.fetch_trades("0xabc")
+    assert "executedAfter=" in seen[1]
+    hedge = second["data"][0]
+    assert hedge["token_id"] == "111"
+    assert hedge["side"] == "SELL"
+    assert Decimal(hedge["price"]) == Decimal("0.48")
+    assert Decimal(hedge["size"]) == Decimal("5")
+
+    class _Missing:
+        def get_json(self, url: str):
+            raise PublicDataError("http 404 for matches", status=404)
+
+    missing = PublicReadClient(_Missing(), network="mainnet", api_key="not-a-real-key")
+    missing._by_condition["0xabc"] = {"market_id": "9001", "up_token": "111", "down_token": "222"}
+    assert missing.fetch_trades("0xabc") == {"data": []}
+    assert missing.last_trade_fetch["ok"] is False
+    assert missing.last_trade_fetch["status"] == 404
+
+
+def test_paper_counts_match_fetches(tmp_path, capsys):
+    rounds = json.loads(
+        (ROOT / "tests" / "fixtures" / "btc_updown_5m_rounds.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    book = {
+        "success": True,
+        "data": {
+            "marketId": 9001,
+            "updateTimestampMs": 1_699_999_700_000,
+            "bids": [[0.48, 1]],
+            "asks": [[0.52, 10]],
+        },
+    }
+    match = json.loads(
+        (ROOT / "tests" / "fixtures" / "predict_match.json").read_text(encoding="utf-8")
+    )
+
+    class _Transport:
+        def __init__(self):
+            self.matches = 0
+
+        def get_json(self, url: str):
+            if "/rounds" in url:
+                return rounds
+            if "/orderbook" in url:
+                return book
+            if "/orders/matches" in url:
+                self.matches += 1
+                if self.matches == 1:
+                    return {"success": True, "data": []}
+                return match
+            if "/markets/" in url:
+                return {"data": {"id": 9001, "status": "REGISTERED"}}
+            raise AssertionError(url)
+
+    client = PublicReadClient(_Transport(), network="mainnet", api_key="not-a-real-key")
+    clock = {"t": 1_700_000_000.0}
+    summary = run_paper(
+        Config(
+            strategy="dual_bid",
+            split_lead_seconds=0,
+            poll_interval_seconds=2,
+            stale_after_ms=10_000,
+            max_open_markets=1,
+            dual_bid_levels=1,
+            ack_latency_ms=0,
+            round_budget=Decimal("40"),
+            per_market_budget=Decimal("40"),
+        ),
+        tmp_path / "matches",
+        duration_seconds=4,
+        max_markets=1,
+        client=client,
+        now_s=lambda: clock["t"],
+        sleep=lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
+    )
+    current = next(
+        row for row in summary["rounds"] if row["slug"] == "btc-updown-5m-1699999800"
+    )
+    assert current["trades_ok"] >= 1
+    assert current["trades_failed"] == 0
+    assert current["trades_http"] == 200
+    assert current["trades_returned"] >= 1
+    assert current["trades_seen"] >= 1
+    assert current["fills_up"] >= 1
+    err = capsys.readouterr().err
+    assert "trades_http=200" in err and "trades_seen=" in err
+
+    class _Down:
+        def get_json(self, url: str):
+            if "/rounds" in url:
+                return rounds
+            if "/orderbook" in url:
+                return book
+            if "/orders/matches" in url:
+                raise PublicDataError("http 404 for matches", status=404)
+            if "/markets/" in url:
+                return {"data": {"id": 9001, "status": "REGISTERED"}}
+            raise AssertionError(url)
+
+    clock = {"t": 1_700_000_000.0}
+    failed = run_paper(
+        Config(
+            strategy="dual_bid",
+            split_lead_seconds=0,
+            poll_interval_seconds=2,
+            stale_after_ms=10_000,
+            max_open_markets=1,
+            dual_bid_levels=1,
+            round_budget=Decimal("40"),
+            per_market_budget=Decimal("40"),
+        ),
+        tmp_path / "no-matches",
+        duration_seconds=2,
+        max_markets=1,
+        client=PublicReadClient(_Down(), network="mainnet", api_key="not-a-real-key"),
+        now_s=lambda: clock["t"],
+        sleep=lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
+    )
+    quiet = next(
+        row for row in failed["rounds"] if row["slug"] == "btc-updown-5m-1699999800"
+    )
+    assert quiet["trades_failed"] >= 1
+    assert quiet["trades_http"] == 404
+    assert quiet["bids_posted"] >= 1
+    assert quiet["books_ok"] >= 1
 
 
 def test_strategy_flag_and_live_refusal(tmp_path, capsys):

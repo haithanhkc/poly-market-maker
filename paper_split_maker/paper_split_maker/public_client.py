@@ -107,6 +107,8 @@ class PublicReadClient:
         self._by_token: dict[str, dict] = {}
         self._by_condition: dict[str, dict] = {}
         self._yes_cache: dict[str, dict] = {}
+        self._trade_after: dict[str, int] = {}
+        self.last_trade_fetch: dict = {"ok": False, "status": 0, "rows": 0}
         self.last_discovery: dict = {
             "network": self.network,
             "series": "",
@@ -229,25 +231,55 @@ class PublicReadClient:
         book["min_order_size"] = "1"
         return book
 
-    def fetch_trades(self, condition_id: str, limit: int = 50) -> dict:
+    def fetch_trades(self, condition_id: str, limit: int = 100) -> dict:
+        """Public match events for one market.
+
+        predict.fun has no ``/v1/markets/{id}/matches``. That path is 404.
+        Prints are ``GET /v1/orders/matches?marketId=``. Mainnet needs the
+        same ``x-api-key`` the book calls already send. A 404 is an empty
+        tape with ``last_trade_fetch.ok`` false, so the book poll keeps going.
+        """
         meta = self._by_condition.get(str(condition_id).lower())
-        market_id = meta["market_id"] if meta else str(condition_id)
-        query = urllib.parse.urlencode({"first": str(int(limit))})
-        url = f"{self.base}/v1/markets/{urllib.parse.quote(str(market_id), safe='')}/matches?{query}"
+        market_id = str(meta["market_id"]) if meta else ""
+        if not market_id:
+            self.last_trade_fetch = {"ok": False, "status": 0, "rows": 0}
+            return {"data": []}
+        page_size = max(1, min(int(limit), 150))
+        watermark = self._trade_after.get(market_id)
+        rows: list = []
+        cursor = None
         try:
-            payload = self._get(url, decimal_floats=True)
+            for _ in range(3):
+                params = {"first": str(page_size), "marketId": market_id}
+                if watermark:
+                    # executedAfter is exclusive. Overlap one millisecond and
+                    # let the engine drop ids it has already applied.
+                    params["executedAfter"] = str(int(watermark) - 1)
+                if cursor:
+                    params["after"] = cursor
+                url = f"{self.base}/v1/orders/matches?{urllib.parse.urlencode(params)}"
+                payload = self._get(url, decimal_floats=True)
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if not isinstance(data, list):
+                    break
+                rows.extend(item for item in data if isinstance(item, dict))
+                cursor = payload.get("cursor") if isinstance(payload, dict) else None
+                if not cursor or len(data) < page_size:
+                    break
         except PublicDataError as exc:
+            self.last_trade_fetch = {
+                "ok": False,
+                "status": int(exc.status or 0),
+                "rows": 0,
+            }
             if exc.status == 404:
                 return {"data": []}
             raise
-        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
-            rows = payload["data"]
-            if rows and isinstance(rows[0], dict) and (
-                "token_id" in rows[0] or "asset_id" in rows[0]
-            ):
-                return payload
-            return {"data": _match_rows(rows, meta)}
-        return {"data": []}
+        newest = _newest_executed_ms(rows)
+        if newest is not None and newest > int(watermark or 0):
+            self._trade_after[market_id] = newest
+        self.last_trade_fetch = {"ok": True, "status": 200, "rows": len(rows)}
+        return {"data": _match_rows(rows, meta)}
 
     def fetch_resolution(self, condition_id: str) -> dict:
         meta = self._by_condition.get(str(condition_id).lower())
@@ -507,6 +539,11 @@ def _match_rows(rows: list, meta: dict | None) -> list[dict]:
         if "token_id" in row or "asset_id" in row:
             out.append(row)
             continue
+        if "taker" in row or "priceExecuted" in row or "amountFilled" in row:
+            converted = _from_match_event(row, up, down)
+            if converted is not None:
+                out.append(converted)
+            continue
         outcome = str(row.get("outcome") or row.get("outcomeName") or "").casefold()
         token = up if outcome in UP_NAMES else down if outcome in DOWN_NAMES else ""
         if not token:
@@ -522,6 +559,95 @@ def _match_rows(rows: list, meta: dict | None) -> list[dict]:
             }
         )
     return out
+
+
+def _from_match_event(row: dict, up: str, down: str) -> dict | None:
+    """One match event becomes the print that can fill a resting bid.
+
+    ``priceExecuted`` and ``amountFilled`` are 18-decimal wei. ``quoteType``
+    is Bid or Ask, not BUY or SELL. A taker Ask sells that outcome into its
+    bids. A taker Bid buys that outcome and fills the other outcome's bids
+    at the complement, which is how Yes and No bids match.
+    """
+    taker = row.get("taker") if isinstance(row.get("taker"), dict) else {}
+    quote = str(taker.get("quoteType") or row.get("quoteType") or "").casefold()
+    taker_side = _outcome_side(taker.get("outcome") or row.get("outcome"))
+    price = _wei_or_decimal(row.get("priceExecuted") if "priceExecuted" in row else taker.get("price"))
+    size = _wei_or_decimal(row.get("amountFilled") if "amountFilled" in row else taker.get("amount"))
+    if price is None or size is None or size <= 0 or not taker_side:
+        return None
+    if quote == "ask":
+        outcome = taker_side
+        side = "SELL"
+        print_price = price
+    elif quote == "bid":
+        outcome = "down" if taker_side == "up" else "up"
+        side = "SELL"
+        print_price = Decimal(1) - price
+    elif quote in {"buy", "sell"}:
+        outcome = taker_side
+        side = quote.upper()
+        print_price = price
+    else:
+        return None
+    if not (Decimal(0) < print_price < Decimal(1)):
+        return None
+    token = up if outcome == "up" else down
+    if not token:
+        return None
+    trade_id = row.get("settlementId") or row.get("transactionHash") or row.get("id") or ""
+    return {
+        "token_id": token,
+        "side": side,
+        "price": format(print_price, "f"),
+        "size": format(size, "f"),
+        "timestamp": row.get("executedAt") or row.get("timestamp"),
+        "transaction_hash": row.get("transactionHash") or trade_id,
+        "id": str(trade_id),
+    }
+
+
+def _outcome_side(outcome) -> str:
+    if isinstance(outcome, dict):
+        name = str(outcome.get("name") or "")
+        index = outcome.get("indexSet")
+    else:
+        name = str(outcome or "")
+        index = None
+    folded = name.casefold()
+    if folded in UP_NAMES or index == 1:
+        return "up"
+    if folded in DOWN_NAMES or index == 2:
+        return "down"
+    return ""
+
+
+def _wei_or_decimal(value):
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    try:
+        amount = Decimal(text)
+    except (ArithmeticError, ValueError):
+        return None
+    if "." not in text and abs(amount) >= Decimal(10) ** 12:
+        amount = amount / (Decimal(10) ** 18)
+    return amount
+
+
+def _newest_executed_ms(rows: list) -> int | None:
+    from paper_split_maker.normalize import _parse_time_ms
+
+    newest = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        stamp = _parse_time_ms(row.get("executedAt") or row.get("timestamp"))
+        if stamp is None:
+            continue
+        if newest is None or stamp > newest:
+            newest = stamp
+    return newest
 
 
 def _levels(raw) -> list[dict] | None:

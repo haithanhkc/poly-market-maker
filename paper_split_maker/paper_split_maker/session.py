@@ -170,9 +170,8 @@ def run_paper(
                     event["book_ts"] = event["ts"]
                     event["ts"] = stamp
                     engine.handle_event(event)
-                for trade in data_api_trade_events(
-                    view, reader.fetch_trades(market.condition_id)
-                ):
+                trades_payload = _poll_trades(reader, market, note)
+                for trade in data_api_trade_events(view, trades_payload):
                     trade["trade_ts"] = trade["ts"]
                     trade["ts"] = stamp
                     engine.handle_event(trade)
@@ -327,13 +326,42 @@ def _stamp_missing(value) -> bool:
         return False
 
 
+def _poll_trades(reader, market, note) -> dict:
+    """Count the matches request. A trade error does not take the book feed down."""
+    try:
+        payload = reader.fetch_trades(market.condition_id)
+    except PublicDataError as exc:
+        market.trade_fetches_failed += 1
+        market.trade_fetch_status = int(getattr(exc, "status", 0) or 0)
+        note(f"trades {market.slug} http {market.trade_fetch_status}")
+        return {"data": []}
+    info = getattr(reader, "last_trade_fetch", None)
+    if not isinstance(info, dict):
+        market.trade_fetches_ok += 1
+        market.trade_fetch_status = market.trade_fetch_status or 200
+        return payload if isinstance(payload, dict) else {"data": []}
+    market.trade_fetch_status = int(info.get("status") or 0)
+    market.trades_returned += int(info.get("rows") or 0)
+    if info.get("ok"):
+        market.trade_fetches_ok += 1
+    else:
+        market.trade_fetches_failed += 1
+        note(
+            f"trades {market.slug} http {market.trade_fetch_status} "
+            f"rows={info.get('rows', 0)}"
+        )
+    return payload if isinstance(payload, dict) else {"data": []}
+
+
 def _dual_status_line(market) -> str:
     skipped = market.skip_counts or {}
     reasons = " ".join(f"{key}={skipped[key]}" for key in sorted(skipped))
     return (
         f"dual_bid {market.slug} books_ok={market.book_fetches_ok} "
         f"books_failed={market.book_fetches_failed} bids_posted={market.bids_posted} "
-        f"trades_seen={market.trades_seen} skipped {reasons or 'none'}"
+        f"trades_ok={market.trade_fetches_ok} trades_failed={market.trade_fetches_failed} "
+        f"trades_http={market.trade_fetch_status} trades_seen={market.trades_seen} "
+        f"skipped {reasons or 'none'}"
     )
 
 

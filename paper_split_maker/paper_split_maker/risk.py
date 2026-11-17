@@ -163,9 +163,32 @@ def market_contribution(
         value = value_up if value_up <= value_down else value_down
     if market.reserve_active:
         value -= market.operational_reserve_amount
-    # Resting bids spend cash whichever side wins. The tokens are already in
-    # the two branches above, so the worse branch keeps the hedge.
-    value -= buy_cost
+    if buy_cost > 0 or market.bought_up_shares > 0 or market.bought_down_shares > 0:
+        # Dual-bid: cash already left for fills. Matched shares pay 1 in the
+        # worse branch. A resting bid counts only when it is on the side we
+        # already hold more of, because that fill adds unmatched shares that
+        # can expire at 0. The other side's bids are the hedge. While the
+        # filled book is flat, neither open ladder is a loss yet. Round
+        # budget still caps how much those bids can spend.
+        matched = (
+            market.bought_up_shares
+            if market.bought_up_shares < market.bought_down_shares
+            else market.bought_down_shares
+        )
+        heavy = ""
+        if market.bought_up_shares > market.bought_down_shares:
+            heavy = "up"
+        elif market.bought_down_shares > market.bought_up_shares:
+            heavy = "down"
+        worsening = ZERO
+        if heavy:
+            for order in orders:
+                if getattr(order, "side", "sell") != "buy":
+                    continue
+                if order.status == "cancel_requested" or order.outcome != heavy:
+                    continue
+                worsening += floor_cash(order.remaining * order.price)
+        return matched - worsening
     return value
 
 

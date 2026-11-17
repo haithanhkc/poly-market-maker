@@ -1107,7 +1107,12 @@ class Engine:
             submit_ts=self.state.now_ms,
             side="buy",
         )
-        if worst_case_equity(self.state, extra=[probe]) < self.state.loss_floor:
+        # Flat ladders are not a loss: the round budget caps their spend.
+        # A bid counts against the floor only when filling it would add to
+        # unmatched inventory we already hold.
+        before = worst_case_equity(self.state)
+        after = worst_case_equity(self.state, extra=[probe])
+        if after < self.state.loss_floor and after < before:
             self.state.order_seq -= 1
             self._skip(market, "loss_budget", bid.outcome, bid.price)
             return False
