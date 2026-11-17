@@ -343,7 +343,16 @@ class Engine:
                     bits.append(
                         f"{side}_age_ms={self.state.now_ms - book.received_ms}"
                     )
+        if reason in {"stale_feed", "disconnected"}:
+            for side in ("up", "down"):
+                book = market.book(side)
+                if book.ts_ms >= 0:
+                    bits.append(
+                        f"{side}_exchange_age_ms={self.state.now_ms - book.ts_ms}"
+                    )
         detail = " ".join(bits)
+        market.skip_counts[label] = int(market.skip_counts.get(label, 0)) + 1
+        market.last_skip_reason = label
         self._emit(
             kind="quote_skipped",
             market=market,
@@ -527,12 +536,8 @@ class Engine:
                 kind="book", market=market, outcome=outcome, reason="duplicate_book"
             )
             return
-        if book.ts_ms == stamp and digest and book.digest and book.digest != digest:
-            book.uncertain = True
-            self._emit(
-                kind="book", market=market, outcome=outcome, reason="uncertain_book"
-            )
-            return
+        # Same exchange millisecond with a new top of book is a newer REST
+        # snapshot. Apply those levels. Do not mark the feed uncertain.
         try:
             if "tick_size" in event and event["tick_size"] not in (None, ""):
                 tick = Decimal(str(event["tick_size"]))
@@ -596,6 +601,7 @@ class Engine:
             )
             return
         self.state.seen_trade_ids.add(trade_id)
+        market.trades_seen += 1
         if self.mode == "live":
             # Live fills come only from the exchange (user_fill).
             self._emit(
@@ -1106,6 +1112,7 @@ class Engine:
             self._skip(market, "loss_budget", bid.outcome, bid.price)
             return False
         self.state.orders[probe.order_id] = probe
+        market.bids_posted += 1
         market.last_action_ts = self.state.now_ms
         self._skip_once.clear()
         self._emit(
@@ -2268,23 +2275,21 @@ class Engine:
         book = market.book(outcome)
         if book.uncertain:
             return False
-        if self.mode == "live":
-            # Freshness is the last time we received a book, not the exchange
-            # timestamp. A quiet book does not go stale just because nothing
-            # inside it changed. ``stale_after_ms`` stays the paper threshold.
-            if book.received_ms < 0:
-                return False
-            age = self.state.now_ms - book.received_ms
-            limit = int(self.config.stale_feed_seconds) * 1000
-            if age < 0:
-                return -age <= self.config.clock_skew_ms
-            return age <= limit
-        if book.ts_ms < 0:
+        # Receipt time, not predict's updateTimestampMs. That field is the last
+        # time the book changed. A round loaded during the pre-open lead keeps
+        # the first snapshot, and the old stamp is already older than
+        # stale_after_ms by the time quoting starts. A snapshot we just
+        # received is fresh until the next poll fails to replace it.
+        if book.received_ms < 0:
             return False
-        age = self.state.now_ms - book.ts_ms
+        age = self.state.now_ms - book.received_ms
+        if self.mode == "live":
+            limit = int(self.config.stale_feed_seconds) * 1000
+        else:
+            limit = self.config.stale_after_ms
         if age < 0:
             return -age <= self.config.clock_skew_ms
-        return age <= self.config.stale_after_ms
+        return age <= limit
 
     def _in_stop_window(self, market: Market) -> bool:
         return (

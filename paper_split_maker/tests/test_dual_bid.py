@@ -391,6 +391,197 @@ def test_dual_bid_loads_the_open_round(tmp_path):
     assert summary["round_totals"]["fills_up"] == 0
 
 
+def test_old_exchange_timestamp_still_quotes(tmp_path):
+    """A snapshot received just now is fresh even when updateTimestampMs is old."""
+    engine = _engine(tmp_path, dual_bid_levels=1, stale_after_ms=10_000)
+    run(engine, [_open()])
+    events = []
+    for outcome in ("up", "down"):
+        event = book_event(
+            "m1",
+            outcome,
+            "0.48",
+            "0.52",
+            ts=QUOTE,
+            bid_size="80",
+            digest=f"{outcome}-stale-stamp",
+        )
+        event["book_ts"] = QUOTE - 60_000
+        events.append(event)
+    events.append(
+        {"type": "heartbeat", "event_id": "hb-quote", "ts": QUOTE, "market_id": "m1"}
+    )
+    run(engine, events)
+    assert _bids(engine)
+    assert engine.state.markets["m1"].bids_posted >= 1
+    run(
+        engine,
+        [
+            {
+                "type": "heartbeat",
+                "event_id": "hb-stale",
+                "ts": QUOTE + 11_000,
+                "market_id": "m1",
+            }
+        ],
+    )
+    market = engine.state.markets["m1"]
+    assert market.skip_counts.get("stale_feed", 0) >= 1
+    row = engine.summary()["rounds"][0]
+    assert row["bids_posted"] >= 1
+    assert row["bids_skipped"]["stale_feed"] >= 1
+
+
+def test_paper_refetches_a_stale_mainnet_book(tmp_path, capsys):
+    """The first snapshot must not be reused for the rest of the round."""
+    book = json.loads(
+        (ROOT / "tests" / "fixtures" / "predict_orderbook.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    rounds = json.loads(
+        (ROOT / "tests" / "fixtures" / "btc_updown_5m_rounds.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    class _Transport:
+        def __init__(self):
+            self.orderbooks = 0
+            self.urls = []
+
+        def get_json(self, url: str):
+            self.urls.append(url)
+            if "/rounds" in url:
+                return rounds
+            if url.endswith("/matches") or "/matches?" in url:
+                if self.orderbooks >= 2:
+                    return {
+                        "data": [
+                            {
+                                "id": "trade-1",
+                                "token_id": "111",
+                                "side": "BUY",
+                                "price": "0.55",
+                                "size": "4",
+                                "timestamp": 1_700_000_000_000,
+                            }
+                        ]
+                    }
+                return {"data": []}
+            if "/orderbook" in url:
+                self.orderbooks += 1
+                payload = json.loads(json.dumps(book))
+                if self.orderbooks >= 5:
+                    payload["data"]["bids"] = [[0.40, 90], [0.39, 40]]
+                    payload["data"]["asks"] = [[0.46, 20]]
+                return payload
+            if "/markets/" in url:
+                return {"data": {"id": 9001, "status": "REGISTERED"}}
+            raise AssertionError(url)
+
+    client = PublicReadClient(
+        _Transport(), network="mainnet", api_key="not-a-real-key"
+    )
+    clock = {"t": 1_700_000_000.0}
+    summary = run_paper(
+        Config(
+            strategy="dual_bid",
+            split_lead_seconds=300,
+            poll_interval_seconds=2,
+            stale_after_ms=10_000,
+            max_open_markets=3,
+            dual_bid_levels=1,
+            dual_bid_requote_ms=1500,
+            round_budget=Decimal("40"),
+            per_market_budget=Decimal("40"),
+        ),
+        tmp_path / "paper",
+        duration_seconds=6,
+        max_markets=5,
+        client=client,
+        now_s=lambda: clock["t"],
+        sleep=lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
+    )
+    assert client.transport.orderbooks >= 6
+    assert "not-a-real-key" not in json.dumps(summary)
+    current = next(
+        row for row in summary["rounds"] if row["slug"] == "btc-updown-5m-1699999800"
+    )
+    assert current["books_ok"] >= 2
+    assert current["books_failed"] == 0
+    assert current["bids_posted"] >= 1
+    assert current["trades_seen"] >= 1
+    assert current["bids_skipped"].get("stale_feed", 0) == 0
+    assert summary["round_totals"]["bids_posted"] >= 1
+    state = json.loads((tmp_path / "paper" / "state.json").read_text(encoding="utf-8"))
+    prices = [
+        order["price"]
+        for order in state["orders"].values()
+        if order["market_id"] == "btc-updown-5m-1699999800" and order["side"] == "buy"
+    ]
+    assert "0.4" in prices or "0.40" in prices
+    err = capsys.readouterr().err
+    assert "books_ok=" in err and "bids_posted=" in err and "trades_seen=" in err
+
+
+def test_zero_update_timestamp_still_quotes(tmp_path):
+    rounds = json.loads(
+        (ROOT / "tests" / "fixtures" / "btc_updown_5m_rounds.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    book = {
+        "success": True,
+        "data": {
+            "marketId": 9001,
+            "updateTimestampMs": 0,
+            "lastOrderSettled": None,
+            "bids": [[0.48, 80]],
+            "asks": [[0.52, 10]],
+        },
+    }
+
+    class _Transport:
+        def get_json(self, url: str):
+            if "/rounds" in url:
+                return rounds
+            if "/orderbook" in url:
+                return book
+            if "/matches" in url:
+                return {"data": []}
+            if "/markets/" in url:
+                return {"data": {"id": 9001, "status": "REGISTERED"}}
+            raise AssertionError(url)
+
+    client = PublicReadClient(_Transport(), network="mainnet", api_key="not-a-real-key")
+    clock = {"t": 1_700_000_000.0}
+    summary = run_paper(
+        Config(
+            strategy="dual_bid",
+            split_lead_seconds=0,
+            poll_interval_seconds=2,
+            stale_after_ms=10_000,
+            max_open_markets=1,
+            dual_bid_levels=1,
+            round_budget=Decimal("40"),
+            per_market_budget=Decimal("40"),
+        ),
+        tmp_path / "zero",
+        duration_seconds=2,
+        max_markets=1,
+        client=client,
+        now_s=lambda: clock["t"],
+        sleep=lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
+    )
+    current = next(
+        row for row in summary["rounds"] if row["slug"] == "btc-updown-5m-1699999800"
+    )
+    assert current["books_failed"] == 0
+    assert current["books_ok"] >= 2
+    assert current["bids_posted"] >= 1
+
+
 def test_strategy_flag_and_live_refusal(tmp_path, capsys):
     config = load_config(ROOT / "config.paper.json")
     assert config.strategy == "ladder"

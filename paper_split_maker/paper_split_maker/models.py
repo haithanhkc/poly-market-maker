@@ -113,6 +113,11 @@ class Market:
     buy_up_fills: int = 0
     buy_down_fills: int = 0
     quoted_as: str = ""
+    book_fetches_ok: int = 0
+    book_fetches_failed: int = 0
+    bids_posted: int = 0
+    trades_seen: int = 0
+    skip_counts: dict = field(default_factory=dict)
     session_stopped: bool = False
     pause_until_ms: int = 0
     last_requote_ts: int = -(10**18)
@@ -169,6 +174,11 @@ class Market:
             "buy_up_fills": self.buy_up_fills,
             "buy_down_fills": self.buy_down_fills,
             "quoted_as": self.quoted_as,
+            "book_fetches_ok": self.book_fetches_ok,
+            "book_fetches_failed": self.book_fetches_failed,
+            "bids_posted": self.bids_posted,
+            "trades_seen": self.trades_seen,
+            "skip_counts": dict(self.skip_counts),
             "session_stopped": self.session_stopped,
             "pause_until_ms": self.pause_until_ms,
             "last_requote_ts": self.last_requote_ts,
@@ -221,6 +231,14 @@ class Market:
             buy_up_fills=int(data.get("buy_up_fills", 0)),
             buy_down_fills=int(data.get("buy_down_fills", 0)),
             quoted_as=str(data.get("quoted_as") or ""),
+            book_fetches_ok=int(data.get("book_fetches_ok", 0)),
+            book_fetches_failed=int(data.get("book_fetches_failed", 0)),
+            bids_posted=int(data.get("bids_posted", 0)),
+            trades_seen=int(data.get("trades_seen", 0)),
+            skip_counts={
+                str(key): int(value)
+                for key, value in (data.get("skip_counts") or {}).items()
+            },
             session_stopped=bool(data.get("session_stopped", False)),
             pause_until_ms=int(data.get("pause_until_ms", 0)),
             last_requote_ts=int(data.get("last_requote_ts", -(10**18))),

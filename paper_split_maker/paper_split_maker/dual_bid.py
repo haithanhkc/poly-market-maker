@@ -265,6 +265,11 @@ def round_report(market: Market) -> dict:
         "excess_shares": money(excess),
         "excess_side": heavy or "",
         "pnl": money(market.net_cash_flow) if redeemed else None,
+        "books_ok": market.book_fetches_ok,
+        "books_failed": market.book_fetches_failed,
+        "bids_posted": market.bids_posted,
+        "bids_skipped": dict(market.skip_counts),
+        "trades_seen": market.trades_seen,
     }
 
 
@@ -286,6 +291,11 @@ def dual_summary(markets) -> dict | None:
     redeemed = 0
     fills_up = 0
     fills_down = 0
+    books_ok = 0
+    books_failed = 0
+    bids_posted = 0
+    trades_seen = 0
+    skipped: dict[str, int] = {}
     for market in chosen:
         matched += (
             market.bought_up_shares
@@ -294,6 +304,12 @@ def dual_summary(markets) -> dict | None:
         )
         fills_up += market.buy_up_fills
         fills_down += market.buy_down_fills
+        books_ok += market.book_fetches_ok
+        books_failed += market.book_fetches_failed
+        bids_posted += market.bids_posted
+        trades_seen += market.trades_seen
+        for key, count in market.skip_counts.items():
+            skipped[str(key)] = skipped.get(str(key), 0) + int(count)
         if market.status == "redeemed":
             redeemed += 1
             pnl += market.net_cash_flow
@@ -307,5 +323,10 @@ def dual_summary(markets) -> dict | None:
             "fills_down": fills_down,
             "matched_shares": money(matched),
             "pnl": money(pnl) if redeemed else None,
+            "books_ok": books_ok,
+            "books_failed": books_failed,
+            "bids_posted": bids_posted,
+            "bids_skipped": skipped,
+            "trades_seen": trades_seen,
         },
     }

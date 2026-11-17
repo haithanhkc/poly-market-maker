@@ -119,6 +119,10 @@ class PublicReadClient:
             "error": "",
         }
 
+    def begin_poll(self) -> None:
+        """Drop the order book cache. One poll may share Up and Down; the next refetches."""
+        self._yes_cache.clear()
+
     def discover_btc_updown(
         self,
         now_s: int,
@@ -450,11 +454,19 @@ def yes_book(payload: dict) -> dict:
     asks = _levels(data.get("asks"))
     if bids is None or asks is None:
         raise PublicDataError("book levels are not pairs")
-    stamp = data.get("updateTimestampMs") or data.get("timestamp")
+    # ``0 or timestamp`` used to throw away a real ``updateTimestampMs: 0``.
+    stamp = data.get("updateTimestampMs")
+    if stamp in (None, ""):
+        stamp = data.get("timestamp")
     market_id = data.get("marketId") or ""
+    top = ""
+    if bids:
+        top += f"b{bids[0]['price']}:{bids[0]['size']}"
+    if asks:
+        top += f"a{asks[0]['price']}:{asks[0]['size']}"
     return {
         "timestamp": stamp,
-        "hash": f"{market_id}:{stamp}",
+        "hash": f"{market_id}:{stamp}:{top}:{len(bids)}:{len(asks)}",
         "bids": bids,
         "asks": asks,
     }

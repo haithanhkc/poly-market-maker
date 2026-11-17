@@ -123,6 +123,9 @@ def run_paper(
     while clock() < deadline:
         polls += 1
         stamp = int(clock() * 1000)
+        begin = getattr(reader, "begin_poll", None)
+        if begin is not None:
+            begin()
         opened = _discover_due(
             engine, reader, config, stamp, max_markets, note, opened_slugs
         )
@@ -143,16 +146,25 @@ def run_paper(
                     ("up", market.up_token_id),
                     ("down", market.down_token_id),
                 ):
-                    book = reader.fetch_book(token)
+                    try:
+                        book = reader.fetch_book(token)
+                    except PublicDataError:
+                        market.book_fetches_failed += 1
+                        raise
+                    if _stamp_missing(book.get("timestamp")):
+                        book = dict(book)
+                        book["timestamp"] = stamp
                     event = clob_book_event(
                         market.market_id,
                         outcome,
                         book,
-                        event_id=f"book:{market.market_id}:{outcome}:{book.get('hash')}:{book.get('timestamp')}",
+                        event_id=f"book:{market.market_id}:{outcome}:{book.get('hash')}:{book.get('timestamp')}:{polls}",
                     )
                     if event is None:
+                        market.book_fetches_failed += 1
                         failed = True
                         continue
+                    market.book_fetches_ok += 1
                     # Exchange timestamps can lead the local clock. Keep them on the
                     # book, and drive the ledger clock with the session clock.
                     event["book_ts"] = event["ts"]
@@ -195,6 +207,9 @@ def run_paper(
         engine.handle_event(
             {"type": "heartbeat", "ts": stamp, "event_id": f"hb-{polls}-{stamp}"}
         )
+        if getattr(config, "strategy", "") == "dual_bid":
+            for market in engine.state.markets.values():
+                note(_dual_status_line(market))
         remaining = deadline - clock()
         if remaining <= 0:
             break
@@ -301,6 +316,25 @@ def _due_slugs(series: str, window: int, now_s: int, lead: int, max_markets: int
         if len(due) >= max_markets:
             break
     return due
+
+
+def _stamp_missing(value) -> bool:
+    if value in (None, "", 0, "0"):
+        return True
+    try:
+        return int(value) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _dual_status_line(market) -> str:
+    skipped = market.skip_counts or {}
+    reasons = " ".join(f"{key}={skipped[key]}" for key in sorted(skipped))
+    return (
+        f"dual_bid {market.slug} books_ok={market.book_fetches_ok} "
+        f"books_failed={market.book_fetches_failed} bids_posted={market.bids_posted} "
+        f"trades_seen={market.trades_seen} skipped {reasons or 'none'}"
+    )
 
 
 def _already_open(engine, slug: str) -> bool:

@@ -95,6 +95,11 @@ def build_summary(
                 "gross_split_usdc": money(market.gross_split),
                 "net_cash_flow": money(market.net_cash_flow),
                 "worst_contribution": money(market_contribution(state, market)),
+                "books_ok": market.book_fetches_ok,
+                "books_failed": market.book_fetches_failed,
+                "bids_posted": market.bids_posted,
+                "bids_skipped": dict(market.skip_counts),
+                "trades_seen": market.trades_seen,
                 "orders": orders,
             }
         )
