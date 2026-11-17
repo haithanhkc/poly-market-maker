@@ -27,7 +27,13 @@ cd paper_split_maker
 python -m paper_split_maker --config config.paper.json --out ..\runs\paper --max-markets 1
 ```
 
-That command does not send orders. Testnet currently lists `btc-updown-1h` (and the 1-day books), not `btc-updown-5m`. With the shipped `series_slug` the paper process records that the series was not found and exits. Set `"series_slug": "btc-updown-1h"` in `config.paper.json` when you want the dry run to read the testnet hour book. Five-minute and fifteen-minute slugs are the mainnet series names; this environment cannot read mainnet without an API key, and it does not place those orders.
+That command does not send orders. Paper reads `PREDICT_NETWORK` and `PREDICT_API_KEY` from `.env` (or the process environment) and uses them for the public book. `mainnet` calls `https://api.predict.fun` with the `x-api-key` header. Leaving the network unset stays on testnet, which has no `btc-updown-5m` series. Discovery errors, the round count, and `opened` are printed on stderr and stored in `summary.json`. A window that has already started is skipped; the next one is loaded during `split_lead_seconds` (300 unless `BOT_SPLIT_LEAD` is set).
+
+Check the key, the login, and the USDT balance without placing an order. The JSON it prints does not contain the key or the JWT:
+
+```powershell
+python -m paper_split_maker --config config.paper.json --check-connection
+```
 
 `requirements.txt` is the paper install. Live signing needs a second install, and still does not run unless every live gate passes:
 

@@ -20,6 +20,7 @@ from paper_split_maker.normalize import complement_levels
 TESTNET = "https://api-testnet.predict.fun"
 MAINNET = "https://api.predict.fun"
 ALLOWED_PREFIXES = (TESTNET, MAINNET)
+# Cloudflare answers the urllib default User-Agent with 403 "error code: 1010".
 USER_AGENT = "paper-split-maker/0.1 (read-only predict.fun; no orders)"
 UP_NAMES = {"up", "yes"}
 DOWN_NAMES = {"down", "no"}
@@ -59,9 +60,11 @@ class UrllibTransport:
             with self._opener.open(request, timeout=self.timeout) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
-            raise PublicDataError(
-                f"http {exc.code} for {url}", status=exc.code
-            ) from exc
+            detail = exc.read(180).decode("utf-8", errors="replace").strip()
+            message = f"http {exc.code} for {url}"
+            if detail:
+                message = f"{message}: {detail}"
+            raise PublicDataError(message, status=exc.code) from exc
         except urllib.error.URLError as exc:
             raise PublicDataError(f"network error for {url}: {exc.reason}") from exc
         try:
@@ -69,6 +72,14 @@ class UrllibTransport:
             return json.loads(raw, **kwargs)
         except json.JSONDecodeError as exc:
             raise PublicDataError(f"invalid json from {url}") from exc
+
+
+def client_from_env(env: dict | None) -> PublicReadClient:
+    """Read PREDICT_NETWORK and PREDICT_API_KEY. The key is a header, never a log line."""
+    env = env or {}
+    network = str(env.get("PREDICT_NETWORK") or "testnet").strip() or "testnet"
+    api_key = str(env.get("PREDICT_API_KEY") or "").strip()
+    return PublicReadClient(network=network, api_key=api_key)
 
 
 def rest_base(network: str = "testnet") -> str:
@@ -96,6 +107,17 @@ class PublicReadClient:
         self._by_token: dict[str, dict] = {}
         self._by_condition: dict[str, dict] = {}
         self._yes_cache: dict[str, dict] = {}
+        self.last_discovery: dict = {
+            "network": self.network,
+            "series": "",
+            "http_status": 0,
+            "rounds": 0,
+            "parsed": 0,
+            "matched": 0,
+            "unparsed": 0,
+            "starts": [],
+            "error": "",
+        }
 
     def discover_btc_updown(
         self,
@@ -106,23 +128,33 @@ class PublicReadClient:
     ) -> list[dict]:
         series_name, wanted = _wanted_slugs(now_s, slugs, series)
         url = (
-            f"{self.base}/v1/series/{urllib.parse.quote(series, safe='')}"
+            f"{self.base}/v1/series/{urllib.parse.quote(series_name, safe='')}"
             "/rounds?status=ACTIVE&first=20"
         )
         try:
-            payload = self.transport.get_json(url)
+            payload = self._rounds(url)
         except PublicDataError as exc:
+            self.last_discovery = self._discovery(
+                series_name, exc.status or 0, error=str(exc)
+            )
             if exc.status == 404:
                 return []
             raise
         rounds = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(rounds, list):
+            self.last_discovery = self._discovery(
+                series_name, 200, error="rounds payload is not a list"
+            )
             raise PublicDataError("rounds payload is not a list")
         found: list[dict] = []
+        starts: list[int] = []
+        unparsed = 0
         for category in rounds:
             converted = category_to_market(category, series_name)
             if converted is None:
+                unparsed += 1
                 continue
+            starts.append(int(converted.get("start_ts") or 0))
             if wanted and converted["slug"] not in wanted:
                 continue
             self._remember(converted)
@@ -130,7 +162,49 @@ class PublicReadClient:
             if len(found) >= limit:
                 break
         found.sort(key=lambda item: int(item.get("start_ts") or 0))
+        self.last_discovery = self._discovery(
+            series_name,
+            200,
+            rounds=len(rounds),
+            parsed=len(rounds) - unparsed,
+            matched=len(found),
+            unparsed=unparsed,
+            starts=starts[:8],
+        )
         return found[:limit]
+
+    def _rounds(self, url: str) -> object:
+        try:
+            return self.transport.get_json(url)
+        except PublicDataError as exc:
+            if exc.status != 400 or "status=" not in url:
+                raise
+            plain = url.split("?", 1)[0] + "?first=20"
+            return self.transport.get_json(plain)
+
+    def _discovery(
+        self,
+        series: str,
+        status: int,
+        *,
+        rounds: int = 0,
+        parsed: int = 0,
+        matched: int = 0,
+        unparsed: int = 0,
+        starts: list[int] | None = None,
+        error: str = "",
+    ) -> dict:
+        return {
+            "network": self.network,
+            "series": series,
+            "http_status": int(status or 0),
+            "rounds": rounds,
+            "parsed": parsed,
+            "matched": matched,
+            "unparsed": unparsed,
+            "starts": list(starts or []),
+            "error": error,
+        }
 
     def fetch_book(self, token_id: str) -> dict:
         meta = self._by_token.get(str(token_id))
@@ -290,7 +364,12 @@ def category_to_market(category: dict, series: str) -> dict | None:
         else category.get("isYieldBearing")
     )
     market_id = market.get("id")
-    condition = market.get("conditionId") or market.get("condition_id")
+    condition = (
+        market.get("conditionId")
+        or market.get("condition_id")
+        or category.get("conditionId")
+        or category.get("condition_id")
+    )
     if market_id is None or not condition:
         return None
     slug = f"{series_of(series)}-{start_s}"
@@ -339,8 +418,10 @@ def _outcome_pair(raw) -> tuple[dict, dict] | None:
                     "indexSet": 1 if name in UP_NAMES else 2,
                 }
             )
-        elif isinstance(item, dict) and item.get("onChainId"):
-            records.append(item)
+        elif isinstance(item, dict) and (item.get("onChainId") or item.get("positionId")):
+            record = dict(item)
+            record["onChainId"] = record.get("onChainId") or record.get("positionId")
+            records.append(record)
         else:
             return None
     up = down = None

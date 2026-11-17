@@ -267,8 +267,12 @@ class MapTransport:
 
 
 def _active_round():
-    """The window that contains the paper clock 1700000000."""
-    start = (1_700_000_000 // 300) * 300
+    """The next 5-minute window after the paper clock 1700000000.
+
+    The window that contains the clock has already started, so paper waits
+    for this one and loads it during the pre-open lead.
+    """
+    start = (1_700_000_000 // 300) * 300 + 300
     return {
         "startsAt": start,
         "endsAt": 1_893_456_000,

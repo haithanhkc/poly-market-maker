@@ -12,7 +12,7 @@ from decimal import ROUND_HALF_EVEN, Decimal
 from paper_split_maker.chain_data import WEI, chain_id
 from paper_split_maker.config import ConfigError
 from paper_split_maker.credentials import Credentials, refuse_mainnet
-from paper_split_maker.public_client import MAINNET, TESTNET
+from paper_split_maker.public_client import MAINNET, TESTNET, USER_AGENT
 
 ALLOWED_PREFIXES = (TESTNET, MAINNET)
 MIN_SELL_SHARES = Decimal("1")
@@ -328,7 +328,11 @@ class PredictClient:
         return self._builder
 
     def _headers(self, *, auth: bool) -> dict:
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        }
         if self.creds.network == "mainnet" and self.creds.api_key:
             headers["x-api-key"] = self.creds.api_key
         if auth and self.jwt:
@@ -337,6 +341,68 @@ class PredictClient:
 
     def _url(self, path: str) -> str:
         return self.base + path
+
+
+def check_connection(
+    creds: Credentials,
+    *,
+    transport=None,
+    balance_reader=None,
+    series: str = "btc-updown-5m",
+) -> dict:
+    """Read the API, log in, and read USDT. The report has no key, JWT, or signature."""
+    client = PredictClient(creds, transport=transport)
+    report = {
+        "network": creds.network,
+        "funder": creds.funder,
+        "predict_account": bool(creds.predict_account),
+        "api_key_present": bool(creds.api_key),
+        "rounds_status": 0,
+        "rounds": 0,
+        "login_ok": False,
+        "usdt": "",
+        "error": "",
+    }
+
+    def _fail(text: str) -> None:
+        safe = creds.redact(text)
+        report["error"] = f"{report['error']}; {safe}".strip("; ")
+
+    try:
+        status, payload = client.transport.request_json(
+            "GET",
+            client._url(f"/v1/series/{series}/rounds?first=1"),
+            None,
+            client._headers(auth=False),
+        )
+        report["rounds_status"] = int(status)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        report["rounds"] = len(data) if isinstance(data, list) else 0
+        if status >= 400:
+            message = ""
+            if isinstance(payload, dict):
+                message = str(payload.get("message") or payload.get("error") or "")
+            _fail(f"rounds http {status} {message}".strip())
+    except Exception as exc:
+        _fail(f"rounds failed: {exc}")
+    try:
+        client.ensure_jwt()
+        report["login_ok"] = bool(client.jwt)
+        client.jwt = ""
+    except Exception as exc:
+        report["login_ok"] = False
+        _fail(f"login failed: {exc}")
+    try:
+        if balance_reader is None:
+            from paper_split_maker.chain_send import collateral_balance_shares
+
+            balance_reader = lambda owner: collateral_balance_shares(
+                owner, network=creds.network
+            )
+        report["usdt"] = str(balance_reader(creds.funder))
+    except Exception as exc:
+        _fail(f"usdt balance failed: {exc}")
+    return report
 
 
 def order_view(order_hash: str, data: dict) -> dict:
@@ -362,10 +428,12 @@ class UrllibJsonTransport:
         if not url.startswith(ALLOWED_PREFIXES):
             raise RuntimeError("refusing non-official host")
         data = None if body is None else json.dumps(body).encode("utf-8")
+        sent = {"Accept": "application/json", "User-Agent": USER_AGENT}
+        sent.update(headers or {})
         request = urllib.request.Request(
             url,
             data=data,
-            headers=headers or {},
+            headers=sent,
             method=method,
         )
         try:

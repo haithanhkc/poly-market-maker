@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Callable, Optional
 
+from paper_split_maker.chain_data import window_seconds
 from paper_split_maker.config import Config, ConfigError
 from paper_split_maker.engine import Engine
 from paper_split_maker.logs import write_summary
@@ -15,7 +17,11 @@ from paper_split_maker.normalize import (
     data_api_trade_events,
     gamma_market_event,
 )
-from paper_split_maker.public_client import PublicDataError, PublicReadClient
+from paper_split_maker.public_client import (
+    PublicDataError,
+    PublicReadClient,
+    client_from_env,
+)
 
 
 def load_scenario(path: Path) -> tuple[dict, list[dict]]:
@@ -82,6 +88,7 @@ def run_paper(
     client: Optional[PublicReadClient] = None,
     now_s: Optional[Callable[[], float]] = None,
     sleep: Optional[Callable[[float], None]] = None,
+    env: Optional[dict] = None,
 ) -> dict:
     import time
 
@@ -91,7 +98,7 @@ def run_paper(
         raise ConfigError("max_markets must be positive")
     clock = now_s or time.time
     sleeper = sleep or time.sleep
-    reader = client or PublicReadClient()
+    reader = client or client_from_env(env)
     engine = open_engine(config, out_dir)
     engine.mode = "paper"
     started = clock()
@@ -99,36 +106,28 @@ def run_paper(
     notes = [
         "Public read-only paper session. No orders were sent.",
         "Bounded by duration_seconds and max_markets.",
+        f"discovery network={reader.network} series={getattr(config, 'series_slug', '') or 'btc-updown-5m'}",
     ]
+    seen: set[str] = set()
+    opened_slugs: set[str] = set()
+
+    def note(text: str) -> None:
+        if not text or text in seen:
+            return
+        seen.add(text)
+        notes.append(text)
+        _stderr(text)
+
     public_ok = True
-    try:
-        payloads = reader.discover_btc_updown(
-            int(started),
-            max_markets,
-            list(config.market_slugs) or None,
-            series=getattr(config, "series_slug", None),
-        )
-    except PublicDataError as exc:
-        public_ok = False
-        notes.append(f"discovery failed: {exc}")
-        payloads = []
-    opened = 0
-    for index, payload in enumerate(payloads):
-        if opened >= max_markets:
-            break
-        event = gamma_market_event(payload, synthetic=False)
-        if event is None:
-            notes.append(f"skipped undiscoverable or non Up/Down payload index {index}")
-            continue
-        event["event_id"] = f"open:{event['condition_id']}"
-        event["ts"] = int(clock() * 1000)
-        engine.handle_event(event)
-        if event["market_id"] in engine.state.markets:
-            opened += 1
     polls = 0
     while clock() < deadline:
         polls += 1
         stamp = int(clock() * 1000)
+        opened = _discover_due(
+            engine, reader, config, stamp, max_markets, note, opened_slugs
+        )
+        if reader.last_discovery.get("error"):
+            public_ok = False
         failed = False
         for market in list(engine.state.markets.values()):
             if market.status == "redeemed":
@@ -172,7 +171,7 @@ def run_paper(
                     engine.handle_event(resolution)
             except PublicDataError as exc:
                 failed = True
-                notes.append(f"poll failed: {exc}")
+                note(f"poll failed: {exc}")
                 break
         if failed:
             public_ok = False
@@ -200,11 +199,116 @@ def run_paper(
         if remaining <= 0:
             break
         sleeper(min(config.poll_interval_seconds, remaining))
-    notes.append(f"polls={polls} opened={opened}")
+    opened = len(opened_slugs)
+    stats = dict(getattr(reader, "last_discovery", {}) or {})
+    note(_discovery_line(stats))
+    note(f"polls={polls} opened={opened}")
     summary = engine.summary(notes=notes)
     summary["public_data_ok"] = public_ok
     summary["duration_seconds"] = duration_seconds
     summary["max_markets"] = max_markets
     summary["polls"] = polls
+    summary["opened"] = opened
+    summary["discovery"] = stats
     write_summary(out_dir, summary)
     return summary
+
+
+def _discover_due(engine, reader, config, stamp: int, max_markets: int, note, opened_slugs: set[str]) -> int:
+    """Load the next session during its pre-open lead. A window already open is skipped."""
+    series = str(getattr(config, "series_slug", "") or "btc-updown-5m")
+    window = window_seconds(series)
+    now_s = stamp // 1000
+    current = (now_s // window) * window
+    lead = int(getattr(config, "split_lead_seconds", 0) or 0)
+    note(f"{series}-{current} already started; waiting for the next session")
+    due = _due_slugs(series, window, now_s, lead, max_markets)
+    if not due:
+        if lead <= 0:
+            note("split_lead_seconds is 0; no upcoming session is loaded")
+        else:
+            nxt = current + window
+            note(f"next session {series}-{nxt} opens in {nxt - now_s}s; lead is {lead}s")
+        return len(opened_slugs)
+    explicit = [str(item) for item in (config.market_slugs or []) if str(item)]
+    slugs = explicit or due
+    try:
+        payloads = reader.discover_btc_updown(now_s, max(len(slugs), 1), slugs, series=series)
+    except PublicDataError as exc:
+        note(f"discovery failed: {exc}")
+        return len(opened_slugs)
+    stats = getattr(reader, "last_discovery", {}) or {}
+    if stats.get("error"):
+        note(f"discovery failed: {stats['error']}")
+    elif int(stats.get("rounds") or 0) == 0:
+        note(f"discovery returned no rounds for {series} on {reader.network}")
+    by_slug = {str(item.get("slug") or ""): item for item in payloads if isinstance(item, dict)}
+    for slug in slugs:
+        if len(opened_slugs) >= max_markets:
+            break
+        if _already_open(engine, slug):
+            opened_slugs.add(slug)
+            note(f"opened {slug}")
+            continue
+        payload = by_slug.get(slug)
+        if payload is None:
+            starts = stats.get("starts") or []
+            note(f"wanted {slug} not in {stats.get('rounds', 0)} rounds; saw starts {starts}")
+            continue
+        event = gamma_market_event(payload, market_id=slug, synthetic=False)
+        if event is None:
+            note(f"{slug} is not a usable Up/Down market")
+            continue
+        event["event_id"] = f"open:{slug}:{stamp}"
+        event["ts"] = stamp
+        engine.handle_event(event)
+        if _already_open(engine, slug):
+            opened_slugs.add(slug)
+            note(f"opened {slug}")
+        else:
+            note(f"{slug} was not loaded")
+    return len(opened_slugs)
+
+
+def _due_slugs(series: str, window: int, now_s: int, lead: int, max_markets: int) -> list[str]:
+    current = (int(now_s) // window) * window
+    due = []
+    for step in range(1, max(max_markets, 1) + 2):
+        open_s = current + step * window
+        wait = open_s - int(now_s)
+        if wait <= 0:
+            continue
+        if wait > lead:
+            break
+        due.append(f"{series}-{open_s}")
+        if len(due) >= max_markets:
+            break
+    return due
+
+
+def _already_open(engine, slug: str) -> bool:
+    if slug in engine.state.markets:
+        return True
+    return any(getattr(market, "slug", "") == slug for market in engine.state.markets.values())
+
+
+def _discovery_line(stats: dict) -> str:
+    if not stats:
+        return ""
+    return (
+        "discovery "
+        f"network={stats.get('network')} series={stats.get('series')} "
+        f"http={stats.get('http_status')} rounds={stats.get('rounds')} "
+        f"parsed={stats.get('parsed')} matched={stats.get('matched')} "
+        f"unparsed={stats.get('unparsed')}"
+    )
+
+
+def _stderr(text: str) -> None:
+    try:
+        print(text, file=sys.stderr)
+    except UnicodeEncodeError:
+        stream = getattr(sys.stderr, "buffer", None)
+        if stream is not None:
+            stream.write((text + "\n").encode("utf-8", "replace"))
+            stream.flush()

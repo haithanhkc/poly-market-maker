@@ -281,7 +281,10 @@ def run_confirmed_live(
     if reader is None:
         from paper_split_maker.public_client import PublicReadClient
 
-        reader = PublicReadClient()
+        reader = PublicReadClient(
+            network=getattr(creds, "network", "testnet"),
+            api_key=getattr(creds, "api_key", ""),
+        )
     ws_queue: queue.Queue = queue.Queue()
     ws_stop = threading.Event()
     ws_assets: list[str] = []

@@ -44,6 +44,11 @@ def main(argv: list[str] | None = None) -> int:
         help="paper poll window; live uses max_runtime_seconds in the config",
     )
     parser.add_argument("--live", action="store_true")
+    parser.add_argument(
+        "--check-connection",
+        action="store_true",
+        help="read the API key, log in, and read USDT, then exit",
+    )
     parser.add_argument("--yes-i-understand-live-risk", action="store_true")
     parser.add_argument(
         "--redeem-pending",
@@ -53,8 +58,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        if args.check_connection:
+            return _check_connection(args)
         if args.redeem_pending is not None:
-            return _redeem_pending(args.redeem_pending)
+            return _redeem_pending(args)
         if args.config is None or args.out is None:
             parser.error("--config and --out are required")
         if args.live:
@@ -83,6 +90,7 @@ def _run_paper(args) -> int:
         Path(args.out),
         duration_seconds=duration,
         max_markets=args.max_markets,
+        env=_credential_env(args.config),
     )
     _print_summary(summary)
     return 0
@@ -155,17 +163,41 @@ def _run_live(args) -> int:
     return 0
 
 
-def _redeem_pending(path: Path) -> int:
+def _check_connection(args) -> int:
+    """Verify the key, the login, and the USDT balance. Nothing here is an order."""
+    if args.config is None:
+        print("config error: --config is required with --check-connection")
+        return 2
+    from paper_split_maker.live_clob import check_connection
+
+    creds = load_credentials(_credential_env(args.config))
+    series = "btc-updown-5m"
+    try:
+        from paper_split_maker.config import load_config
+
+        series = load_config(args.config).series_slug
+    except ConfigError:
+        pass
+    report = check_connection(creds, series=series)
+    _safe_print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    ok = report.get("login_ok") and int(report.get("rounds_status") or 0) < 400 and report.get("usdt") != ""
+    return 0 if ok else 2
+
+
+def _redeem_pending(args) -> int:
     """Retry a deferred redeem file. Loads keys only on this path."""
     from paper_split_maker.live_runner import redeem_pending_once
     from paper_split_maker.normalize import resolution_settled
 
+    path = args.redeem_pending
     creds = load_credentials(_credential_env(args.config))
 
     def resolved(condition_id: str) -> bool:
         from paper_split_maker.public_client import PublicReadClient
 
-        payload = PublicReadClient().fetch_resolution(condition_id)
+        payload = PublicReadClient(
+            network=creds.network, api_key=creds.api_key
+        ).fetch_resolution(condition_id)
         return resolution_settled(condition_id, payload)
 
     def submit(record: dict) -> None:
@@ -204,6 +236,10 @@ def _print_summary(summary: dict) -> None:
         "rebate_estimate_unguaranteed": summary.get("rebate_estimate_unguaranteed"),
         "at_risk_cap": summary.get("at_risk_cap"),
         "public_data_ok": summary.get("public_data_ok"),
+        "polls": summary.get("polls"),
+        "opened": summary.get("opened"),
+        "discovery": summary.get("discovery"),
+        "notes": summary.get("notes"),
         "disclaimer_vi": summary.get("disclaimer_vi"),
     }
     text = json.dumps(brief, ensure_ascii=False, indent=2, sort_keys=True)
