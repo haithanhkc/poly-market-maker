@@ -410,7 +410,10 @@ def category_to_market(category: dict, series: str) -> dict | None:
         return None
     slug = f"{series_of(series)}-{start_s}"
     question = str(market.get("question") or category.get("title") or slug)
-    return {
+    from paper_split_maker.binance_btc import reference_price_from_category
+
+    strike = reference_price_from_category(category, market)
+    payload = {
         "id": str(market_id),
         "predictMarketId": str(market_id),
         "version": "v1",
@@ -433,6 +436,9 @@ def category_to_market(category: dict, series: str) -> dict | None:
         "_up_token": str(up["onChainId"]),
         "_down_token": str(down["onChainId"]),
     }
+    if strike is not None:
+        payload["referencePrice"] = format(strike, "f")
+    return payload
 
 
 def _outcome_pair(raw) -> tuple[dict, dict] | None:

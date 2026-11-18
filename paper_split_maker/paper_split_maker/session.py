@@ -118,8 +118,47 @@ def run_paper(
         notes.append(text)
         _stderr(text)
 
+    feed = _start_binance(config, engine, note)
     public_ok = True
     polls = 0
+    try:
+        return _paper_loop(
+            config,
+            out_dir,
+            engine,
+            reader,
+            clock,
+            sleeper,
+            deadline,
+            duration_seconds,
+            max_markets,
+            note,
+            notes,
+            opened_slugs,
+            public_ok,
+            polls,
+        )
+    finally:
+        if feed is not None:
+            feed.stop()
+
+
+def _paper_loop(
+    config,
+    out_dir,
+    engine,
+    reader,
+    clock,
+    sleeper,
+    deadline,
+    duration_seconds,
+    max_markets,
+    note,
+    notes,
+    opened_slugs,
+    public_ok,
+    polls,
+):
     while clock() < deadline:
         polls += 1
         stamp = int(clock() * 1000)
@@ -227,6 +266,21 @@ def run_paper(
     summary["discovery"] = stats
     write_summary(out_dir, summary)
     return summary
+
+
+def _start_binance(config, engine, note):
+    """Public BTC trade stream. Only small_pair with the lean flag connects."""
+    if not getattr(config, "small_pair_binance", False):
+        return None
+    if str(getattr(config, "strategy", "") or "") != "small_pair":
+        return None
+    from paper_split_maker.binance_btc import BinanceBtcFeed
+
+    feed = BinanceBtcFeed(lookback_s=int(config.small_pair_vol_lookback_seconds))
+    engine.binance_feed = feed
+    feed.start()
+    note("binance btc feed started (public trade stream, no orders)")
+    return feed
 
 
 def sessions_due(series: str, now_s: int, lead: int, *, include_current: bool) -> list[str]:

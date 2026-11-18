@@ -158,7 +158,7 @@ def gamma_market_event(
     if accepting is None:
         accepting = not closed
     ident = market_id or str(payload.get("id") or condition_id)
-    return {
+    event = {
         "type": "market_open",
         "market_id": ident,
         "condition_id": str(condition_id),
@@ -177,6 +177,10 @@ def gamma_market_event(
         "synthetic": synthetic,
         "closed": closed,
     }
+    reference = payload.get("referencePrice") or payload.get("reference_price")
+    if reference not in (None, ""):
+        event["reference_price"] = str(reference)
+    return event
 
 
 def clob_book_event(

@@ -69,6 +69,11 @@ def main(argv: list[str] | None = None) -> int:
             "Default is btc-updown-5m,btc-updown-15m."
         ),
     )
+    parser.add_argument(
+        "--binance-lean",
+        action="store_true",
+        help="lean small_pair toward the Binance fair value. Off by default.",
+    )
     parser.add_argument("--live", action="store_true")
     parser.add_argument(
         "--check-connection",
@@ -127,6 +132,8 @@ def _apply_strategy(config, args):
     chosen = getattr(args, "series", None)
     if chosen not in (None, ""):
         config.small_pair_series = parse_series_list(chosen)
+    if getattr(args, "binance_lean", False):
+        config.small_pair_binance = True
     _honor_bankroll(config, args)
     return config
 

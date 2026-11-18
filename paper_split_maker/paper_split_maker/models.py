@@ -18,6 +18,12 @@ def _d(value: object) -> Decimal:
     return D(value)
 
 
+def _optional_decimal(value: object) -> Optional[Decimal]:
+    if value in (None, ""):
+        return None
+    return D(value)
+
+
 @dataclass
 class LevelBook:
     ts_ms: int = -1
@@ -126,6 +132,19 @@ class Market:
     pause_until_ms: int = 0
     last_requote_ts: int = -(10**18)
     pending_split: Decimal = ZERO
+    reference_price: Optional[Decimal] = None
+    reference_source: str = ""
+    reference_logged: bool = False
+    fair_gap_abs_sum: Decimal = ZERO
+    fair_gap_n: int = 0
+    fair_gap_max: Decimal = ZERO
+    binance_implied_winner: str = ""
+    binance_close_locked: bool = False
+    last_binance: Optional[Decimal] = None
+    last_fair_up: Optional[Decimal] = None
+    last_mid_up: Optional[Decimal] = None
+    last_gap: Optional[Decimal] = None
+    last_lean_action: str = ""
 
     def inventory(self, outcome: str) -> Decimal:
         return self.up if outcome == "up" else self.down
@@ -191,6 +210,19 @@ class Market:
             "pause_until_ms": self.pause_until_ms,
             "last_requote_ts": self.last_requote_ts,
             "pending_split": money(self.pending_split),
+            "reference_price": money(self.reference_price) if self.reference_price else None,
+            "reference_source": self.reference_source,
+            "reference_logged": self.reference_logged,
+            "fair_gap_abs_sum": money(self.fair_gap_abs_sum),
+            "fair_gap_n": self.fair_gap_n,
+            "fair_gap_max": money(self.fair_gap_max),
+            "binance_implied_winner": self.binance_implied_winner,
+            "binance_close_locked": self.binance_close_locked,
+            "last_binance": money(self.last_binance) if self.last_binance else None,
+            "last_fair_up": money(self.last_fair_up) if self.last_fair_up else None,
+            "last_mid_up": money(self.last_mid_up) if self.last_mid_up else None,
+            "last_gap": money(self.last_gap) if self.last_gap is not None else None,
+            "last_lean_action": self.last_lean_action,
         }
 
     @classmethod
@@ -255,6 +287,19 @@ class Market:
             pause_until_ms=int(data.get("pause_until_ms", 0)),
             last_requote_ts=int(data.get("last_requote_ts", -(10**18))),
             pending_split=_d(data.get("pending_split", "0")),
+            reference_price=_optional_decimal(data.get("reference_price")),
+            reference_source=str(data.get("reference_source") or ""),
+            reference_logged=bool(data.get("reference_logged", False)),
+            fair_gap_abs_sum=_d(data.get("fair_gap_abs_sum", "0")),
+            fair_gap_n=int(data.get("fair_gap_n", 0) or 0),
+            fair_gap_max=_d(data.get("fair_gap_max", "0")),
+            binance_implied_winner=str(data.get("binance_implied_winner") or ""),
+            binance_close_locked=bool(data.get("binance_close_locked", False)),
+            last_binance=_optional_decimal(data.get("last_binance")),
+            last_fair_up=_optional_decimal(data.get("last_fair_up")),
+            last_mid_up=_optional_decimal(data.get("last_mid_up")),
+            last_gap=_optional_decimal(data.get("last_gap")),
+            last_lean_action=str(data.get("last_lean_action") or ""),
         )
 
 

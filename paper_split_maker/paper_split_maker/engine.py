@@ -8,6 +8,7 @@ latency and only while the feed is up.
 
 from __future__ import annotations
 
+import sys
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
@@ -99,6 +100,7 @@ class Engine:
         # Long replays flush the ledger once at the end. Live paper mode keeps
         # the default and writes state after every event.
         self.persist_each_event = True
+        self.binance_feed = None
 
     @classmethod
     def create(
@@ -1180,9 +1182,18 @@ class Engine:
         if left < 0:
             left = ZERO
         tick = market.tick_size if market.tick_size > 0 else self.config.default_tick
+        up_bid = market.up_book.best_bid()
+        up_ask = market.up_book.best_ask()
+        fair = None
+        spot = None
+        s0 = market.reference_price
+        if self.config.small_pair_binance:
+            spot, s0, fair = self._apply_binance_lean(
+                market, open_ms, window, age_s, up_bid, up_ask
+            )
         plan = plan_small_pair(
-            up_bid=market.up_book.best_bid(),
-            up_ask=market.up_book.best_ask(),
+            up_bid=up_bid,
+            up_ask=up_ask,
             up_levels=market.up_book.bids,
             down_bid=market.down_book.best_bid(),
             down_ask=market.down_book.best_ask(),
@@ -1193,7 +1204,13 @@ class Engine:
             budget_left=left,
             age_s=age_s,
             window_s=window,
+            fair_up=fair,
+            fair_gap=self.config.small_pair_fair_gap,
+            loser_fair=self.config.small_pair_loser_fair,
+            loser_after_s=self.config.small_pair_loser_after_seconds,
         )
+        if self.config.small_pair_binance:
+            self._log_binance_lean(market, spot, s0, fair, up_bid, up_ask, plan.action or plan.reason)
         if not plan.bids:
             self._cancel_market(market, plan.reason or "no_bid")
             self._skip(market, plan.reason or "no_bid")
@@ -1201,6 +1218,83 @@ class Engine:
         self._sync_bids(market, plan.bids, "small_pair")
         if plan.reason:
             self._skip(market, plan.reason)
+
+    def _apply_binance_lean(self, market, open_ms, window, age_s, up_bid, up_ask):
+        """Record S0, fair value, and the gap. Returns spot, S0, and P(Up)."""
+        from paper_split_maker.binance_btc import fair_up
+
+        feed = self.binance_feed
+        latest = feed.latest() if feed is not None else None
+        spot = latest[1] if latest else None
+        if (
+            (market.reference_price is None or market.reference_price <= 0)
+            and spot is not None
+            and self.state.now_ms >= open_ms
+        ):
+            at_open = feed.price_at(open_ms) if feed is not None else None
+            market.reference_price = at_open or spot
+            market.reference_source = "binance"
+        if market.reference_price and not market.reference_logged:
+            market.reference_logged = True
+            print(
+                f"small_pair {market.slug or market.market_id} "
+                f"reference source={market.reference_source or 'unknown'} "
+                f"s0={market.reference_price}",
+                file=sys.stderr,
+                flush=True,
+            )
+        s0 = market.reference_price
+        fair = None
+        if spot is not None and s0 is not None and s0 > 0:
+            remaining = (open_ms + int(window) * 1000 - self.state.now_ms) / 1000
+            sigma = feed.vol(self.state.now_ms) if feed is not None else None
+            fair = fair_up(
+                spot,
+                s0,
+                sigma,
+                remaining,
+                self.config.small_pair_sigma_floor,
+            )
+            implied = "up" if spot >= s0 else "down"
+            if not market.binance_close_locked:
+                market.binance_implied_winner = implied
+            if remaining <= 1:
+                market.binance_close_locked = True
+                market.binance_implied_winner = implied
+        return spot, s0, fair
+
+    def _log_binance_lean(self, market, spot, s0, fair, up_bid, up_ask, action) -> None:
+        mid = None
+        if up_bid is not None and up_ask is not None and up_ask > up_bid:
+            mid = (up_bid + up_ask) / 2
+        gap = None
+        if fair is not None and mid is not None:
+            gap = fair - mid
+            width = abs(gap)
+            market.fair_gap_abs_sum += width
+            market.fair_gap_n += 1
+            if width > market.fair_gap_max:
+                market.fair_gap_max = width
+        market.last_binance = spot
+        market.last_fair_up = fair
+        market.last_mid_up = mid
+        market.last_gap = gap
+        market.last_lean_action = action or ""
+        detail = (
+            f"px={spot if spot is not None else '-'} "
+            f"s0={s0 if s0 is not None else '-'} "
+            f"source={market.reference_source or '-'} "
+            f"fair_up={fair if fair is not None else '-'} "
+            f"mid_up={mid if mid is not None else '-'} "
+            f"gap={gap if gap is not None else '-'} "
+            f"action={action or '-'}"
+        )
+        print(
+            f"binance_lean {market.slug or market.market_id} {detail}",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._emit(kind="binance_lean", market=market, reason=action or "", detail=detail)
 
     def _decide(self, market: Market) -> None:
         if self.config.strategy == "dual_bid":
@@ -2703,6 +2797,15 @@ def _market_from_event(event: dict, config: Config) -> Market:
         up_book=LevelBook(),
         down_book=LevelBook(),
     )
+    reference = event.get("reference_price")
+    if reference not in (None, ""):
+        try:
+            price = Decimal(str(reference))
+        except (ValueError, ArithmeticError):
+            price = None
+        if price is not None and price > 0:
+            market.reference_price = price
+            market.reference_source = "predict"
     if market.up_token_id == market.down_token_id:
         raise ValueError("duplicate token ids")
     if {market.up_label.casefold(), market.down_label.casefold()} != {"up", "down"}:

@@ -138,6 +138,17 @@ class Config:
     min_share_balance: Decimal = Decimal("0.85")
     min_bid_price: Decimal = Decimal("0.10")
     round_budget: Decimal = Decimal("25")
+    # Off unless --binance-lean or this flag. The book-mid quote is unchanged.
+    small_pair_binance: bool = False
+    # Recentre on fair value once |fair - mid| exceeds this.
+    small_pair_fair_gap: Decimal = Decimal("0.03")
+    # After small_pair_loser_after_seconds, a side below this fair value is pulled.
+    small_pair_loser_fair: Decimal = Decimal("0.30")
+    small_pair_loser_after_seconds: int = 60
+    # Per-second log-return volatility floor. About 56% annualized.
+    small_pair_sigma_floor: Decimal = Decimal("0.0001")
+    # Realized vol window, in seconds. 600 is inside the 5-15 minute band.
+    small_pair_vol_lookback_seconds: int = 600
     ladder_levels: int = 3
     ladder_spacing: Decimal = Decimal("0.01")
     # Join the touch on a side once its mid is this far below the other.
@@ -271,6 +282,16 @@ class Config:
             raise ConfigError(
                 "small_pair_series must be btc-updown-5m, btc-updown-15m, or btc-updown-1h"
             )
+        if self.small_pair_fair_gap < 0 or self.small_pair_fair_gap >= 1:
+            raise ConfigError("small_pair_fair_gap must be in [0, 1)")
+        if self.small_pair_loser_fair <= 0 or self.small_pair_loser_fair >= Decimal("0.5"):
+            raise ConfigError("small_pair_loser_fair must sit inside (0, 0.5)")
+        if self.small_pair_loser_after_seconds < 0:
+            raise ConfigError("small_pair_loser_after_seconds must be non-negative")
+        if self.small_pair_sigma_floor <= 0:
+            raise ConfigError("small_pair_sigma_floor must be positive")
+        if self.small_pair_vol_lookback_seconds < 60:
+            raise ConfigError("small_pair_vol_lookback_seconds must be at least 60")
         if self.ladder_levels < 1:
             raise ConfigError("ladder_levels must be at least 1")
         if self.ladder_spacing <= 0:
@@ -362,6 +383,9 @@ _DECIMAL_FIELDS = {
     "min_share_balance",
     "min_bid_price",
     "round_budget",
+    "small_pair_fair_gap",
+    "small_pair_loser_fair",
+    "small_pair_sigma_floor",
 }
 _INT_FIELDS = {
     "stale_after_ms",
@@ -391,6 +415,8 @@ _INT_FIELDS = {
     "dual_bid_stop_seconds",
     "dual_bid_levels",
     "dual_bid_requote_ms",
+    "small_pair_loser_after_seconds",
+    "small_pair_vol_lookback_seconds",
 }
 _BOOL_FIELDS = {
     "trade_through_fills",
@@ -398,6 +424,7 @@ _BOOL_FIELDS = {
     "auto_split",
     "merge_when_idle",
     "live",
+    "small_pair_binance",
 }
 
 

@@ -60,6 +60,13 @@ python -m paper_split_maker --config config.paper.json --strategy small_pair --s
 
 The process sends no orders. Mainnet reads still need `PREDICT_NETWORK=mainnet` and `PREDICT_API_KEY` in `.env`. `--live` with `small_pair` is refused. Each `rounds` row has the winner, fills and shares per side, average prices, pair cost, matched shares, the excess side and its price, and PnL split into matched and excess.
 
+`--binance-lean` (config `small_pair_binance`, default off) reads the public Binance BTCUSDT trade stream and leans the 0.96 pair toward that fair value. It does not send orders and does not use an API key. When predict.fun prints a strike, that price is the round open; otherwise the open is the Binance price at the window start. The log line is `binance_lean` with price, S0, fair Up, the predict mid, the gap, and the action. Each `rounds` row then also has the reference source, the Binance-implied winner at the close, whether that agrees with the settlement winner, and the mean and max absolute gap. A 10-session 5-minute wrapper is `run_smallpair_bn10.ps1` (about 65 minutes, `runs\smallpair_bn10`):
+
+```powershell
+cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
+.\run_smallpair_bn10.ps1
+```
+
 Check the key, the login, and the USDT balance without placing an order. The JSON it prints does not contain the key or the JWT:
 
 ```powershell
