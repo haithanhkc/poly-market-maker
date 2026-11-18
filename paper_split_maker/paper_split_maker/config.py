@@ -140,15 +140,36 @@ class Config:
     round_budget: Decimal = Decimal("25")
     # Off unless --binance-lean or this flag. The book-mid quote is unchanged.
     small_pair_binance: bool = False
-    # Recentre on fair value once |fair - mid| exceeds this.
+    # Kept so older configs still load. The lean no longer recentres on fair value.
     small_pair_fair_gap: Decimal = Decimal("0.03")
-    # After small_pair_loser_after_seconds, a side below this fair value is pulled.
-    small_pair_loser_fair: Decimal = Decimal("0.30")
-    small_pair_loser_after_seconds: int = 60
+    # After this many seconds, stop a side whose fair value is below small_pair_loser_fair.
+    small_pair_loser_fair: Decimal = Decimal("0.45")
+    small_pair_loser_after_seconds: int = 30
+    # Drop a bid that is more than this far above that side's fair value.
+    # The wider gap is used when the Binance print is older than small_pair_stale_seconds.
+    small_pair_adverse_gap: Decimal = Decimal("0.02")
+    small_pair_adverse_gap_stale: Decimal = Decimal("0.03")
+    small_pair_stale_seconds: int = 2
     # Per-second log-return volatility floor. About 56% annualized.
     small_pair_sigma_floor: Decimal = Decimal("0.0001")
-    # Realized vol window, in seconds. 600 is inside the 5-15 minute band.
-    small_pair_vol_lookback_seconds: int = 600
+    # Realized vol window. 900 seconds is 15 minutes. The multiplier cannot exceed 1.
+    small_pair_vol_lookback_seconds: int = 900
+    small_pair_sigma_multiplier: Decimal = Decimal("1")
+    # P >= favorite_fair may hold this many excess shares. P < 0.5 is capped lower.
+    small_pair_favorite_excess: Decimal = Decimal("12")
+    small_pair_underdog_excess: Decimal = Decimal("4")
+    small_pair_favorite_fair: Decimal = Decimal("0.55")
+    # |mid - 0.5| below this band uses the nearer pair sum, unless the mode halves the lot.
+    small_pair_neutral_band: Decimal = Decimal("0.10")
+    small_pair_neutral_target: Decimal = Decimal("0.94")
+    small_pair_neutral_mode: str = "sum"
+    # Binance mode waits this long after the open, and pulls P < 0.5 from this second.
+    small_pair_start_seconds: int = 10
+    small_pair_late_loser_seconds: int = 240
+    # Per-session spend is min(round budget, cap, equity * fraction) when the lean is on.
+    session_budget_cap: Decimal = Decimal("25")
+    session_budget_fraction: Decimal = Decimal("0.25")
+    session_budget_min: Decimal = Decimal("1")
     ladder_levels: int = 3
     ladder_spacing: Decimal = Decimal("0.01")
     # Join the touch on a side once its mid is this far below the other.
@@ -284,14 +305,48 @@ class Config:
             )
         if self.small_pair_fair_gap < 0 or self.small_pair_fair_gap >= 1:
             raise ConfigError("small_pair_fair_gap must be in [0, 1)")
-        if self.small_pair_loser_fair <= 0 or self.small_pair_loser_fair >= Decimal("0.5"):
-            raise ConfigError("small_pair_loser_fair must sit inside (0, 0.5)")
+        if self.small_pair_loser_fair <= 0 or self.small_pair_loser_fair > Decimal("0.5"):
+            raise ConfigError("small_pair_loser_fair must sit inside (0, 0.5]")
         if self.small_pair_loser_after_seconds < 0:
             raise ConfigError("small_pair_loser_after_seconds must be non-negative")
+        if self.small_pair_adverse_gap <= 0 or self.small_pair_adverse_gap >= 1:
+            raise ConfigError("small_pair_adverse_gap must sit inside (0, 1)")
+        if self.small_pair_adverse_gap_stale < self.small_pair_adverse_gap:
+            raise ConfigError("small_pair_adverse_gap_stale must be at least the fresh gap")
+        if self.small_pair_adverse_gap_stale >= 1:
+            raise ConfigError("small_pair_adverse_gap_stale must be below 1")
+        if self.small_pair_stale_seconds < 0:
+            raise ConfigError("small_pair_stale_seconds must be non-negative")
         if self.small_pair_sigma_floor <= 0:
             raise ConfigError("small_pair_sigma_floor must be positive")
         if self.small_pair_vol_lookback_seconds < 60:
             raise ConfigError("small_pair_vol_lookback_seconds must be at least 60")
+        if self.small_pair_sigma_multiplier <= 0 or self.small_pair_sigma_multiplier > 1:
+            raise ConfigError("small_pair_sigma_multiplier must sit inside (0, 1]")
+        if self.small_pair_underdog_excess < 2 or self.small_pair_underdog_excess > 4:
+            raise ConfigError("small_pair_underdog_excess must sit inside [2, 4]")
+        if self.small_pair_favorite_excess < self.small_pair_underdog_excess:
+            raise ConfigError("small_pair_favorite_excess must be at least the underdog cap")
+        if self.small_pair_favorite_fair <= Decimal("0.5") or self.small_pair_favorite_fair >= 1:
+            raise ConfigError("small_pair_favorite_fair must sit inside (0.5, 1)")
+        if self.small_pair_neutral_band <= 0 or self.small_pair_neutral_band >= Decimal("0.5"):
+            raise ConfigError("small_pair_neutral_band must sit inside (0, 0.5)")
+        if self.small_pair_neutral_target <= 0 or self.small_pair_neutral_target > 1:
+            raise ConfigError("small_pair_neutral_target must sit inside (0, 1]")
+        if self.small_pair_neutral_mode not in {"sum", "half_lot"}:
+            raise ConfigError("small_pair_neutral_mode must be sum or half_lot")
+        if self.small_pair_start_seconds < 0:
+            raise ConfigError("small_pair_start_seconds must be non-negative")
+        if self.small_pair_late_loser_seconds < 0:
+            raise ConfigError("small_pair_late_loser_seconds must be non-negative")
+        if self.session_budget_cap <= 0:
+            raise ConfigError("session_budget_cap must be positive")
+        if self.session_budget_fraction <= 0 or self.session_budget_fraction > 1:
+            raise ConfigError("session_budget_fraction must sit inside (0, 1]")
+        if self.session_budget_min <= 0:
+            raise ConfigError("session_budget_min must be positive")
+        if self.session_budget_min > self.session_budget_cap:
+            raise ConfigError("session_budget_min cannot exceed session_budget_cap")
         if self.ladder_levels < 1:
             raise ConfigError("ladder_levels must be at least 1")
         if self.ladder_spacing <= 0:
@@ -385,7 +440,18 @@ _DECIMAL_FIELDS = {
     "round_budget",
     "small_pair_fair_gap",
     "small_pair_loser_fair",
+    "small_pair_adverse_gap",
+    "small_pair_adverse_gap_stale",
     "small_pair_sigma_floor",
+    "small_pair_sigma_multiplier",
+    "small_pair_favorite_excess",
+    "small_pair_underdog_excess",
+    "small_pair_favorite_fair",
+    "small_pair_neutral_band",
+    "small_pair_neutral_target",
+    "session_budget_cap",
+    "session_budget_fraction",
+    "session_budget_min",
 }
 _INT_FIELDS = {
     "stale_after_ms",
@@ -416,7 +482,10 @@ _INT_FIELDS = {
     "dual_bid_levels",
     "dual_bid_requote_ms",
     "small_pair_loser_after_seconds",
+    "small_pair_stale_seconds",
     "small_pair_vol_lookback_seconds",
+    "small_pair_start_seconds",
+    "small_pair_late_loser_seconds",
 }
 _BOOL_FIELDS = {
     "trade_through_fills",
@@ -471,6 +540,10 @@ def config_from_mapping(data: dict) -> Config:
             kwargs[key] = tuple(value)
         elif key == "small_pair_series":
             kwargs[key] = parse_series_list(value)
+        elif key == "small_pair_neutral_mode":
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError("small_pair_neutral_mode must be a string")
+            kwargs[key] = value.strip()
         elif key == "kill_switch_file":
             if not isinstance(value, str):
                 raise ConfigError("kill_switch_file must be a string")

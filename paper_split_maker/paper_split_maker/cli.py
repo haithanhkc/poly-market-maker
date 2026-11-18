@@ -37,13 +37,20 @@ def main(argv: list[str] | None = None) -> int:
         "--max-markets",
         type=int,
         default=None,
-        help="sessions to open (default 1, or BOT_MAX_MARKETS). Up to 500.",
+        help=(
+            "sessions to open (default 1, or BOT_MAX_MARKETS). Up to 500. "
+            "0 means no cap. With --duration-seconds 0, omitting this flag is also unlimited."
+        ),
     )
     parser.add_argument(
         "--duration-seconds",
         type=int,
         default=None,
-        help="paper poll window; live uses max_runtime_seconds in the config",
+        help=(
+            "paper poll window. 0 means no time limit. "
+            "Together with --max-markets 0, or with --max-markets omitted, the run "
+            "continues until it cannot fund a session or it is stopped."
+        ),
     )
     parser.add_argument(
         "--strategy",
@@ -72,7 +79,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--binance-lean",
         action="store_true",
-        help="lean small_pair toward the Binance fair value. Off by default.",
+        help=(
+            "filter small_pair bids with the public Binance fair value. Off by default."
+        ),
     )
     parser.add_argument("--live", action="store_true")
     parser.add_argument(
@@ -112,7 +121,10 @@ def _load(args):
     """
     raw = load_config(args.config)
     explicit = getattr(args, "max_markets", None) is not None
-    requested = args.max_markets if explicit else 1
+    unlimited_markets = explicit and args.max_markets == 0
+    requested = 1 if (not explicit or unlimited_markets) else args.max_markets
+    if requested < 1 or requested > 500:
+        raise ConfigError("max markets must be from 1 to 500")
     settings = prepare_run(
         args.config,
         os.environ,
@@ -121,7 +133,7 @@ def _load(args):
     )
     settings.config.json_initial_capital = raw.initial_capital
     settings.config.json_max_loss_fraction = raw.max_loss_fraction
-    args.max_markets = settings.max_markets
+    args.max_markets = 0 if unlimited_markets else settings.max_markets
     return settings.config
 
 
@@ -181,16 +193,29 @@ def _honor_bankroll(config, args):
 
 
 def _run_paper(args) -> int:
+    asked_markets = args.max_markets
+    asked_duration = args.duration_seconds
     config = _apply_strategy(_load(args), args)
     if config.live:
         print("config has live:true. Refusing to trade without --live.")
         return 2
-    duration = args.duration_seconds or config.paper_duration_seconds
+    if asked_duration is None:
+        duration = config.paper_duration_seconds
+    else:
+        duration = asked_duration
+    if duration < 0:
+        raise ConfigError("duration_seconds must be zero or positive")
+    if asked_markets is None and duration == 0:
+        markets = 0
+    elif asked_markets == 0:
+        markets = 0
+    else:
+        markets = args.max_markets
     summary = run_paper(
         config,
         Path(args.out),
         duration_seconds=duration,
-        max_markets=args.max_markets,
+        max_markets=markets,
         env=_credential_env(args.config),
     )
     _print_summary(summary)

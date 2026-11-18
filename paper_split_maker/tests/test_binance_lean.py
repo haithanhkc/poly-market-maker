@@ -139,51 +139,171 @@ def _tops(plan):
     return (up[0] if up else None), (down[0] if down else None)
 
 
-def test_lean_recentres_past_the_gap_and_keeps_the_pair_under_the_target():
-    untouched = _plan(fair_up=Decimal("0.51"))
-    assert _tops(untouched) == (Decimal("0.48"), Decimal("0.48"))
-    assert untouched.action == "mid"
-    leaned = _plan(
+def _filter(**overrides):
+    values = dict(binance_filter=True, binance_age_s=0, age_s=10, fair_up=Decimal("0.50"))
+    values.update(overrides)
+    return _plan(**values)
+
+
+def test_flag_off_keeps_the_book_mid_pair():
+    plan = _plan(age_s=2, fair_up=Decimal("0.20"))
+    assert _tops(plan) == (Decimal("0.48"), Decimal("0.48"))
+    assert plan.action == "mid"
+    assert plan.filtered == ()
+
+
+def test_adverse_filter_uses_a_wider_gap_when_the_print_is_stale():
+    fresh = _filter(
+        fair_up=Decimal("0.555"),
+        up_bid=Decimal("0.58"),
+        up_ask=Decimal("0.62"),
+        down_bid=Decimal("0.20"),
+        down_ask=Decimal("0.80"),
+        binance_age_s=1,
+    )
+    up, _down = _tops(fresh)
+    assert up != Decimal("0.58")
+    assert dict(fresh.filtered).get("adverse", 0) >= 1
+    stale = _filter(
+        fair_up=Decimal("0.555"),
+        up_bid=Decimal("0.58"),
+        up_ask=Decimal("0.62"),
+        down_bid=Decimal("0.20"),
+        down_ask=Decimal("0.80"),
+        binance_age_s=3,
+    )
+    assert _tops(stale)[0] == Decimal("0.58")
+
+
+def test_loser_cutoff_replaces_the_old_threshold():
+    early = _filter(
+        age_s=29,
+        fair_up=Decimal("0.44"),
+        up_bid=Decimal("0.40"),
+        up_ask=Decimal("0.44"),
+        down_bid=Decimal("0.20"),
+        down_ask=Decimal("0.80"),
+    )
+    assert "up" in {bid.outcome for bid in early.bids}
+    pulled = _filter(
+        age_s=30,
+        fair_up=Decimal("0.44"),
+        up_bid=Decimal("0.40"),
+        up_ask=Decimal("0.44"),
+        down_bid=Decimal("0.20"),
+        down_ask=Decimal("0.80"),
+    )
+    assert "up" not in {bid.outcome for bid in pulled.bids}
+    assert "down" in {bid.outcome for bid in pulled.bids}
+    assert pulled.action == "loser_cutoff"
+
+
+def test_asymmetric_imbalance_cap():
+    favorite = _filter(
         fair_up=Decimal("0.70"),
-        up_bid=Decimal("0.20"),
+        up_bid=Decimal("0.68"),
+        up_ask=Decimal("0.72"),
+        down_bid=Decimal("0.20"),
+        down_ask=Decimal("0.80"),
+        up_shares=Decimal("11"),
+    )
+    assert "up" in {bid.outcome for bid in favorite.bids}
+    blocked = _filter(
+        fair_up=Decimal("0.70"),
+        up_bid=Decimal("0.68"),
+        up_ask=Decimal("0.72"),
+        down_bid=Decimal("0.20"),
+        down_ask=Decimal("0.80"),
+        up_shares=Decimal("12"),
+    )
+    assert "up" not in {bid.outcome for bid in blocked.bids}
+    assert blocked.reason == "imbalance"
+    under = _filter(
+        fair_up=Decimal("0.40"),
+        up_bid=Decimal("0.38"),
+        up_ask=Decimal("0.42"),
+        down_bid=Decimal("0.20"),
+        down_ask=Decimal("0.80"),
+        up_shares=Decimal("1"),
+        underdog_excess=Decimal("2"),
+    )
+    assert "up" in {bid.outcome for bid in under.bids}
+    tight = _filter(
+        fair_up=Decimal("0.40"),
+        up_bid=Decimal("0.38"),
+        up_ask=Decimal("0.42"),
+        down_bid=Decimal("0.20"),
+        down_ask=Decimal("0.80"),
+        up_shares=Decimal("2"),
+        underdog_excess=Decimal("2"),
+    )
+    assert "up" not in {bid.outcome for bid in tight.bids}
+    middle = _filter(fair_up=Decimal("0.52"), up_shares=Decimal("4"))
+    assert "up" not in {bid.outcome for bid in middle.bids}
+
+
+def test_regime_lowers_the_pair_sum_near_fifty_fifty():
+    neutral = _filter()
+    up, down = _tops(neutral)
+    assert up + down == Decimal("0.94")
+    assert neutral.action == "neutral_sum"
+    wide = _filter(
+        fair_up=Decimal("0.70"),
+        up_bid=Decimal("0.60"),
         up_ask=Decimal("0.80"),
         down_bid=Decimal("0.20"),
         down_ask=Decimal("0.80"),
     )
-    up, down = _tops(leaned)
-    assert up > Decimal("0.48")
-    assert down < Decimal("0.48")
-    assert up + down <= Decimal("0.96")
-    assert leaned.action == "fair"
-    tight = _plan(fair_up=Decimal("0.70"))
-    up, down = _tops(tight)
-    assert Decimal("0.48") < up < Decimal("0.52")
-    assert up + down <= Decimal("0.96")
+    up, down = _tops(wide)
+    assert up + down == Decimal("0.96")
+    assert wide.action == "wide"
+    halved = _filter(neutral_mode="half_lot")
+    up, down = _tops(halved)
+    assert up + down == Decimal("0.96")
+    assert halved.action == "half_lot"
 
 
-def test_pulls_the_likely_loser_and_stops_adding_to_a_heavy_loser():
-    pulled = _plan(age_s=60, fair_up=Decimal("0.20"))
-    sides = {bid.outcome for bid in pulled.bids}
-    assert "up" not in sides
-    assert "down" in sides
-    assert pulled.action == "pull_loser"
-    other = _plan(age_s=60, fair_up=Decimal("0.80"))
-    sides = {bid.outcome for bid in other.bids}
-    assert "down" not in sides
-    assert "up" in sides
-    early = _plan(age_s=5, fair_up=Decimal("0.20"))
+def test_quotes_from_ten_seconds_and_pulls_the_underdog_after_240():
+    assert _filter(age_s=9, start_s=10).reason == "before_open"
+    assert _filter(age_s=10, start_s=10).bids
+    early = _filter(age_s=239, fair_up=Decimal("0.48"))
     assert "up" in {bid.outcome for bid in early.bids}
-    heavy = _plan(
-        age_s=5,
-        fair_up=Decimal("0.40"),
-        up_shares=Decimal("2"),
-        down_shares=Decimal("0"),
+    late = _filter(age_s=240, fair_up=Decimal("0.48"))
+    assert "up" not in {bid.outcome for bid in late.bids}
+    assert late.action == "late_loser"
+    kept = _filter(age_s=240, fair_up=Decimal("0.55"))
+    assert "up" in {bid.outcome for bid in kept.bids}
+
+
+def test_session_budget_scales_only_while_the_filter_is_on():
+    from paper_split_maker.config import Config
+    from paper_split_maker.small_pair import session_spend_cap
+    from tests.helpers import DEFAULTS
+
+    values = dict(DEFAULTS)
+    values.update(
+        strategy="small_pair",
+        initial_capital=Decimal("100"),
+        per_market_budget=Decimal("25"),
+        round_budget=Decimal("25"),
+        max_loss_fraction=Decimal("0.99"),
+        small_pair_binance=False,
     )
-    sides = {bid.outcome for bid in heavy.bids}
-    assert "up" not in sides
-    assert "down" in sides
-    assert heavy.action == "heavy_loser"
-    assert heavy.reason == "heavy_loser"
+    plain = Config(**values)
+    assert session_spend_cap(plain, Decimal("40")) == Decimal("25")
+    values["small_pair_binance"] = True
+    leaned = Config(**values)
+    assert session_spend_cap(leaned, Decimal("100")) == Decimal("25")
+    assert session_spend_cap(leaned, Decimal("40")) == Decimal("10")
+    loaded = load_config(ROOT / "config.paper.json")
+    assert loaded.small_pair_vol_lookback_seconds == 900
+    assert loaded.small_pair_loser_after_seconds == 30
+    assert loaded.small_pair_loser_fair == Decimal("0.45")
+    assert loaded.small_pair_sigma_multiplier == Decimal("1")
+    raw = json.loads((ROOT / "config.paper.json").read_text(encoding="utf-8"))
+    raw["small_pair_sigma_multiplier"] = "1.5"
+    with pytest.raises(Exception):
+        config_from_mapping(raw)
 
 
 def test_predict_strike_is_the_reference_when_the_payload_has_one():
@@ -282,6 +402,94 @@ def test_engine_uses_binance_at_the_open_and_records_the_close(tmp_path, capsys)
     assert row["fair_gap_mean"] is not None
     market.winner = "up"
     assert round_report(market)["winner_vs_binance"] == "agree"
+
+
+def test_simulated_fill_logs_the_fair_gap(tmp_path, capsys):
+    engine = make_engine(
+        tmp_path,
+        strategy="small_pair",
+        round_budget=Decimal("25"),
+        per_market_budget=Decimal("25"),
+        stale_after_ms=500_000,
+        ack_latency_ms=0,
+        cancel_latency_ms=0,
+        small_pair_binance=True,
+        initial_capital=Decimal("100"),
+        max_loss_fraction=Decimal("0.99"),
+    )
+
+    class Feed:
+        def latest(self):
+            return (engine.state.now_ms, Decimal("64000"))
+
+        def price_at(self, ts_ms):
+            return Decimal("64000")
+
+        def vol(self, now_ms):
+            return 0.0002
+
+    engine.binance_feed = Feed()
+    quote = T0 + 10_000
+    run(
+        engine,
+        [
+            market_event(
+                slug=f"btc-updown-5m-{OPEN}",
+                end_ts=(OPEN + 300) * 1000,
+                ts=T0,
+                reference_price="64000",
+            )
+        ],
+    )
+    events = []
+    for outcome in ("up", "down"):
+        events.append(
+            book_event(
+                "m1",
+                outcome,
+                "0.48",
+                "0.52",
+                ts=quote,
+                bid_size="1",
+                ask_size="10",
+                digest=f"fill-{outcome}",
+            )
+        )
+    events.append({"type": "heartbeat", "event_id": "hb-fill", "ts": quote, "market_id": "m1"})
+    run(engine, events)
+    resting = [
+        order
+        for order in engine.state.orders.values()
+        if order.status in {"queued", "live"} and order.outcome == "up"
+    ]
+    assert resting
+    price = resting[0].price
+    run(
+        engine,
+        [
+            {
+                "type": "trade",
+                "event_id": "sell-up",
+                "ts": quote,
+                "market_id": "m1",
+                "outcome": "up",
+                "price": str(price),
+                "size": str(resting[0].size),
+                "taker_side": "SELL",
+                "trade_id": "sell-up",
+            }
+        ],
+    )
+    market = engine.state.markets["m1"]
+    assert market.fill_edge_n == 1
+    assert market.buy_up_fills == 1
+    row = round_report(market)
+    assert row["fill_fair_minus_price_avg"] is not None
+    text = capsys.readouterr().err
+    assert "binance_fill" in text
+    assert "fair_side=" in text
+    assert "fair_minus_price=" in text
+    assert "binance_age_s=" in text
 
 
 def test_binance_flag_starts_and_stops_a_fake_feed(tmp_path, monkeypatch):

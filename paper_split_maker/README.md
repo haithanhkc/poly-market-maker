@@ -60,11 +60,18 @@ python -m paper_split_maker --config config.paper.json --strategy small_pair --s
 
 The process sends no orders. Mainnet reads still need `PREDICT_NETWORK=mainnet` and `PREDICT_API_KEY` in `.env`. `--live` with `small_pair` is refused. Each `rounds` row has the winner, fills and shares per side, average prices, pair cost, matched shares, the excess side and its price, and PnL split into matched and excess.
 
-`--binance-lean` (config `small_pair_binance`, default off) reads the public Binance BTCUSDT trade stream and leans the 0.96 pair toward that fair value. It does not send orders and does not use an API key. When predict.fun prints a strike, that price is the round open; otherwise the open is the Binance price at the window start. The log line is `binance_lean` with price, S0, fair Up, the predict mid, the gap, and the action. Each `rounds` row then also has the reference source, the Binance-implied winner at the close, whether that agrees with the settlement winner, and the mean and max absolute gap. A 10-session 5-minute wrapper is `run_smallpair_bn10.ps1` (about 65 minutes, `runs\smallpair_bn10`):
+`--binance-lean` (config `small_pair_binance`, default off) reads the public Binance BTCUSDT trade stream and uses that fair value as a filter. It does not send orders and does not use an API key. The quote stays on the book mid. A bid more than 0.02 above its fair value is not posted (0.03 when the Binance print is older than 2 seconds). From 30 seconds, a side below 0.45 is pulled. From 240 seconds, a side below 0.50 is pulled. A side at or above 0.55 may lead by 12 shares; a side below 0.50 may lead by 4. When the Up mid is within 0.10 of 0.50 the pair sum is 0.94 instead of 0.96. Quoting starts at 10 seconds. Sigma is the 15-minute realized volatility, multiplied by at most 1. Each simulated fill logs fair value, price, fair minus price, seconds into the round, and the age of the Binance print. The round row counts bids removed by each rule and the average fair-minus-price of fills. Without the flag the old 2-second, 0.96, cap-of-4 quote is unchanged. A 10-session wrapper is `run_smallpair_bn10.ps1`:
 
 ```powershell
 cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
 .\run_smallpair_bn10.ps1
+```
+
+An open-ended $100 run is `run_smallpair_bn100.ps1`. It keeps the machine awake, writes `runs\smallpair_bn100`, and uses `--duration-seconds 0 --max-markets 0` so sessions roll until cash cannot fund another one, you press Ctrl+C, or you create `runs\smallpair_bn100\STOP`. `summary.json` is rewritten after every redeem (`stop_reason`, equity, sessions, wins, losses, cumulative PnL) and `sessions.csv` has one row per session. The per-session budget is `min(25, cash * 0.25)`. `--max-loss-fraction 0.99` keeps the account floor from stopping the run first. Run the same script again after a reboot: it resumes `state.json` when the capital and loss fraction match. If they do not, the process prints the locked bankroll and keeps it. Do not delete `state.json` to force a new bankroll; use a new `--out` directory instead.
+
+```powershell
+cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
+.\run_smallpair_bn100.ps1
 ```
 
 Check the key, the login, and the USDT balance without placing an order. The JSON it prints does not contain the key or the JWT:

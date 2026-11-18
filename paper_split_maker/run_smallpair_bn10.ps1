@@ -1,4 +1,4 @@
-# Paper small_pair, 10 BTC 5-minute sessions, Binance lean. No orders.
+# Paper small_pair, 10 BTC 5-minute sessions, Binance fair-value filter. No orders.
 # Keep the machine awake, then restore the previous execution state.
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot

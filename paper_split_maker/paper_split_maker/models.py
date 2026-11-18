@@ -145,6 +145,11 @@ class Market:
     last_mid_up: Optional[Decimal] = None
     last_gap: Optional[Decimal] = None
     last_lean_action: str = ""
+    filter_counts: dict = field(default_factory=dict)
+    fill_edge_sum: Decimal = ZERO
+    fill_edge_n: int = 0
+    last_binance_age_s: Optional[Decimal] = None
+    last_binance_ts_ms: int = 0
 
     def inventory(self, outcome: str) -> Decimal:
         return self.up if outcome == "up" else self.down
@@ -223,6 +228,15 @@ class Market:
             "last_mid_up": money(self.last_mid_up) if self.last_mid_up else None,
             "last_gap": money(self.last_gap) if self.last_gap is not None else None,
             "last_lean_action": self.last_lean_action,
+            "filter_counts": {
+                str(key): int(value) for key, value in (self.filter_counts or {}).items()
+            },
+            "fill_edge_sum": money(self.fill_edge_sum),
+            "fill_edge_n": self.fill_edge_n,
+            "last_binance_age_s": (
+                money(self.last_binance_age_s) if self.last_binance_age_s is not None else None
+            ),
+            "last_binance_ts_ms": self.last_binance_ts_ms,
         }
 
     @classmethod
@@ -300,6 +314,14 @@ class Market:
             last_mid_up=_optional_decimal(data.get("last_mid_up")),
             last_gap=_optional_decimal(data.get("last_gap")),
             last_lean_action=str(data.get("last_lean_action") or ""),
+            filter_counts={
+                str(key): int(value)
+                for key, value in (data.get("filter_counts") or {}).items()
+            },
+            fill_edge_sum=_d(data.get("fill_edge_sum", "0")),
+            fill_edge_n=int(data.get("fill_edge_n", 0) or 0),
+            last_binance_age_s=_optional_decimal(data.get("last_binance_age_s")),
+            last_binance_ts_ms=int(data.get("last_binance_ts_ms", 0) or 0),
         )
 
 

@@ -17,7 +17,7 @@ from paper_split_maker.chain_data import series_of, window_seconds
 from paper_split_maker.config import Config
 from paper_split_maker.decimal_utils import ONE, ZERO, ceil_tick, floor_cash, money, on_grid, qdown
 from paper_split_maker.dual_bid import plan_bids, quote_phase, round_open_ms
-from paper_split_maker.small_pair import plan_small_pair
+from paper_split_maker.small_pair import plan_small_pair, session_spend_cap
 from paper_split_maker.logs import LogWriter
 from paper_split_maker.models import (
     WORKING_ORDER_STATUSES,
@@ -876,6 +876,7 @@ class Engine:
             order.remaining = ZERO
             order.status = "filled"
         market.last_action_ts = self.state.now_ms
+        self._note_binance_fill(market, order, size)
         self._emit(
             kind="fill",
             market=market,
@@ -883,6 +884,49 @@ class Engine:
             size=size,
             price=order.price,
             reason="exchange_fill" if source == "exchange" else "queue_model_fill",
+        )
+
+    def _note_binance_fill(self, market: Market, order: Order, size: Decimal) -> None:
+        """Log fair value against a simulated buy. Only the Binance filter does this."""
+        if not self.config.small_pair_binance or market.quoted_as != "small_pair":
+            return
+        if getattr(order, "side", "sell") != "buy":
+            return
+        fair = market.last_fair_up
+        if fair is None:
+            fair_side = None
+        elif order.outcome == "up":
+            fair_side = fair
+        else:
+            fair_side = Decimal("1") - fair
+        edge = None if fair_side is None else fair_side - order.price
+        if edge is not None:
+            market.fill_edge_sum += edge
+            market.fill_edge_n += 1
+        window = window_seconds(series_of(market.slug))
+        open_ms = round_open_ms(market.slug, market.end_ts_ms, window)
+        sec = (self.state.now_ms - open_ms) // 1000
+        age = market.last_binance_age_s
+        detail = (
+            f"fair_side={fair_side if fair_side is not None else '-'} "
+            f"price={order.price} "
+            f"fair_minus_price={edge if edge is not None else '-'} "
+            f"sec={sec} "
+            f"binance_age_s={age if age is not None else '-'}"
+        )
+        print(
+            f"binance_fill {market.slug or market.market_id} {detail}",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._emit(
+            kind="binance_fill",
+            market=market,
+            order=order,
+            price=order.price,
+            size=size,
+            reason=order.outcome,
+            detail=detail,
         )
 
     def _on_resolution(self, event: dict) -> None:
@@ -1174,9 +1218,7 @@ class Engine:
         window = window_seconds(series_of(market.slug))
         open_ms = round_open_ms(market.slug, market.end_ts_ms, window)
         age_s = (self.state.now_ms - open_ms) // 1000
-        cap = self.config.round_budget
-        if self.config.per_market_budget < cap:
-            cap = self.config.per_market_budget
+        cap = session_spend_cap(self.config, self.state.cash)
         spent = market.bought_up_cost + market.bought_down_cost
         left = cap - spent
         if left < 0:
@@ -1187,8 +1229,9 @@ class Engine:
         fair = None
         spot = None
         s0 = market.reference_price
+        age_binance = None
         if self.config.small_pair_binance:
-            spot, s0, fair = self._apply_binance_lean(
+            spot, s0, fair, age_binance = self._apply_binance_lean(
                 market, open_ms, window, age_s, up_bid, up_ask
             )
         plan = plan_small_pair(
@@ -1204,11 +1247,30 @@ class Engine:
             budget_left=left,
             age_s=age_s,
             window_s=window,
+            start_s=(
+                self.config.small_pair_start_seconds
+                if self.config.small_pair_binance
+                else 2
+            ),
             fair_up=fair,
-            fair_gap=self.config.small_pair_fair_gap,
             loser_fair=self.config.small_pair_loser_fair,
             loser_after_s=self.config.small_pair_loser_after_seconds,
+            binance_filter=bool(self.config.small_pair_binance),
+            adverse_gap=self.config.small_pair_adverse_gap,
+            adverse_gap_stale=self.config.small_pair_adverse_gap_stale,
+            binance_age_s=age_binance,
+            stale_after_s=self.config.small_pair_stale_seconds,
+            favorite_excess=self.config.small_pair_favorite_excess,
+            underdog_excess=self.config.small_pair_underdog_excess,
+            favorite_fair=self.config.small_pair_favorite_fair,
+            neutral_band=self.config.small_pair_neutral_band,
+            neutral_target=self.config.small_pair_neutral_target,
+            neutral_mode=self.config.small_pair_neutral_mode,
+            late_loser_s=self.config.small_pair_late_loser_seconds,
         )
+        if self.config.small_pair_binance:
+            for rule, count in plan.filtered:
+                market.filter_counts[rule] = int(market.filter_counts.get(rule, 0)) + int(count)
         if self.config.small_pair_binance:
             self._log_binance_lean(market, spot, s0, fair, up_bid, up_ask, plan.action or plan.reason)
         if not plan.bids:
@@ -1226,6 +1288,13 @@ class Engine:
         feed = self.binance_feed
         latest = feed.latest() if feed is not None else None
         spot = latest[1] if latest else None
+        age_binance = None
+        if latest is not None:
+            age_binance = (self.state.now_ms - int(latest[0])) / 1000
+            if age_binance < 0:
+                age_binance = 0
+            market.last_binance_ts_ms = int(latest[0])
+            market.last_binance_age_s = Decimal(str(round(age_binance, 3)))
         if (
             (market.reference_price is None or market.reference_price <= 0)
             and spot is not None
@@ -1248,6 +1317,9 @@ class Engine:
         if spot is not None and s0 is not None and s0 > 0:
             remaining = (open_ms + int(window) * 1000 - self.state.now_ms) / 1000
             sigma = feed.vol(self.state.now_ms) if feed is not None else None
+            multiplier = self.config.small_pair_sigma_multiplier
+            if sigma is not None and multiplier != 1:
+                sigma = float(sigma) * float(multiplier)
             fair = fair_up(
                 spot,
                 s0,
@@ -1261,7 +1333,7 @@ class Engine:
             if remaining <= 1:
                 market.binance_close_locked = True
                 market.binance_implied_winner = implied
-        return spot, s0, fair
+        return spot, s0, fair, age_binance
 
     def _log_binance_lean(self, market, spot, s0, fair, up_bid, up_ask, action) -> None:
         mid = None

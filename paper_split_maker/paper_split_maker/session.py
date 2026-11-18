@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import sys
 from pathlib import Path
@@ -10,7 +11,10 @@ from typing import Callable, Optional
 from paper_split_maker.chain_data import window_seconds
 from paper_split_maker.config import Config, ConfigError
 from paper_split_maker.engine import Engine
+from paper_split_maker.decimal_utils import ZERO, money
 from paper_split_maker.logs import write_summary
+from paper_split_maker.risk import worst_case_equity
+from paper_split_maker.small_pair import can_fund_session
 from paper_split_maker.normalize import (
     clob_book_event,
     data_api_resolution_event,
@@ -92,20 +96,25 @@ def run_paper(
 ) -> dict:
     import time
 
-    if duration_seconds <= 0:
-        raise ConfigError("duration_seconds must be positive")
-    if max_markets <= 0:
-        raise ConfigError("max_markets must be positive")
+    if duration_seconds < 0:
+        raise ConfigError("duration_seconds must be zero or positive")
+    if max_markets < 0:
+        raise ConfigError("max_markets must be zero or positive")
     clock = now_s or time.time
     sleeper = sleep or time.sleep
     reader = client or client_from_env(env)
     engine = open_engine(config, out_dir)
     engine.mode = "paper"
     started = clock()
-    deadline = started + duration_seconds
+    deadline = None if duration_seconds == 0 else started + duration_seconds
+    bound = (
+        "Open-ended until the session cannot be funded or the run is stopped."
+        if duration_seconds == 0 and max_markets == 0
+        else "Bounded by duration_seconds and max_markets. Zero means no limit."
+    )
     notes = [
         "Public read-only paper session. No orders were sent.",
-        "Bounded by duration_seconds and max_markets.",
+        bound,
         f"discovery network={reader.network} series={getattr(config, 'series_slug', '') or 'btc-updown-5m'}",
     ]
     seen: set[str] = set()
@@ -159,104 +168,269 @@ def _paper_loop(
     public_ok,
     polls,
 ):
-    while clock() < deadline:
-        polls += 1
-        stamp = int(clock() * 1000)
-        begin = getattr(reader, "begin_poll", None)
-        if begin is not None:
-            begin()
-        opened = _discover_due(
-            engine, reader, config, stamp, max_markets, note, opened_slugs
-        )
-        if reader.last_discovery.get("error"):
-            public_ok = False
-        failed = False
-        for market in list(engine.state.markets.values()):
-            if market.status == "redeemed":
-                continue
-            view = {
-                "market_id": market.market_id,
-                "condition_id": market.condition_id,
-                "up_token_id": market.up_token_id,
-                "down_token_id": market.down_token_id,
-            }
-            try:
-                for outcome, token in (
-                    ("up", market.up_token_id),
-                    ("down", market.down_token_id),
-                ):
-                    try:
-                        book = reader.fetch_book(token)
-                    except PublicDataError:
-                        market.book_fetches_failed += 1
-                        raise
-                    if _stamp_missing(book.get("timestamp")):
-                        book = dict(book)
-                        book["timestamp"] = stamp
-                    event = clob_book_event(
-                        market.market_id,
-                        outcome,
-                        book,
-                        event_id=f"book:{market.market_id}:{outcome}:{book.get('hash')}:{book.get('timestamp')}:{polls}",
-                    )
-                    if event is None:
-                        market.book_fetches_failed += 1
-                        failed = True
-                        continue
-                    market.book_fetches_ok += 1
-                    # Exchange timestamps can lead the local clock. Keep them on the
-                    # book, and drive the ledger clock with the session clock.
-                    event["book_ts"] = event["ts"]
-                    event["ts"] = stamp
-                    engine.handle_event(event)
-                trades_payload = _poll_trades(reader, market, note)
-                for trade in data_api_trade_events(view, trades_payload):
-                    trade["trade_ts"] = trade["ts"]
-                    trade["ts"] = stamp
-                    engine.handle_event(trade)
-                resolution = data_api_resolution_event(
-                    view, reader.fetch_resolution(market.condition_id)
-                )
-                if resolution is not None:
-                    engine.handle_event(resolution)
-            except PublicDataError as exc:
-                failed = True
-                note(f"poll failed: {exc}")
+    stop_reason = "running"
+    redeemed_ids = {
+        market.market_id
+        for market in engine.state.markets.values()
+        if market.status == "redeemed"
+    }
+    try:
+        while True:
+            if deadline is not None and clock() >= deadline:
+                stop_reason = "duration"
                 break
-        if failed:
-            public_ok = False
-            engine.handle_event(
-                {
-                    "type": "feed",
-                    "status": "down",
-                    "ts": stamp,
-                    "event_id": f"feed-down-{polls}",
-                }
+            if _hit_cap(len(opened_slugs), max_markets) and not _session_busy(engine):
+                stop_reason = "max_markets"
+                break
+            if not _session_busy(engine) and _should_bust(config, engine):
+                stop_reason = "bust"
+                break
+            if (out_dir / "STOP").exists():
+                stop_reason = "manual"
+                break
+            polls += 1
+            stamp = int(clock() * 1000)
+            begin = getattr(reader, "begin_poll", None)
+            if begin is not None:
+                begin()
+            opened = _discover_due(
+                engine, reader, config, stamp, max_markets, note, opened_slugs
             )
-        elif not engine.state.feed_up:
-            engine.handle_event(
-                {
-                    "type": "feed",
-                    "status": "up",
-                    "ts": stamp,
-                    "event_id": f"feed-up-{polls}",
+            if reader.last_discovery.get("error"):
+                public_ok = False
+            failed = False
+            for market in list(engine.state.markets.values()):
+                if market.status == "redeemed":
+                    continue
+                view = {
+                    "market_id": market.market_id,
+                    "condition_id": market.condition_id,
+                    "up_token_id": market.up_token_id,
+                    "down_token_id": market.down_token_id,
                 }
+                try:
+                    for outcome, token in (
+                        ("up", market.up_token_id),
+                        ("down", market.down_token_id),
+                    ):
+                        try:
+                            book = reader.fetch_book(token)
+                        except PublicDataError:
+                            market.book_fetches_failed += 1
+                            raise
+                        if _stamp_missing(book.get("timestamp")):
+                            book = dict(book)
+                            book["timestamp"] = stamp
+                        event = clob_book_event(
+                            market.market_id,
+                            outcome,
+                            book,
+                            event_id=f"book:{market.market_id}:{outcome}:{book.get('hash')}:{book.get('timestamp')}:{polls}",
+                        )
+                        if event is None:
+                            market.book_fetches_failed += 1
+                            failed = True
+                            continue
+                        market.book_fetches_ok += 1
+                        # Exchange timestamps can lead the local clock. Keep them on the
+                        # book, and drive the ledger clock with the session clock.
+                        event["book_ts"] = event["ts"]
+                        event["ts"] = stamp
+                        engine.handle_event(event)
+                    trades_payload = _poll_trades(reader, market, note)
+                    for trade in data_api_trade_events(view, trades_payload):
+                        trade["trade_ts"] = trade["ts"]
+                        trade["ts"] = stamp
+                        engine.handle_event(trade)
+                    resolution = data_api_resolution_event(
+                        view, reader.fetch_resolution(market.condition_id)
+                    )
+                    if resolution is not None:
+                        engine.handle_event(resolution)
+                except PublicDataError as exc:
+                    failed = True
+                    note(f"poll failed: {exc}")
+                    break
+            if failed:
+                public_ok = False
+                engine.handle_event(
+                    {
+                        "type": "feed",
+                        "status": "down",
+                        "ts": stamp,
+                        "event_id": f"feed-down-{polls}",
+                    }
+                )
+            elif not engine.state.feed_up:
+                engine.handle_event(
+                    {
+                        "type": "feed",
+                        "status": "up",
+                        "ts": stamp,
+                        "event_id": f"feed-up-{polls}",
+                    }
+                )
+            engine.handle_event(
+                {"type": "heartbeat", "ts": stamp, "event_id": f"hb-{polls}-{stamp}"}
             )
-        engine.handle_event(
-            {"type": "heartbeat", "ts": stamp, "event_id": f"hb-{polls}-{stamp}"}
-        )
-        if getattr(config, "strategy", "") in {"dual_bid", "small_pair"}:
-            label = str(config.strategy)
-            for market in engine.state.markets.values():
-                note(_status_line(label, market))
-        remaining = deadline - clock()
-        if remaining <= 0:
-            break
-        sleeper(min(config.poll_interval_seconds, remaining))
+            if getattr(config, "strategy", "") in {"dual_bid", "small_pair"}:
+                label = str(config.strategy)
+                for market in engine.state.markets.values():
+                    note(_status_line(label, market))
+            fresh = {
+                market.market_id
+                for market in engine.state.markets.values()
+                if market.status == "redeemed"
+            }
+            if fresh - redeemed_ids:
+                redeemed_ids = fresh
+                _write_run_files(
+                    out_dir,
+                    engine,
+                    notes,
+                    public_ok,
+                    duration_seconds,
+                    max_markets,
+                    polls,
+                    len(opened_slugs),
+                    dict(getattr(reader, "last_discovery", {}) or {}),
+                    "running",
+                )
+            if deadline is None:
+                sleeper(config.poll_interval_seconds)
+                continue
+            remaining = deadline - clock()
+            if remaining <= 0:
+                stop_reason = "duration"
+                break
+            sleeper(min(config.poll_interval_seconds, remaining))
+    except KeyboardInterrupt:
+        stop_reason = "manual"
     opened = len(opened_slugs)
     stats = dict(getattr(reader, "last_discovery", {}) or {})
     note(_discovery_line(stats))
-    note(f"polls={polls} opened={opened}")
+    note(f"polls={polls} opened={opened} stop={stop_reason}")
+    return _write_run_files(
+        out_dir,
+        engine,
+        notes,
+        public_ok,
+        duration_seconds,
+        max_markets,
+        polls,
+        opened,
+        stats,
+        stop_reason,
+    )
+
+
+def _hit_cap(opened: int, max_markets: int) -> bool:
+    return max_markets > 0 and opened >= max_markets
+
+
+def _session_busy(engine) -> bool:
+    for market in engine.state.markets.values():
+        if market.status not in {"redeemed", "expired_unresolved"}:
+            return True
+    return False
+
+
+def _should_bust(config, engine) -> bool:
+    if engine.state.killed:
+        return True
+    return not can_fund_session(config, engine.state.cash)
+
+
+def _progress(engine) -> dict:
+    redeemed = [
+        market
+        for market in engine.state.markets.values()
+        if market.status == "redeemed"
+    ]
+    wins = losses = flats = 0
+    pnl = ZERO
+    for market in redeemed:
+        flow = market.net_cash_flow
+        pnl += flow
+        if flow > 0:
+            wins += 1
+        elif flow < 0:
+            losses += 1
+        else:
+            flats += 1
+    return {
+        "equity": money(worst_case_equity(engine.state)),
+        "cash": money(engine.state.cash),
+        "sessions": len(engine.state.markets),
+        "redeemed": len(redeemed),
+        "wins": wins,
+        "losses": losses,
+        "flats": flats,
+        "cumulative_pnl": money(pnl),
+    }
+
+
+_SESSION_COLUMNS = (
+    "slug",
+    "market_id",
+    "status",
+    "winner",
+    "shares_up",
+    "shares_down",
+    "pair_cost",
+    "pnl",
+    "pnl_matched",
+    "pnl_excess",
+    "filters_adverse",
+    "filters_loser_cutoff",
+    "filters_imbalance",
+    "filters_late_loser",
+    "fill_fair_minus_price_avg",
+)
+
+
+def write_sessions_csv(directory: Path, summary: dict) -> Path:
+    path = Path(directory) / "sessions.csv"
+    rounds = summary.get("rounds") or []
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_SESSION_COLUMNS)
+        writer.writeheader()
+        for row in rounds:
+            filters = row.get("filters") or {}
+            writer.writerow(
+                {
+                    "slug": row.get("slug") or "",
+                    "market_id": row.get("market_id") or "",
+                    "status": row.get("status") or "",
+                    "winner": row.get("winner") or "",
+                    "shares_up": row.get("shares_up") or "",
+                    "shares_down": row.get("shares_down") or "",
+                    "pair_cost": row.get("pair_cost") or "",
+                    "pnl": row.get("pnl") or "",
+                    "pnl_matched": row.get("pnl_matched") or "",
+                    "pnl_excess": row.get("pnl_excess") or "",
+                    "filters_adverse": filters.get("adverse", 0),
+                    "filters_loser_cutoff": filters.get("loser_cutoff", 0),
+                    "filters_imbalance": filters.get("imbalance", 0),
+                    "filters_late_loser": filters.get("late_loser", 0),
+                    "fill_fair_minus_price_avg": row.get("fill_fair_minus_price_avg") or "",
+                }
+            )
+    return path
+
+
+def _write_run_files(
+    out_dir,
+    engine,
+    notes,
+    public_ok,
+    duration_seconds,
+    max_markets,
+    polls,
+    opened,
+    stats,
+    stop_reason,
+) -> dict:
     summary = engine.summary(notes=notes)
     summary["public_data_ok"] = public_ok
     summary["duration_seconds"] = duration_seconds
@@ -264,7 +438,10 @@ def _paper_loop(
     summary["polls"] = polls
     summary["opened"] = opened
     summary["discovery"] = stats
+    summary["stop_reason"] = stop_reason
+    summary["progress"] = _progress(engine)
     write_summary(out_dir, summary)
+    write_sessions_csv(out_dir, summary)
     return summary
 
 
@@ -312,7 +489,7 @@ def _discover_due(engine, reader, config, stamp: int, max_markets: int, note, op
         series_list = [str(getattr(config, "series_slug", "") or "btc-updown-5m")]
     discoveries = []
     for series in series_list:
-        if len(opened_slugs) >= max_markets:
+        if _hit_cap(len(opened_slugs), max_markets):
             break
         _discover_series(
             engine, reader, config, stamp, max_markets, note, opened_slugs, series
@@ -339,7 +516,12 @@ def _discover_series(
     if strategy == "small_pair":
         if 0 <= age < window:
             want_current = True
-            note(f"{current_slug} is open; small_pair quotes from +2s until close")
+            start = (
+                int(getattr(config, "small_pair_start_seconds", 10) or 10)
+                if getattr(config, "small_pair_binance", False)
+                else 2
+            )
+            note(f"{current_slug} is open; small_pair quotes from +{start}s until close")
     elif strategy == "dual_bid":
         stop = int(getattr(config, "dual_bid_stop_seconds", 275) or 275)
         start = int(getattr(config, "dual_bid_start_seconds", 8) or 8)
@@ -350,7 +532,8 @@ def _discover_series(
             )
     if not want_current:
         note(f"{series}-{current} already started; waiting for the next session")
-    due = _due_slugs(series, window, now_s, lead, max_markets)
+    lookahead = 8 if max_markets <= 0 else min(int(max_markets), 8)
+    due = _due_slugs(series, window, now_s, lead, lookahead)
     explicit = [str(item) for item in (config.market_slugs or []) if str(item)]
     if strategy == "small_pair":
         explicit = []
@@ -374,7 +557,7 @@ def _discover_series(
         note(f"discovery returned no rounds for {series} on {reader.network}")
     by_slug = {str(item.get("slug") or ""): item for item in payloads if isinstance(item, dict)}
     for slug in slugs:
-        if len(opened_slugs) >= max_markets:
+        if _hit_cap(len(opened_slugs), max_markets):
             break
         if _already_open(engine, slug):
             opened_slugs.add(slug)

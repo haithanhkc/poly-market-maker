@@ -37,6 +37,7 @@ class Plan:
     bids: list[Bid]
     reason: str = ""
     action: str = ""
+    filtered: tuple[tuple[str, int], ...] = ()
 
 
 def quiet_after(window_s: int) -> int:
@@ -146,6 +147,44 @@ def fit_pair(
     return None
 
 
+def _excess_cap(probability, favorite_fair, favorite_excess, underdog_excess, base):
+    """Shares one side may lead by. Favorites are loose. A sub-0.5 side is tight."""
+    if probability >= favorite_fair:
+        return favorite_excess
+    if probability < Decimal("0.5"):
+        return underdog_excess
+    return base
+
+
+def session_spend_cap(config, cash: Decimal) -> Decimal:
+    """Round budget. The Binance mode also caps it at a fraction of cash."""
+    cap = config.round_budget
+    if config.per_market_budget < cap:
+        cap = config.per_market_budget
+    if not getattr(config, "small_pair_binance", False):
+        return cap if cap > 0 else ZERO
+    ceiling = config.session_budget_cap
+    if ceiling > 0 and ceiling < cap:
+        cap = ceiling
+    fraction = config.session_budget_fraction
+    if fraction > 0:
+        scaled = cash * fraction
+        if scaled < cap:
+            cap = scaled
+    if cap < 0:
+        return ZERO
+    return cap
+
+
+def can_fund_session(config, cash: Decimal) -> bool:
+    """True when cash can still pay the minimum session."""
+    if cash < config.session_budget_min:
+        return False
+    if getattr(config, "small_pair_binance", False):
+        return session_spend_cap(config, cash) >= config.session_budget_min
+    return True
+
+
 def plan_small_pair(
     *,
     up_bid: Decimal | None,
@@ -167,16 +206,30 @@ def plan_small_pair(
     start_s: int = START_SECONDS,
     fair_up: Decimal | None = None,
     fair_gap: Decimal = Decimal("0.03"),
-    loser_fair: Decimal = Decimal("0.30"),
-    loser_after_s: int = 60,
+    loser_fair: Decimal = Decimal("0.45"),
+    loser_after_s: int = 30,
+    binance_filter: bool = False,
+    adverse_gap: Decimal = Decimal("0.02"),
+    adverse_gap_stale: Decimal = Decimal("0.03"),
+    binance_age_s: float | None = None,
+    stale_after_s: int = 2,
+    favorite_excess: Decimal = Decimal("12"),
+    underdog_excess: Decimal = Decimal("4"),
+    favorite_fair: Decimal = Decimal("0.55"),
+    neutral_band: Decimal = Decimal("0.10"),
+    neutral_target: Decimal = Decimal("0.94"),
+    neutral_mode: str = "sum",
+    late_loser_s: int = 240,
 ) -> Plan:
     """Bids for this heartbeat, plus a short reason when a rule binds.
 
-    ``fair_up`` is optional. When it is absent the centre is the book mid.
-    When it is present and more than ``fair_gap`` away from the mid, the
-    centre moves to the fair value and one tick of the pair is taken off
-    the likely loser, so the two top bids still sum to at most ``target``.
+    Without ``binance_filter`` the centre is the book mid and the pair sum is
+    ``target``. With the filter, fair value does not move the centre. It drops
+    bids that sit too far above fair, stops a losing side, and widens the
+    imbalance cap only for the side that is ahead on the Binance probability.
+    ``fair_gap`` is accepted so older callers still load. It is not used.
     """
+    del fair_gap
     if age_s < int(start_s):
         return Plan([], "before_open")
     if age_s >= int(window_s):
@@ -192,64 +245,87 @@ def plan_small_pair(
     ):
         return Plan([], "no_mid")
     mid = (up_bid + up_ask) / 2
-    centre = mid
+    active_target = target
+    lot_cap = max_shares
     lean = "mid"
-    if fair_up is not None and Decimal("0") < fair_up < Decimal("1"):
-        if abs(fair_up - mid) > fair_gap:
-            centre = fair_up
-            lean = "fair"
-    half = (Decimal("1") - target) / 2
-    raw_up = _on_tick(centre - half, tick)
-    raw_down = target - raw_up
-    if lean == "fair" and fair_up is not None:
-        # The likely loser gives up one tick. The sum stays at or under target.
-        if fair_up >= Decimal("0.5"):
-            raw_down -= tick
+    if binance_filter:
+        if abs(mid - Decimal("0.5")) >= neutral_band:
+            lean = "wide"
+        elif neutral_mode == "half_lot":
+            lot_cap = (max_shares / 2).to_integral_value(rounding=ROUND_DOWN)
+            if lot_cap < 1:
+                lot_cap = Decimal("1")
+            lean = "half_lot"
         else:
-            raw_up -= tick
-    touch = fit_pair(raw_up, raw_down, up_ask, down_ask, tick, target)
+            active_target = neutral_target
+            lean = "neutral_sum"
+    half = (Decimal("1") - active_target) / 2
+    raw_up = _on_tick(mid - half, tick)
+    raw_down = active_target - raw_up
+    touch = fit_pair(raw_up, raw_down, up_ask, down_ask, tick, active_target)
     if touch is None:
-        if lean == "mid":
-            return Plan([], "cross")
-        up_touch, down_touch = raw_up, raw_down
-    else:
-        up_touch, down_touch = touch
+        return Plan([], "cross")
+    up_touch, down_touch = touch
     allowed = {"up", "down"}
     reason = ""
+    removed: dict[str, str] = {}
     skewed = up_shares - down_shares
+    fair_ok = (
+        binance_filter
+        and fair_up is not None
+        and Decimal("0") < fair_up < Decimal("1")
+    )
     if late:
         allowed = {"down"} if skewed > 0 else {"up"}
         reason = "late_light"
-    elif skewed >= imbalance_cap:
+    elif not fair_ok and skewed >= imbalance_cap:
         allowed = {"down"}
         reason = "imbalance"
-    elif -skewed >= imbalance_cap:
+    elif not fair_ok and -skewed >= imbalance_cap:
         allowed = {"up"}
         reason = "imbalance"
-    if fair_up is not None and Decimal("0") < fair_up < Decimal("1"):
-        if age_s >= int(loser_after_s) and fair_up < loser_fair and "up" in allowed:
+    if fair_ok:
+        up_cap = _excess_cap(
+            fair_up, favorite_fair, favorite_excess, underdog_excess, imbalance_cap
+        )
+        down_cap = _excess_cap(
+            Decimal("1") - fair_up,
+            favorite_fair,
+            favorite_excess,
+            underdog_excess,
+            imbalance_cap,
+        )
+        if skewed >= up_cap and "up" in allowed:
             allowed.discard("up")
-            lean = "pull_loser"
-            reason = reason or "pull_loser"
-        down_fair = Decimal("1") - fair_up
-        if age_s >= int(loser_after_s) and down_fair < loser_fair and "down" in allowed:
+            removed["up"] = "imbalance"
+            reason = reason or "imbalance"
+        if -skewed >= down_cap and "down" in allowed:
             allowed.discard("down")
-            lean = "pull_loser"
-            reason = reason or "pull_loser"
-        predicted_loser = "down" if fair_up >= Decimal("0.5") else "up"
-        if skewed > 0:
-            heavy = "up"
-        elif skewed < 0:
-            heavy = "down"
-        else:
-            heavy = ""
-        if heavy and heavy == predicted_loser and heavy in allowed:
-            allowed.discard(heavy)
-            lean = "heavy_loser"
-            reason = reason or "heavy_loser"
+            removed["down"] = "imbalance"
+            reason = reason or "imbalance"
+        for side in ("up", "down"):
+            if side not in allowed or side in removed:
+                continue
+            probability = fair_up if side == "up" else Decimal("1") - fair_up
+            if age_s >= int(late_loser_s) and probability < Decimal("0.5"):
+                allowed.discard(side)
+                removed[side] = "late_loser"
+                reason = reason or "late_loser"
+                lean = "late_loser"
+            elif age_s >= int(loser_after_s) and probability < loser_fair:
+                allowed.discard(side)
+                removed[side] = "loser_cutoff"
+                reason = reason or "loser_cutoff"
+                lean = "loser_cutoff"
     remaining = budget_left if budget_left > 0 else ZERO
     bids: list[Bid] = []
     trimmed = False
+    counts: dict[str, int] = {}
+    for side, rule in removed.items():
+        counts[rule] = counts.get(rule, 0) + int(levels)
+    gap = adverse_gap
+    if binance_age_s is None or float(binance_age_s) > float(stale_after_s):
+        gap = adverse_gap_stale
     books = {"up": up_levels, "down": down_levels}
     touches = {"up": up_touch, "down": down_touch}
     asks = {"up": up_ask, "down": down_ask}
@@ -260,7 +336,14 @@ def plan_small_pair(
             price = touches[side] - (tick * step)
             if not _post_only(price, asks[side]):
                 continue
-            size = lot_for(price, max_shares)
+            if fair_ok:
+                fair_side = fair_up if side == "up" else Decimal("1") - fair_up
+                if price - fair_side > gap:
+                    counts["adverse"] = counts.get("adverse", 0) + 1
+                    lean = "adverse"
+                    reason = reason or "adverse"
+                    continue
+            size = lot_for(price, lot_cap)
             if size is None:
                 continue
             notional = floor_cash(size * price)
@@ -276,18 +359,34 @@ def plan_small_pair(
                     queue_ahead=_size_at(books[side], price),
                 )
             )
+    filtered = tuple(sorted(counts.items()))
     if not bids:
         empty = "budget" if trimmed else (reason or "no_bid")
-        return Plan([], empty, lean if lean != "mid" else "")
+        kept = lean if lean != "mid" else ""
+        return Plan([], empty, kept, filtered)
     if trimmed and not reason:
         reason = "budget"
-    return Plan(bids, reason, lean)
+    return Plan(bids, reason, lean, filtered)
 
 
 def _avg(shares: Decimal, cost: Decimal) -> Decimal | None:
     if shares <= 0:
         return None
     return cost / shares
+
+
+def _fill_edge_avg(market: Market):
+    count = int(getattr(market, "fill_edge_n", 0) or 0)
+    if count <= 0:
+        return None
+    total = getattr(market, "fill_edge_sum", ZERO) or ZERO
+    return money(total / Decimal(count))
+
+
+def _age_text(value) -> str | None:
+    if value is None:
+        return None
+    return money(value)
 
 
 def _binance_report(market: Market) -> dict:
@@ -312,6 +411,19 @@ def _binance_report(market: Market) -> dict:
         "winner_vs_binance": None if agree is None else ("agree" if agree else "disagree"),
         "fair_gap_mean": money(mean) if mean is not None else None,
         "fair_gap_max": money(widest) if count else None,
+        "filters": {
+            "adverse": int(getattr(market, "filter_counts", {}).get("adverse", 0) or 0),
+            "loser_cutoff": int(
+                getattr(market, "filter_counts", {}).get("loser_cutoff", 0) or 0
+            ),
+            "imbalance": int(getattr(market, "filter_counts", {}).get("imbalance", 0) or 0),
+            "late_loser": int(
+                getattr(market, "filter_counts", {}).get("late_loser", 0) or 0
+            ),
+        },
+        "fill_fair_minus_price_avg": _fill_edge_avg(market),
+        "fill_fair_n": int(getattr(market, "fill_edge_n", 0) or 0),
+        "binance_age_s": _age_text(getattr(market, "last_binance_age_s", None)),
     }
 
 
