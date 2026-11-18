@@ -12,10 +12,11 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
-from paper_split_maker.chain_data import window_seconds
+from paper_split_maker.chain_data import series_of, window_seconds
 from paper_split_maker.config import Config
 from paper_split_maker.decimal_utils import ONE, ZERO, ceil_tick, floor_cash, money, on_grid, qdown
 from paper_split_maker.dual_bid import plan_bids, quote_phase, round_open_ms
+from paper_split_maker.small_pair import plan_small_pair
 from paper_split_maker.logs import LogWriter
 from paper_split_maker.models import (
     WORKING_ORDER_STATUSES,
@@ -575,7 +576,7 @@ class Engine:
         book.received_ms = self.state.now_ms
         self._record_mid(market, outcome)
         self._emit(kind="book", market=market, outcome=outcome, reason="ok")
-        if self.config.strategy == "dual_bid":
+        if self.config.strategy in {"dual_bid", "small_pair"}:
             return
         # Reprice when the leftover leg's own book moves. The other side's
         # book does not change this bid.
@@ -1071,6 +1072,9 @@ class Engine:
             min_share_balance=self.config.min_share_balance,
             budget_left=left,
         )
+        self._sync_bids(market, desired, "dual_bid")
+
+    def _sync_bids(self, market: Market, desired, reason: str) -> None:
         wanted = {(bid.outcome, bid.price): bid for bid in desired}
         for order in self._working_bids(market):
             bid = wanted.get((order.outcome, order.price))
@@ -1084,12 +1088,12 @@ class Engine:
             self._request_cancel(market, order, "reprice")
         placed = False
         for bid in wanted.values():
-            if self._place_bid(market, bid):
+            if self._place_bid(market, bid, reason):
                 placed = True
         if not placed and not self._working_bids(market):
             self._skip(market, "no_bid")
 
-    def _place_bid(self, market: Market, bid) -> bool:
+    def _place_bid(self, market: Market, bid, reason: str = "dual_bid") -> bool:
         notional = floor_cash(bid.size * bid.price)
         if notional <= 0 or self.state.cash < notional:
             self._skip(market, "cash", bid.outcome, bid.price)
@@ -1126,13 +1130,84 @@ class Engine:
             order=probe,
             size=bid.size,
             price=bid.price,
-            reason="dual_bid",
+            reason=reason,
         )
         return True
+
+    def _decide_small_pair(self, market: Market) -> None:
+        """Buy the 0.96 pair. Never split, sell, merge, or take."""
+        if market.status == "redeemed":
+            return
+        market.quoted_as = "small_pair"
+        self._check_kill_switch()
+        self._check_realized_loss()
+        if self.state.killed:
+            self._cancel_market(market, "killed")
+            self._skip(market, "killed")
+            return
+        if self.state.mismatch_stop:
+            self.state.mismatch_stop = False
+        self._refresh_expiry(market)
+        if market.status == "resolved":
+            self._cancel_market(market, "resolved")
+            self._try_redeem(market)
+            return
+        if market.status == "expired_unresolved":
+            self._cancel_market(market, "expired_unresolved")
+            self._skip(market, "expired_unresolved")
+            return
+        if not self._feeds_ok(market):
+            reason = "disconnected" if not self.state.feed_up else "stale_feed"
+            self._cancel_market(market, reason)
+            self._skip(market, reason)
+            return
+        if not market.accepting_orders:
+            self._cancel_market(market, "not_accepting")
+            self._skip(market, "not_accepting")
+            return
+        if self.state.now_ms < market.pause_until_ms:
+            self._cancel_market(market, "reject_pause")
+            self._skip(market, "reject_pause")
+            return
+        window = window_seconds(series_of(market.slug))
+        open_ms = round_open_ms(market.slug, market.end_ts_ms, window)
+        age_s = (self.state.now_ms - open_ms) // 1000
+        cap = self.config.round_budget
+        if self.config.per_market_budget < cap:
+            cap = self.config.per_market_budget
+        spent = market.bought_up_cost + market.bought_down_cost
+        left = cap - spent
+        if left < 0:
+            left = ZERO
+        tick = market.tick_size if market.tick_size > 0 else self.config.default_tick
+        plan = plan_small_pair(
+            up_bid=market.up_book.best_bid(),
+            up_ask=market.up_book.best_ask(),
+            up_levels=market.up_book.bids,
+            down_bid=market.down_book.best_bid(),
+            down_ask=market.down_book.best_ask(),
+            down_levels=market.down_book.bids,
+            tick=tick,
+            up_shares=market.bought_up_shares,
+            down_shares=market.bought_down_shares,
+            budget_left=left,
+            age_s=age_s,
+            window_s=window,
+        )
+        if not plan.bids:
+            self._cancel_market(market, plan.reason or "no_bid")
+            self._skip(market, plan.reason or "no_bid")
+            return
+        self._sync_bids(market, plan.bids, "small_pair")
+        if plan.reason:
+            self._skip(market, plan.reason)
 
     def _decide(self, market: Market) -> None:
         if self.config.strategy == "dual_bid":
             self._decide_dual_bid(market)
+            return
+        if self.config.strategy == "small_pair":
+            self._decide_small_pair(market)
             return
         if market.status == "redeemed":
             return

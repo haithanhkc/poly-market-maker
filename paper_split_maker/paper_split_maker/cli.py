@@ -8,7 +8,9 @@ import os
 import sys
 from pathlib import Path
 
-from paper_split_maker.config import ConfigError
+from decimal import Decimal
+
+from paper_split_maker.config import ConfigError, load_config
 from paper_split_maker.credentials import load_credentials
 from paper_split_maker.envfile import prepare_run
 from paper_split_maker.live_gate import CONFIRMATION, live_gates
@@ -34,8 +36,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-markets",
         type=int,
-        default=1,
-        help="how many sessions to split, quote, and finish (default 1)",
+        default=None,
+        help="sessions to open (default 1, or BOT_MAX_MARKETS). Up to 500.",
     )
     parser.add_argument(
         "--duration-seconds",
@@ -45,9 +47,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--strategy",
-        choices=("single", "ladder", "dual_bid"),
+        choices=("single", "ladder", "dual_bid", "small_pair"),
         default=None,
-        help="override the config strategy; dual_bid is paper-only",
+        help="override the config strategy; dual_bid and small_pair are paper-only",
+    )
+    parser.add_argument(
+        "--capital",
+        default=None,
+        help="bankroll for this run. Overrides the JSON and BOT_CAPITAL.",
+    )
+    parser.add_argument(
+        "--max-loss-fraction",
+        default=None,
+        help="loss fraction for this run. Overrides the JSON and BOT_MAX_LOSS_FRACTION.",
     )
     parser.add_argument("--live", action="store_true")
     parser.add_argument(
@@ -79,8 +91,23 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _load(args):
-    """JSON defaults, then .env, then BOT_* already set in the process."""
-    settings = prepare_run(args.config, os.environ, max_markets=args.max_markets)
+    """JSON defaults, then .env, then BOT_* already set in the process.
+
+    An explicit ``--max-markets`` wins over ``BOT_MAX_MARKETS``. The raw JSON
+    bankroll is kept on the config so a buy strategy can put it back after
+    the ladder derive step.
+    """
+    raw = load_config(args.config)
+    explicit = getattr(args, "max_markets", None) is not None
+    requested = args.max_markets if explicit else 1
+    settings = prepare_run(
+        args.config,
+        os.environ,
+        max_markets=requested,
+        honor_env_markets=not explicit,
+    )
+    settings.config.json_initial_capital = raw.initial_capital
+    settings.config.json_max_loss_fraction = raw.max_loss_fraction
     args.max_markets = settings.max_markets
     return settings.config
 
@@ -89,8 +116,47 @@ def _apply_strategy(config, args):
     choice = getattr(args, "strategy", None)
     if choice:
         config.strategy = choice
-        config.validate()
+    _honor_bankroll(config, args)
     return config
+
+
+def _honor_bankroll(config, args):
+    """Buy strategies keep the JSON bankroll. The ladder still uses the derive.
+
+    ``prepare_run`` always replaces ``initial_capital`` with ``split_clip * 3``
+    and ``max_loss_fraction`` with the ladder's worst-day ratio. A config of
+    5000 and 0.20 therefore became capital 75 and a floor near 68.92 before
+    the strategy flag was applied. ``--capital`` and ``--max-loss-fraction``
+    still win, and so does ``BOT_CAPITAL`` / ``BOT_MAX_LOSS_FRACTION`` when
+    the CLI flag is absent.
+    """
+    buy = config.strategy in {"dual_bid", "small_pair"}
+    cli_capital = getattr(args, "capital", None)
+    cli_fraction = getattr(args, "max_loss_fraction", None)
+    if cli_capital not in (None, ""):
+        try:
+            config.initial_capital = Decimal(str(cli_capital))
+        except (ArithmeticError, ValueError) as exc:
+            raise ConfigError("capital is not a decimal") from exc
+        config.capital_from_env = True
+    elif buy and not getattr(config, "capital_from_env", False):
+        saved = getattr(config, "json_initial_capital", None)
+        if saved is not None:
+            config.initial_capital = saved
+    if cli_fraction not in (None, ""):
+        try:
+            config.max_loss_fraction = Decimal(str(cli_fraction))
+        except (ArithmeticError, ValueError) as exc:
+            raise ConfigError("max_loss_fraction is not a decimal") from exc
+    elif buy and not getattr(config, "fraction_from_env", False):
+        saved = getattr(config, "json_max_loss_fraction", None)
+        if saved is not None:
+            config.max_loss_fraction = saved
+    if config.per_market_budget > config.initial_capital:
+        config.per_market_budget = config.initial_capital
+    if config.strategy == "small_pair" and config.max_open_markets < 4:
+        config.max_open_markets = 4
+    config.validate()
 
 
 def _run_paper(args) -> int:
@@ -129,8 +195,8 @@ def _credential_env(config_path: Path | None) -> dict:
 
 def _run_live(args) -> int:
     config = _apply_strategy(_load(args), args)
-    if config.strategy == "dual_bid":
-        print("dual_bid is paper-only and does not send orders.")
+    if config.strategy in {"dual_bid", "small_pair"}:
+        print(f"{config.strategy} is paper-only and does not send orders.")
         return 2
     allowed, reason = live_gates(
         config_live=config.live,

@@ -282,11 +282,14 @@ def dual_summary(markets) -> dict | None:
     chosen = [
         market
         for market in markets
-        if market.quoted_as == "dual_bid"
-        or market.buy_up_fills
-        or market.buy_down_fills
-        or market.bought_up_shares > 0
-        or market.bought_down_shares > 0
+        if market.quoted_as != "small_pair"
+        and (
+            market.quoted_as == "dual_bid"
+            or market.buy_up_fills
+            or market.buy_down_fills
+            or market.bought_up_shares > 0
+            or market.bought_down_shares > 0
+        )
     ]
     if not chosen:
         return None

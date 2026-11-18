@@ -257,7 +257,13 @@ def apply_wallet_balance(config: Config, balance: Decimal) -> None:
     config.validate()
 
 
-def apply_bot_env(config: Config, env: dict, *, max_markets: int) -> RunSettings:
+def apply_bot_env(
+    config: Config,
+    env: dict,
+    *,
+    max_markets: int,
+    honor_env_markets: bool = True,
+) -> RunSettings:
     """Overlay BOT_* onto a config. Missing ladder fields are derived from the split."""
     cfg = replace(config)
     mode = "live" if cfg.live else "paper"
@@ -266,11 +272,13 @@ def apply_bot_env(config: Config, env: dict, *, max_markets: int) -> RunSettings
     if split is not None:
         cfg.split_clip = _decimal("BOT_SPLIT_SIZE", split)
     _apply_derived(cfg, env)
-    markets = _apply_markets_and_mode(cfg, env, markets)
+    markets = _apply_markets_and_mode(
+        cfg, env, markets, honor_limit=honor_env_markets
+    )
     mode = "live" if cfg.live else "paper"
     _check_sizes(cfg)
-    if markets < 1 or markets > 100:
-        raise ConfigError("BOT_MAX_MARKETS must be from 1 to 100")
+    if markets < 1 or markets > 500:
+        raise ConfigError("max markets must be from 1 to 500")
     if cfg.ladder_levels < 1 or cfg.ladder_levels > 10:
         raise ConfigError("BOT_RUNGS must be from 1 to 10")
     # The per-market budget has to fit the split the operator just chose.
@@ -284,18 +292,30 @@ def apply_bot_env(config: Config, env: dict, *, max_markets: int) -> RunSettings
     return RunSettings(config=cfg, max_markets=markets, mode=mode)
 
 
-def prepare_run(config_path: Path, process_env: dict, *, max_markets: int) -> RunSettings:
+def prepare_run(
+    config_path: Path,
+    process_env: dict,
+    *,
+    max_markets: int,
+    honor_env_markets: bool = True,
+) -> RunSettings:
     """JSON first, then paper_split_maker/.env next to that file, then process BOT_*."""
     from paper_split_maker.config import load_config
 
     config = load_config(config_path)
     env = merged_bot_env(Path(config_path).resolve().parent / ".env", process_env)
-    return apply_bot_env(config, env, max_markets=max_markets)
+    return apply_bot_env(
+        config,
+        env,
+        max_markets=max_markets,
+        honor_env_markets=honor_env_markets,
+    )
 
 
 def _apply_derived(cfg: Config, env: dict) -> None:
     """Fill clip, rungs, and stops from the split, then let advanced keys win."""
     cfg.capital_from_env = False
+    cfg.fraction_from_env = False
     if cfg.split_clip <= 0:
         _apply_explicit(cfg, env)
         return
@@ -330,6 +350,7 @@ def _apply_explicit(cfg: Config, env: dict) -> None:
     fraction = _present(env, "BOT_MAX_LOSS_FRACTION")
     if fraction is not None:
         cfg.max_loss_fraction = _decimal("BOT_MAX_LOSS_FRACTION", fraction)
+        cfg.fraction_from_env = True
     session = _present(env, "BOT_SESSION_STOP")
     if session is not None:
         cfg.session_max_loss = _decimal("BOT_SESSION_STOP", session)
@@ -338,9 +359,11 @@ def _apply_explicit(cfg: Config, env: dict) -> None:
         cfg.split_lead_seconds = _integer("BOT_SPLIT_LEAD", lead)
 
 
-def _apply_markets_and_mode(cfg: Config, env: dict, markets: int) -> int:
+def _apply_markets_and_mode(
+    cfg: Config, env: dict, markets: int, *, honor_limit: bool = True
+) -> int:
     limit = _present(env, "BOT_MAX_MARKETS")
-    if limit is not None:
+    if honor_limit and limit is not None:
         markets = _integer("BOT_MAX_MARKETS", limit)
     chosen = _present(env, "BOT_MODE")
     if chosen is None:

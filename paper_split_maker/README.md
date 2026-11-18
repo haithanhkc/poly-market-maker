@@ -39,6 +39,19 @@ python -m paper_split_maker --config config.paper.json --strategy dual_bid --out
 
 `summary.json` then has one `rounds` row per session (fills per side, average prices, pair cost, matched shares, balance, excess, PnL, winner) and a `round_totals` object. PnL is filled in when the round redeems. The command does not send orders. `--live` with `dual_bid` is refused.
 
+`strategy=small_pair` is a second paper-only mode. It does not replace `dual_bid`. It quotes BTC 5-minute and 15-minute up/down rounds from 2 seconds after the open. The top Up bid and the top Down bid sum to 0.96 and sit half of the remaining cent under the Up mid. Four levels step down by 0.01. Each level is one lot, `ceil(1 / price)` shares and at most 8. When one side is ahead by 4 shares or more, that side's bids are cancelled until it is back under the cap. From 270s (5m) or 840s (15m), a flat position places nothing and a skewed position keeps only the light side. The round stops at 25 USDT. Shares are held to resolution and redeemed. Fills use the same queue model and `GET /v1/orders/matches` feed as `dual_bid`. This is not a claim that the shape is profitable.
+
+`prepare_run` still derives the ladder bankroll from the split (`split_clip * 3`, and the worst-day fraction `182.3864 / 2250`). With `split_clip` 25 that is capital 75 and a loss floor of about 68.92, which is why a JSON `initial_capital` of 5000 used to be ignored. For `dual_bid` and `small_pair` the JSON `initial_capital` and `max_loss_fraction` are put back after that derive, unless `BOT_CAPITAL` or `BOT_MAX_LOSS_FRACTION` is set. `--capital` and `--max-loss-fraction` override both. `--max-markets` accepts up to 500 and, when you pass it, wins over `BOT_MAX_MARKETS`. Use a fresh `--out` directory; a resume will not change the capital locked in `state.json`.
+
+```powershell
+cd C:\Users\danny\Desktop\poly-market-maker
+.\.venv\Scripts\Activate.ps1
+cd paper_split_maker
+python -m paper_split_maker --config config.paper.json --strategy small_pair --out runs\smallpair --max-markets 300 --duration-seconds 90000 --capital 5000 --max-loss-fraction 0.20
+```
+
+That is about 25 hours, long enough for 300 sessions. Both the 5-minute and the 15-minute rounds count toward `--max-markets`. The process sends no orders. Mainnet reads still need `PREDICT_NETWORK=mainnet` and `PREDICT_API_KEY` in `.env`. `--live` with `small_pair` is refused. Each `rounds` row has the winner, fills and shares per side, average prices, pair cost, matched shares, the excess side and its price, and PnL split into matched and excess.
+
 Check the key, the login, and the USDT balance without placing an order. The JSON it prints does not contain the key or the JWT:
 
 ```powershell

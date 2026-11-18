@@ -149,10 +149,15 @@ def build_summary(
 
 def _with_rounds(summary: dict, state: State) -> dict:
     from paper_split_maker.dual_bid import dual_summary
+    from paper_split_maker.small_pair import small_pair_summary
 
-    block = dual_summary(state.markets.values())
-    if block:
-        summary.update(block)
+    markets = state.markets.values()
+    dual = dual_summary(markets)
+    if dual:
+        summary.update(dual)
+    small = small_pair_summary(state.markets.values())
+    if small:
+        summary.update(small)
     return summary
 
 

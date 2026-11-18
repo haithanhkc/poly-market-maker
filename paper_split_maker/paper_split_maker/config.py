@@ -116,6 +116,7 @@ class Config:
     # single keeps one maker sell per side. ladder posts a few post-only
     # rungs around the mid and skews size toward the side that is falling.
     # dual_bid buys both outcomes during the open round and holds them.
+    # small_pair is the paper 0.96 pair on BTC 5m and 15m. It is paper-only.
     strategy: str = "single"
     # dual_bid quotes this many seconds after the round opens, and pulls
     # every bid at the stop. 8s and 275s sit in the 5-10s and 270-285s windows.
@@ -230,8 +231,8 @@ class Config:
             raise ConfigError("max_runtime_seconds must be positive")
         if self.redeem_max_attempts < 1:
             raise ConfigError("redeem_max_attempts must be at least 1")
-        if self.strategy not in ("single", "ladder", "dual_bid"):
-            raise ConfigError("strategy must be single, ladder, or dual_bid")
+        if self.strategy not in ("single", "ladder", "dual_bid", "small_pair"):
+            raise ConfigError("strategy must be single, ladder, dual_bid, or small_pair")
         if self.dual_bid_start_seconds < 0 or self.dual_bid_stop_seconds <= self.dual_bid_start_seconds:
             raise ConfigError("dual_bid quote window is invalid")
         if self.dual_bid_levels < 1 or self.dual_bid_levels > 20:

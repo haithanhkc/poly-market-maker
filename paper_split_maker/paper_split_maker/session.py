@@ -206,9 +206,10 @@ def run_paper(
         engine.handle_event(
             {"type": "heartbeat", "ts": stamp, "event_id": f"hb-{polls}-{stamp}"}
         )
-        if getattr(config, "strategy", "") == "dual_bid":
+        if getattr(config, "strategy", "") in {"dual_bid", "small_pair"}:
+            label = str(config.strategy)
             for market in engine.state.markets.values():
-                note(_dual_status_line(market))
+                note(_status_line(label, market))
         remaining = deadline - clock()
         if remaining <= 0:
             break
@@ -228,24 +229,60 @@ def run_paper(
     return summary
 
 
+def sessions_due(series: str, now_s: int, lead: int, *, include_current: bool) -> list[str]:
+    """Current window, when requested, plus later windows that open inside the lead."""
+    window = window_seconds(series)
+    current = (int(now_s) // window) * window
+    slugs = [f"{series}-{current}"] if include_current else []
+    slugs.extend(_due_slugs(series, window, now_s, lead, max_markets=8))
+    return slugs
+
+
 def _discover_due(engine, reader, config, stamp: int, max_markets: int, note, opened_slugs: set[str]) -> int:
     """Load the next session during its pre-open lead.
 
     Split mode skips a window that has already opened. ``dual_bid`` also loads
-    the current window while it is still inside the quote stop, because that
-    mode bids during the round.
+    the current window while it is still inside the quote stop. ``small_pair``
+    loads the open 5m and 15m rounds, and the next one of each inside the lead.
     """
-    series = str(getattr(config, "series_slug", "") or "btc-updown-5m")
+    strategy = str(getattr(config, "strategy", "") or "")
+    if strategy == "small_pair":
+        series_list = ["btc-updown-5m", "btc-updown-15m"]
+    else:
+        series_list = [str(getattr(config, "series_slug", "") or "btc-updown-5m")]
+    discoveries = []
+    for series in series_list:
+        if len(opened_slugs) >= max_markets:
+            break
+        _discover_series(
+            engine, reader, config, stamp, max_markets, note, opened_slugs, series
+        )
+        discoveries.append(dict(getattr(reader, "last_discovery", {}) or {}))
+        if strategy != "small_pair":
+            break
+    if len(discoveries) > 1 and hasattr(reader, "last_discovery"):
+        reader.last_discovery = _merge_discovery(discoveries)
+    return len(opened_slugs)
+
+
+def _discover_series(
+    engine, reader, config, stamp, max_markets, note, opened_slugs, series: str
+) -> None:
+    strategy = str(getattr(config, "strategy", "") or "")
     window = window_seconds(series)
     now_s = stamp // 1000
     current = (now_s // window) * window
     lead = int(getattr(config, "split_lead_seconds", 0) or 0)
     current_slug = f"{series}-{current}"
+    age = now_s - current
     want_current = False
-    if getattr(config, "strategy", "") == "dual_bid":
+    if strategy == "small_pair":
+        if 0 <= age < window:
+            want_current = True
+            note(f"{current_slug} is open; small_pair quotes from +2s until close")
+    elif strategy == "dual_bid":
         stop = int(getattr(config, "dual_bid_stop_seconds", 275) or 275)
         start = int(getattr(config, "dual_bid_start_seconds", 8) or 8)
-        age = now_s - current
         if 0 <= age <= stop:
             want_current = True
             note(
@@ -255,6 +292,8 @@ def _discover_due(engine, reader, config, stamp: int, max_markets: int, note, op
         note(f"{series}-{current} already started; waiting for the next session")
     due = _due_slugs(series, window, now_s, lead, max_markets)
     explicit = [str(item) for item in (config.market_slugs or []) if str(item)]
+    if strategy == "small_pair":
+        explicit = []
     slugs = explicit or (([current_slug] if want_current else []) + due)
     if not slugs:
         if lead <= 0:
@@ -262,12 +301,12 @@ def _discover_due(engine, reader, config, stamp: int, max_markets: int, note, op
         else:
             nxt = current + window
             note(f"next session {series}-{nxt} opens in {nxt - now_s}s; lead is {lead}s")
-        return len(opened_slugs)
+        return
     try:
         payloads = reader.discover_btc_updown(now_s, max(len(slugs), 1), slugs, series=series)
     except PublicDataError as exc:
         note(f"discovery failed: {exc}")
-        return len(opened_slugs)
+        return
     stats = getattr(reader, "last_discovery", {}) or {}
     if stats.get("error"):
         note(f"discovery failed: {stats['error']}")
@@ -298,7 +337,25 @@ def _discover_due(engine, reader, config, stamp: int, max_markets: int, note, op
             note(f"opened {slug}")
         else:
             note(f"{slug} was not loaded")
-    return len(opened_slugs)
+
+
+def _merge_discovery(rows: list[dict]) -> dict:
+    errors = [str(row.get("error") or "") for row in rows if row.get("error")]
+    starts = []
+    for row in rows:
+        starts.extend(row.get("starts") or [])
+    return {
+        "network": rows[-1].get("network") if rows else "",
+        "series": ",".join(str(row.get("series") or "") for row in rows),
+        "http_status": rows[-1].get("http_status") if rows else 0,
+        "rounds": sum(int(row.get("rounds") or 0) for row in rows),
+        "parsed": sum(int(row.get("parsed") or 0) for row in rows),
+        "matched": sum(int(row.get("matched") or 0) for row in rows),
+        "unparsed": sum(int(row.get("unparsed") or 0) for row in rows),
+        "starts": starts[:8],
+        "error": "; ".join(errors),
+        "by_series": rows,
+    }
 
 
 def _due_slugs(series: str, window: int, now_s: int, lead: int, max_markets: int) -> list[str]:
@@ -354,10 +411,14 @@ def _poll_trades(reader, market, note) -> dict:
 
 
 def _dual_status_line(market) -> str:
+    return _status_line("dual_bid", market)
+
+
+def _status_line(label: str, market) -> str:
     skipped = market.skip_counts or {}
     reasons = " ".join(f"{key}={skipped[key]}" for key in sorted(skipped))
     return (
-        f"dual_bid {market.slug} books_ok={market.book_fetches_ok} "
+        f"{label} {market.slug} books_ok={market.book_fetches_ok} "
         f"books_failed={market.book_fetches_failed} bids_posted={market.bids_posted} "
         f"trades_ok={market.trade_fetches_ok} trades_failed={market.trade_fetches_failed} "
         f"trades_http={market.trade_fetch_status} trades_seen={market.trades_seen} "
