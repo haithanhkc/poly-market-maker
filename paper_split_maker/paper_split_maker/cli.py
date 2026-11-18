@@ -10,7 +10,7 @@ from pathlib import Path
 
 from decimal import Decimal
 
-from paper_split_maker.config import ConfigError, load_config
+from paper_split_maker.config import ConfigError, load_config, parse_series_list
 from paper_split_maker.credentials import load_credentials
 from paper_split_maker.envfile import prepare_run
 from paper_split_maker.live_gate import CONFIRMATION, live_gates
@@ -60,6 +60,14 @@ def main(argv: list[str] | None = None) -> int:
         "--max-loss-fraction",
         default=None,
         help="loss fraction for this run. Overrides the JSON and BOT_MAX_LOSS_FRACTION.",
+    )
+    parser.add_argument(
+        "--series",
+        default=None,
+        help=(
+            "comma-separated small_pair series, for example btc-updown-5m. "
+            "Default is btc-updown-5m,btc-updown-15m."
+        ),
     )
     parser.add_argument("--live", action="store_true")
     parser.add_argument(
@@ -116,6 +124,9 @@ def _apply_strategy(config, args):
     choice = getattr(args, "strategy", None)
     if choice:
         config.strategy = choice
+    chosen = getattr(args, "series", None)
+    if chosen not in (None, ""):
+        config.small_pair_series = parse_series_list(chosen)
     _honor_bankroll(config, args)
     return config
 
@@ -154,8 +165,11 @@ def _honor_bankroll(config, args):
             config.max_loss_fraction = saved
     if config.per_market_budget > config.initial_capital:
         config.per_market_budget = config.initial_capital
-    if config.strategy == "small_pair" and config.max_open_markets < 4:
-        config.max_open_markets = 4
+    if config.strategy == "small_pair":
+        # Current window plus the next one, for each selected series.
+        needed = 2 * len(config.small_pair_series)
+        if config.max_open_markets < needed:
+            config.max_open_markets = needed
     config.validate()
 
 

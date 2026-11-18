@@ -243,11 +243,17 @@ def _discover_due(engine, reader, config, stamp: int, max_markets: int, note, op
 
     Split mode skips a window that has already opened. ``dual_bid`` also loads
     the current window while it is still inside the quote stop. ``small_pair``
-    loads the open 5m and 15m rounds, and the next one of each inside the lead.
+    loads each series in ``small_pair_series`` (5m and 15m by default).
     """
     strategy = str(getattr(config, "strategy", "") or "")
     if strategy == "small_pair":
-        series_list = ["btc-updown-5m", "btc-updown-15m"]
+        series_list = [
+            str(item)
+            for item in (
+                getattr(config, "small_pair_series", None)
+                or ("btc-updown-5m", "btc-updown-15m")
+            )
+        ]
     else:
         series_list = [str(getattr(config, "series_slug", "") or "btc-updown-5m")]
     discoveries = []

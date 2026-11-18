@@ -19,6 +19,11 @@ class ConfigError(ValueError):
     pass
 
 
+ALLOWED_SERIES = frozenset(
+    {"btc-updown-5m", "btc-updown-15m", "btc-updown-1h"}
+)
+
+
 _FORBIDDEN_PARTS = (
     "private",
     "secret",
@@ -78,6 +83,8 @@ class Config:
     live: bool = False
     # Recurring predict.fun series. 5m, 15m, and 1h are the BTC up/down books.
     series_slug: str = "btc-updown-5m"
+    # small_pair discovers these series. The default is 5m and 15m together.
+    small_pair_series: tuple[str, ...] = ("btc-updown-5m", "btc-updown-15m")
     # 0 disables the per-session cap. The aggregate floor still applies.
     session_max_loss: Decimal = Decimal("0")
     # 0 cancels on any price change. 1 cancels only after a full tick.
@@ -253,9 +260,16 @@ class Config:
             raise ConfigError("min_bid_price must sit inside (0, 1)")
         if self.round_budget <= 0:
             raise ConfigError("round_budget must be positive")
-        if self.series_slug not in {"btc-updown-5m", "btc-updown-15m", "btc-updown-1h"}:
+        if self.series_slug not in ALLOWED_SERIES:
             raise ConfigError(
                 "series_slug must be btc-updown-5m, btc-updown-15m, or btc-updown-1h"
+            )
+        if not self.small_pair_series:
+            raise ConfigError("small_pair_series must name at least one series")
+        unknown = [item for item in self.small_pair_series if item not in ALLOWED_SERIES]
+        if unknown:
+            raise ConfigError(
+                "small_pair_series must be btc-updown-5m, btc-updown-15m, or btc-updown-1h"
             )
         if self.ladder_levels < 1:
             raise ConfigError("ladder_levels must be at least 1")
@@ -428,6 +442,8 @@ def config_from_mapping(data: dict) -> Config:
             ):
                 raise ConfigError("market_slugs must be a list of strings")
             kwargs[key] = tuple(value)
+        elif key == "small_pair_series":
+            kwargs[key] = parse_series_list(value)
         elif key == "kill_switch_file":
             if not isinstance(value, str):
                 raise ConfigError("kill_switch_file must be a string")
@@ -437,6 +453,27 @@ def config_from_mapping(data: dict) -> Config:
     cfg = Config(**kwargs)
     cfg.validate()
     return cfg
+
+
+def parse_series_list(value) -> tuple[str, ...]:
+    """Accept a JSON list or a comma-separated CLI string. Order is kept."""
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise ConfigError("small_pair_series must be a list of series slugs")
+    chosen: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise ConfigError("small_pair_series must be a list of series slugs")
+        name = item.strip()
+        if not name or name in chosen:
+            continue
+        chosen.append(name)
+    if not chosen:
+        raise ConfigError("small_pair_series must name at least one series")
+    return tuple(chosen)
 
 
 def load_config(path: str | Path) -> Config:

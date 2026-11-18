@@ -8,8 +8,10 @@ from argparse import Namespace
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
+import pytest
+
 from paper_split_maker.cli import _apply_strategy, _load, main
-from paper_split_maker.config import Config
+from paper_split_maker.config import Config, ConfigError, load_config
 from paper_split_maker.envfile import derive_from_split, prepare_run
 from paper_split_maker.public_client import PublicReadClient
 from paper_split_maker.session import run_paper, sessions_due
@@ -461,3 +463,80 @@ def test_long_run_flags_and_live_refusal(tmp_path, monkeypatch, capsys):
     assert refused == 2
     assert "paper-only" in capsys.readouterr().out
     assert "not-a-real-key" not in capsys.readouterr().out
+
+
+def test_small_pair_series_defaults_and_rejects_unknown():
+    config = load_config(ROOT / "config.paper.json")
+    assert config.small_pair_series == ("btc-updown-5m", "btc-updown-15m")
+    raw = json.loads((ROOT / "config.paper.json").read_text(encoding="utf-8"))
+    raw["small_pair_series"] = ["btc-updown-5m"]
+    assert load_config_mapping(raw).small_pair_series == ("btc-updown-5m",)
+    raw["small_pair_series"] = ["btc-updown-5m", "btc-updown-5m", " btc-updown-15m "]
+    assert load_config_mapping(raw).small_pair_series == (
+        "btc-updown-5m",
+        "btc-updown-15m",
+    )
+    raw["small_pair_series"] = ["eth-updown-5m"]
+    with pytest.raises(ConfigError, match="small_pair_series"):
+        load_config_mapping(raw)
+    raw["small_pair_series"] = []
+    with pytest.raises(ConfigError, match="at least one"):
+        load_config_mapping(raw)
+
+
+def test_series_flag_limits_discovery_to_five_minutes(tmp_path, monkeypatch):
+    raw = json.loads((ROOT / "config.paper.json").read_text(encoding="utf-8"))
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    for key in list(os.environ):
+        if key.startswith("BOT_"):
+            monkeypatch.delenv(key, raising=False)
+    args = Namespace(
+        config=path,
+        strategy="small_pair",
+        series="btc-updown-5m",
+        capital=None,
+        max_loss_fraction=None,
+        max_markets=8,
+    )
+    config = _apply_strategy(_load(args), args)
+    assert config.small_pair_series == ("btc-updown-5m",)
+    urls = []
+
+    class _Rounds:
+        def get_json(self, url: str):
+            urls.append(url)
+            return ROUNDS
+
+    clock = {"t": 1_700_000_000.0}
+    summary = run_paper(
+        config,
+        tmp_path / "paper",
+        duration_seconds=2,
+        max_markets=8,
+        client=PublicReadClient(_Rounds(), network="mainnet", api_key="not-a-real-key"),
+        now_s=lambda: clock["t"],
+        sleep=lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
+    )
+    assert any("btc-updown-5m" in url and "/rounds" in url for url in urls)
+    assert not any("btc-updown-15m" in url for url in urls)
+    assert "not-a-real-key" not in json.dumps(summary)
+    bad = main(
+        [
+            "--config",
+            str(path),
+            "--out",
+            str(tmp_path / "bad"),
+            "--strategy",
+            "small_pair",
+            "--series",
+            "nope",
+        ]
+    )
+    assert bad == 2
+
+
+def load_config_mapping(data: dict):
+    from paper_split_maker.config import config_from_mapping
+
+    return config_from_mapping(data)

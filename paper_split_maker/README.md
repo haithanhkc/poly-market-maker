@@ -50,7 +50,15 @@ cd paper_split_maker
 python -m paper_split_maker --config config.paper.json --strategy small_pair --out runs\smallpair --max-markets 300 --duration-seconds 90000 --capital 5000 --max-loss-fraction 0.20
 ```
 
-That is about 25 hours, long enough for 300 sessions. Both the 5-minute and the 15-minute rounds count toward `--max-markets`. The process sends no orders. Mainnet reads still need `PREDICT_NETWORK=mainnet` and `PREDICT_API_KEY` in `.env`. `--live` with `small_pair` is refused. Each `rounds` row has the winner, fills and shares per side, average prices, pair cost, matched shares, the excess side and its price, and PnL split into matched and excess.
+That is about 25 hours, long enough for 300 sessions when both series are on. Both the 5-minute and the 15-minute rounds count toward `--max-markets`. `small_pair_series` in the config, or `--series`, chooses which books to load. Allowed values are `btc-updown-5m`, `btc-updown-15m`, and `btc-updown-1h`. The default is 5m and 15m.
+
+A 5-minute-only run opens about 12 rounds an hour, so 300 sessions is 25 hours plus one extra hour for the last round to finish:
+
+```powershell
+python -m paper_split_maker --config config.paper.json --strategy small_pair --series btc-updown-5m --out runs\smallpair5m --max-markets 300 --duration-seconds 93600 --capital 5000 --max-loss-fraction 0.20
+```
+
+The process sends no orders. Mainnet reads still need `PREDICT_NETWORK=mainnet` and `PREDICT_API_KEY` in `.env`. `--live` with `small_pair` is refused. Each `rounds` row has the winner, fills and shares per side, average prices, pair cost, matched shares, the excess side and its price, and PnL split into matched and excess.
 
 Check the key, the login, and the USDT balance without placing an order. The JSON it prints does not contain the key or the JWT:
 
