@@ -1,45 +1,63 @@
-"""Public market websocket and authenticated user websocket message shapes.
+"""predict.fun websocket message shapes.
 
-The hosts are the official CLOB subscription endpoints. This module builds
-messages and reads fills. It does not open a socket and it does not log the
-user-channel credential object.
+Mainnet is ``wss://ws.predict.fun/ws``. Testnet is
+``wss://ws-testnet.predict.fun/ws``. This module builds subscribe frames and
+reads fills. It does not open a socket and it does not log a JWT or a key.
 """
 
 from __future__ import annotations
 
 from decimal import Decimal
 
-MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-USER_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+from paper_split_maker.chain_data import WEI, wei_to_shares
+
+MARKET_WS = "wss://ws.predict.fun/ws"
+TESTNET_WS = "wss://ws-testnet.predict.fun/ws"
 BINANCE_BTC_WS = "wss://stream.binance.com:9443/ws/btcusdt@bookTicker"
-CONFIRMED_TRADE = {"MATCHED", "MINED", "CONFIRMED"}
 
 
-def market_subscribe(asset_ids: list[str]) -> dict:
+def market_ws(network: str = "mainnet") -> str:
+    if str(network).lower() == "testnet":
+        return TESTNET_WS
+    return MARKET_WS
+
+
+def market_subscribe(market_ids: list[str], *, request_id: int = 1) -> dict:
+    """One order-book subscription. The server reads only the first topic."""
+    first = str(market_ids[0]) if market_ids else ""
     return {
-        "assets_ids": [str(item) for item in asset_ids],
-        "type": "market",
-        "custom_feature_enabled": True,
+        "method": "subscribe",
+        "requestId": int(request_id),
+        "params": [f"predictOrderbook/{first}"] if first else [],
     }
 
 
-def user_subscribe(
-    api_key: str, secret: str, passphrase: str, condition_ids: list[str]
-) -> dict:
+def market_subscriptions(market_ids: list[str]) -> list[dict]:
+    return [
+        market_subscribe([item], request_id=index + 1)
+        for index, item in enumerate(market_ids)
+        if str(item)
+    ]
+
+
+def user_subscribe(jwt: str, *, request_id: int = 1) -> dict:
     return {
-        "auth": {
-            "apiKey": api_key,
-            "secret": secret,
-            "passphrase": passphrase,
-        },
-        "markets": [str(item) for item in condition_ids],
-        "type": "user",
+        "method": "subscribe",
+        "requestId": int(request_id),
+        "params": [f"predictWalletEvents/{jwt}"],
     }
 
 
 def describe_user_subscribe(funder: str, condition_count: int) -> str:
-    """Text safe to print. It names the funder and never the API secret."""
-    return f"user channel funder={funder} markets={condition_count}"
+    """Text safe to print. It names the funder and never the JWT or API key."""
+    return f"wallet events funder={funder} markets={condition_count}"
+
+
+def heartbeat_reply(frame: dict) -> dict | None:
+    """Echo the server heartbeat. A missing or different echo closes the socket."""
+    if not isinstance(frame, dict) or frame.get("topic") != "heartbeat":
+        return None
+    return {"method": "heartbeat", "data": frame.get("data")}
 
 
 def binance_mid(payload: dict) -> Decimal | None:
@@ -55,58 +73,44 @@ def binance_mid(payload: dict) -> Decimal | None:
 
 
 def user_fill_deltas(payload: dict, matched_so_far: dict[str, Decimal]) -> list[dict]:
-    """Fills for our orders. Trade ids dedupe MATCHED and later CONFIRMED.
+    """Fills for our orders.
 
-    An order event with a larger size_matched emits only the increase. The
-    synthetic trade id includes the new matched total, so a replay is a duplicate.
+    A predict.fun ``orderTransactionSuccess`` event is one settlement. An
+    order snapshot with a larger matched size emits only the increase.
     """
     if not isinstance(payload, dict):
         return []
-    kind = str(payload.get("event_type") or "")
-    if kind == "trade":
-        return _trade_fills(payload)
+    event = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    kind = str(event.get("type") or payload.get("event_type") or "")
+    if kind == "orderTransactionSuccess":
+        return _wallet_fill(event)
     if kind == "order":
         return _order_fill(payload, matched_so_far)
     return []
 
 
-def _trade_fills(payload: dict) -> list[dict]:
-    status = str(payload.get("status") or "")
-    if status not in CONFIRMED_TRADE:
+def _wallet_fill(event: dict) -> list[dict]:
+    fill = event.get("fill") if isinstance(event.get("fill"), dict) else {}
+    order_id = str(event.get("orderHash") or event.get("orderId") or "")
+    trade_id = str(event.get("settlementId") or event.get("orderId") or "")
+    if not order_id or not trade_id:
         return []
-    trade_id = str(payload.get("id") or "")
-    if not trade_id:
+    try:
+        size = _amount_shares(fill.get("executedSizeWei"))
+        price = _amount_shares(fill.get("executedPriceWei"))
+    except (ValueError, ArithmeticError):
         return []
-    rows = []
-    makers = payload.get("maker_orders") or []
-    if isinstance(makers, list):
-        for maker in makers:
-            if not isinstance(maker, dict):
-                continue
-            order_id = str(maker.get("order_id") or "")
-            if not order_id:
-                continue
-            rows.append(
-                {
-                    "exchange_order_id": order_id,
-                    "trade_id": trade_id,
-                    "size": str(maker.get("matched_amount") or "0"),
-                    "price": str(maker.get("price") or payload.get("price") or "0"),
-                    "role": "maker",
-                }
-            )
-    taker_id = str(payload.get("taker_order_id") or "")
-    if taker_id and str(payload.get("trader_side") or "") == "TAKER":
-        rows.append(
-            {
-                "exchange_order_id": taker_id,
-                "trade_id": trade_id,
-                "size": str(payload.get("size") or "0"),
-                "price": str(payload.get("price") or "0"),
-                "role": "taker",
-            }
-        )
-    return rows
+    if size <= 0:
+        return []
+    return [
+        {
+            "exchange_order_id": order_id,
+            "trade_id": trade_id,
+            "size": format(size, "f"),
+            "price": format(price, "f"),
+            "role": "maker" if event.get("isMaker") else "taker",
+        }
+    ]
 
 
 def _order_fill(payload: dict, matched_so_far: dict[str, Decimal]) -> list[dict]:
@@ -132,3 +136,13 @@ def _order_fill(payload: dict, matched_so_far: dict[str, Decimal]) -> list[dict]
             "role": "maker",
         }
     ]
+
+
+def _amount_shares(value) -> Decimal:
+    """Wei when the integer is large, otherwise a human share amount."""
+    if value is None or value == "":
+        return Decimal("0")
+    number = Decimal(str(value))
+    if number >= Decimal(WEI) / Decimal(1000):
+        return wei_to_shares(int(number))
+    return number

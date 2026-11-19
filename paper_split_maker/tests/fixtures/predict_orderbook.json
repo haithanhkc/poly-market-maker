@@ -1,0 +1,10 @@
+{
+  "success": true,
+  "data": {
+    "marketId": 9001,
+    "updateTimestampMs": 1699999700000,
+    "lastOrderSettled": null,
+    "bids": [[0.48, 135], [0.47, 80]],
+    "asks": [[0.52, 40]]
+  }
+}

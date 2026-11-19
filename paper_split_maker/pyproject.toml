@@ -1,13 +1,13 @@
 [project]
 name = "paper-split-maker"
 version = "0.1.0"
-description = "Two-sided maker sell bot for Polymarket BTC Up/Down. Paper by default; live is opt-in."
+description = "Two-sided maker sell bot for predict.fun BTC Up/Down. Paper by default; live is opt-in."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-live = ["py-clob-client-v2", "web3", "websockets", "polymarket"]
+live = ["predict-sdk", "web3", "websockets", "eth-account"]
 
 [project.scripts]
 paper-split-maker = "paper_split_maker.cli:main"

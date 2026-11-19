@@ -19,6 +19,11 @@ class ConfigError(ValueError):
     pass
 
 
+ALLOWED_SERIES = frozenset(
+    {"btc-updown-5m", "btc-updown-15m", "btc-updown-1h"}
+)
+
+
 _FORBIDDEN_PARTS = (
     "private",
     "secret",
@@ -76,6 +81,10 @@ class Config:
     market_slugs: tuple[str, ...] = ()
     # Live is off unless this is true AND the CLI flag AND the risk confirmation.
     live: bool = False
+    # Recurring predict.fun series. 5m, 15m, and 1h are the BTC up/down books.
+    series_slug: str = "btc-updown-5m"
+    # small_pair discovers these series. The default is 5m and 15m together.
+    small_pair_series: tuple[str, ...] = ("btc-updown-5m", "btc-updown-15m")
     # 0 disables the per-session cap. The aggregate floor still applies.
     session_max_loss: Decimal = Decimal("0")
     # 0 cancels on any price change. 1 cancels only after a full tick.
@@ -113,7 +122,73 @@ class Config:
     redeem_max_attempts: int = 5
     # single keeps one maker sell per side. ladder posts a few post-only
     # rungs around the mid and skews size toward the side that is falling.
+    # dual_bid buys both outcomes during the open round and holds them.
+    # small_pair is the paper 0.96 pair on BTC 5m and 15m. It is paper-only.
     strategy: str = "single"
+    # dual_bid quotes this many seconds after the round opens, and pulls
+    # every bid at the stop. 8s and 275s sit in the 5-10s and 270-285s windows.
+    dual_bid_start_seconds: int = 8
+    dual_bid_stop_seconds: int = 275
+    dual_bid_levels: int = 6
+    dual_bid_clip: Decimal = Decimal("5")
+    dual_bid_max_clip: Decimal = Decimal("24")
+    dual_bid_requote_ms: int = 1500
+    target_pair_cost: Decimal = Decimal("0.97")
+    pair_cost_stop: Decimal = Decimal("1")
+    min_share_balance: Decimal = Decimal("0.85")
+    min_bid_price: Decimal = Decimal("0.10")
+    round_budget: Decimal = Decimal("25")
+    # Off unless --binance-lean or this flag. The book-mid quote is unchanged.
+    small_pair_binance: bool = False
+    # Kept so older configs still load. The lean no longer recentres on fair value.
+    small_pair_fair_gap: Decimal = Decimal("0.03")
+    # After this many seconds, stop a side whose fair value is below small_pair_loser_fair.
+    small_pair_loser_fair: Decimal = Decimal("0.45")
+    small_pair_loser_after_seconds: int = 30
+    # Drop a bid that is more than this far above that side's fair value.
+    # The wider gap is used when the Binance print is older than small_pair_stale_seconds.
+    small_pair_adverse_gap: Decimal = Decimal("0.02")
+    small_pair_adverse_gap_stale: Decimal = Decimal("0.03")
+    small_pair_stale_seconds: int = 2
+    # Per-second log-return volatility floor. About 56% annualized.
+    small_pair_sigma_floor: Decimal = Decimal("0.0001")
+    # Realized vol window. 900 seconds is 15 minutes. The multiplier cannot exceed 1.
+    small_pair_vol_lookback_seconds: int = 900
+    small_pair_sigma_multiplier: Decimal = Decimal("1")
+    # P >= favorite_fair may hold this many excess shares. P < 0.5 is capped lower.
+    small_pair_favorite_excess: Decimal = Decimal("12")
+    small_pair_underdog_excess: Decimal = Decimal("4")
+    small_pair_favorite_fair: Decimal = Decimal("0.55")
+    # |mid - 0.5| below this band uses the nearer pair sum, unless the mode halves the lot.
+    small_pair_neutral_band: Decimal = Decimal("0.10")
+    small_pair_neutral_target: Decimal = Decimal("0.94")
+    small_pair_neutral_mode: str = "sum"
+    # Binance mode waits this long after the open, and pulls P < 0.5 from this second.
+    small_pair_start_seconds: int = 10
+    small_pair_late_loser_seconds: int = 240
+    # Per-session spend is min(round budget, cap, equity * fraction) when the lean is on.
+    session_budget_cap: Decimal = Decimal("25")
+    session_budget_fraction: Decimal = Decimal("0.25")
+    session_budget_min: Decimal = Decimal("1")
+    # binance keeps the current filter. chainlink or combined opt into the blend.
+    price_source: str = "binance"
+    # |binance - chainlink| / chainlink above this widens the adverse gap.
+    small_pair_price_disagree: Decimal = Decimal("0.001")
+    small_pair_disagree_gap: Decimal = Decimal("0.04")
+    # Combined mode subtracts this from the pair sum only when a feed is stale
+    # or the de-biased Binance/Chainlink residual is abnormal.
+    small_pair_widen_extra: Decimal = Decimal("0.02")
+    # Combined mode only. One live lot on a side, then wait for the other side.
+    small_pair_pair_gate: bool = True
+    # Raise the lagging bid so filled-average + that bid stays within this sum.
+    small_pair_catch_up: bool = True
+    small_pair_catch_up_sum: Decimal = Decimal("0.97")
+    # On a 300s round, stop opening a new pair after this many seconds.
+    # Longer rounds use the same fraction of the window. 0 turns it off.
+    small_pair_first_leg_seconds: int = 200
+    # The on-chain aggregator is fresh for this long after updatedAt.
+    chainlink_stale_seconds: int = 3600
+    chainlink_poll_seconds: int = 5
     ladder_levels: int = 3
     ladder_spacing: Decimal = Decimal("0.01")
     # Join the touch on a side once its mid is this far below the other.
@@ -214,8 +289,101 @@ class Config:
             raise ConfigError("max_runtime_seconds must be positive")
         if self.redeem_max_attempts < 1:
             raise ConfigError("redeem_max_attempts must be at least 1")
-        if self.strategy not in ("single", "ladder"):
-            raise ConfigError("strategy must be single or ladder")
+        if self.strategy not in ("single", "ladder", "dual_bid", "small_pair"):
+            raise ConfigError("strategy must be single, ladder, dual_bid, or small_pair")
+        if self.dual_bid_start_seconds < 0 or self.dual_bid_stop_seconds <= self.dual_bid_start_seconds:
+            raise ConfigError("dual_bid quote window is invalid")
+        if self.dual_bid_levels < 1 or self.dual_bid_levels > 20:
+            raise ConfigError("dual_bid_levels must be from 1 to 20")
+        if self.dual_bid_clip <= 0 or self.dual_bid_max_clip < self.dual_bid_clip:
+            raise ConfigError("dual_bid clip sizes are invalid")
+        if self.dual_bid_max_clip > 100:
+            raise ConfigError("dual_bid_max_clip must be at most 100")
+        if self.dual_bid_requote_ms < 0:
+            raise ConfigError("dual_bid_requote_ms must be non-negative")
+        if self.target_pair_cost <= 0 or self.target_pair_cost > 1:
+            raise ConfigError("target_pair_cost must be in (0, 1]")
+        if self.pair_cost_stop < self.target_pair_cost or self.pair_cost_stop > Decimal("2"):
+            raise ConfigError("pair_cost_stop must sit between the target and 2")
+        if self.min_share_balance <= 0 or self.min_share_balance > 1:
+            raise ConfigError("min_share_balance must be in (0, 1]")
+        if self.min_bid_price <= 0 or self.min_bid_price >= 1:
+            raise ConfigError("min_bid_price must sit inside (0, 1)")
+        if self.round_budget <= 0:
+            raise ConfigError("round_budget must be positive")
+        if self.series_slug not in ALLOWED_SERIES:
+            raise ConfigError(
+                "series_slug must be btc-updown-5m, btc-updown-15m, or btc-updown-1h"
+            )
+        if not self.small_pair_series:
+            raise ConfigError("small_pair_series must name at least one series")
+        unknown = [item for item in self.small_pair_series if item not in ALLOWED_SERIES]
+        if unknown:
+            raise ConfigError(
+                "small_pair_series must be btc-updown-5m, btc-updown-15m, or btc-updown-1h"
+            )
+        if self.small_pair_fair_gap < 0 or self.small_pair_fair_gap >= 1:
+            raise ConfigError("small_pair_fair_gap must be in [0, 1)")
+        if self.small_pair_loser_fair <= 0 or self.small_pair_loser_fair > Decimal("0.5"):
+            raise ConfigError("small_pair_loser_fair must sit inside (0, 0.5]")
+        if self.small_pair_loser_after_seconds < 0:
+            raise ConfigError("small_pair_loser_after_seconds must be non-negative")
+        if self.small_pair_adverse_gap <= 0 or self.small_pair_adverse_gap >= 1:
+            raise ConfigError("small_pair_adverse_gap must sit inside (0, 1)")
+        if self.small_pair_adverse_gap_stale < self.small_pair_adverse_gap:
+            raise ConfigError("small_pair_adverse_gap_stale must be at least the fresh gap")
+        if self.small_pair_adverse_gap_stale >= 1:
+            raise ConfigError("small_pair_adverse_gap_stale must be below 1")
+        if self.small_pair_stale_seconds < 0:
+            raise ConfigError("small_pair_stale_seconds must be non-negative")
+        if self.small_pair_sigma_floor <= 0:
+            raise ConfigError("small_pair_sigma_floor must be positive")
+        if self.small_pair_vol_lookback_seconds < 60:
+            raise ConfigError("small_pair_vol_lookback_seconds must be at least 60")
+        if self.small_pair_sigma_multiplier <= 0 or self.small_pair_sigma_multiplier > 1:
+            raise ConfigError("small_pair_sigma_multiplier must sit inside (0, 1]")
+        if self.small_pair_underdog_excess < 2 or self.small_pair_underdog_excess > 4:
+            raise ConfigError("small_pair_underdog_excess must sit inside [2, 4]")
+        if self.small_pair_favorite_excess < self.small_pair_underdog_excess:
+            raise ConfigError("small_pair_favorite_excess must be at least the underdog cap")
+        if self.small_pair_favorite_fair <= Decimal("0.5") or self.small_pair_favorite_fair >= 1:
+            raise ConfigError("small_pair_favorite_fair must sit inside (0.5, 1)")
+        if self.small_pair_neutral_band <= 0 or self.small_pair_neutral_band >= Decimal("0.5"):
+            raise ConfigError("small_pair_neutral_band must sit inside (0, 0.5)")
+        if self.small_pair_neutral_target <= 0 or self.small_pair_neutral_target > 1:
+            raise ConfigError("small_pair_neutral_target must sit inside (0, 1]")
+        if self.small_pair_neutral_mode not in {"sum", "half_lot"}:
+            raise ConfigError("small_pair_neutral_mode must be sum or half_lot")
+        if self.small_pair_start_seconds < 0:
+            raise ConfigError("small_pair_start_seconds must be non-negative")
+        if self.small_pair_late_loser_seconds < 0:
+            raise ConfigError("small_pair_late_loser_seconds must be non-negative")
+        if self.session_budget_cap <= 0:
+            raise ConfigError("session_budget_cap must be positive")
+        if self.session_budget_fraction <= 0 or self.session_budget_fraction > 1:
+            raise ConfigError("session_budget_fraction must sit inside (0, 1]")
+        if self.session_budget_min <= 0:
+            raise ConfigError("session_budget_min must be positive")
+        if self.session_budget_min > self.session_budget_cap:
+            raise ConfigError("session_budget_min cannot exceed session_budget_cap")
+        if self.price_source not in {"binance", "chainlink", "combined"}:
+            raise ConfigError("price_source must be binance, chainlink, or combined")
+        if self.small_pair_price_disagree <= 0 or self.small_pair_price_disagree >= 1:
+            raise ConfigError("small_pair_price_disagree must sit inside (0, 1)")
+        if self.small_pair_disagree_gap < self.small_pair_adverse_gap_stale:
+            raise ConfigError("small_pair_disagree_gap must be at least the stale gap")
+        if self.small_pair_disagree_gap >= 1:
+            raise ConfigError("small_pair_disagree_gap must be below 1")
+        if self.small_pair_widen_extra < 0 or self.small_pair_widen_extra > Decimal("0.06"):
+            raise ConfigError("small_pair_widen_extra must sit inside [0, 0.06]")
+        if self.small_pair_catch_up_sum <= 0 or self.small_pair_catch_up_sum > 1:
+            raise ConfigError("small_pair_catch_up_sum must sit inside (0, 1]")
+        if self.small_pair_first_leg_seconds < 0:
+            raise ConfigError("small_pair_first_leg_seconds must be non-negative")
+        if self.chainlink_stale_seconds < 1:
+            raise ConfigError("chainlink_stale_seconds must be at least 1")
+        if self.chainlink_poll_seconds < 1:
+            raise ConfigError("chainlink_poll_seconds must be at least 1")
         if self.ladder_levels < 1:
             raise ConfigError("ladder_levels must be at least 1")
         if self.ladder_spacing <= 0:
@@ -300,6 +468,31 @@ _DECIMAL_FIELDS = {
     "winner_min_price",
     "max_fee_gwei",
     "priority_fee_gwei",
+    "dual_bid_clip",
+    "dual_bid_max_clip",
+    "target_pair_cost",
+    "pair_cost_stop",
+    "min_share_balance",
+    "min_bid_price",
+    "round_budget",
+    "small_pair_fair_gap",
+    "small_pair_loser_fair",
+    "small_pair_adverse_gap",
+    "small_pair_adverse_gap_stale",
+    "small_pair_sigma_floor",
+    "small_pair_sigma_multiplier",
+    "small_pair_favorite_excess",
+    "small_pair_underdog_excess",
+    "small_pair_favorite_fair",
+    "small_pair_neutral_band",
+    "small_pair_neutral_target",
+    "session_budget_cap",
+    "session_budget_fraction",
+    "session_budget_min",
+    "small_pair_price_disagree",
+    "small_pair_disagree_gap",
+    "small_pair_widen_extra",
+    "small_pair_catch_up_sum",
 }
 _INT_FIELDS = {
     "stale_after_ms",
@@ -325,6 +518,18 @@ _INT_FIELDS = {
     "late_window_seconds",
     "split_confirm_timeout_ms",
     "gas_limit",
+    "dual_bid_start_seconds",
+    "dual_bid_stop_seconds",
+    "dual_bid_levels",
+    "dual_bid_requote_ms",
+    "small_pair_loser_after_seconds",
+    "small_pair_stale_seconds",
+    "small_pair_vol_lookback_seconds",
+    "small_pair_start_seconds",
+    "small_pair_late_loser_seconds",
+    "chainlink_stale_seconds",
+    "chainlink_poll_seconds",
+    "small_pair_first_leg_seconds",
 }
 _BOOL_FIELDS = {
     "trade_through_fills",
@@ -332,6 +537,9 @@ _BOOL_FIELDS = {
     "auto_split",
     "merge_when_idle",
     "live",
+    "small_pair_binance",
+    "small_pair_pair_gate",
+    "small_pair_catch_up",
 }
 
 
@@ -364,6 +572,10 @@ def config_from_mapping(data: dict) -> Config:
             kwargs[key] = str(value)
         elif key == "strategy":
             kwargs[key] = str(value)
+        elif key == "series_slug":
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError("series_slug must be a string")
+            kwargs[key] = value.strip()
         elif key == "poll_interval_seconds":
             kwargs[key] = float(value)
         elif key == "market_slugs":
@@ -372,6 +584,16 @@ def config_from_mapping(data: dict) -> Config:
             ):
                 raise ConfigError("market_slugs must be a list of strings")
             kwargs[key] = tuple(value)
+        elif key == "small_pair_series":
+            kwargs[key] = parse_series_list(value)
+        elif key == "price_source":
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError("price_source must be a string")
+            kwargs[key] = value.strip()
+        elif key == "small_pair_neutral_mode":
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError("small_pair_neutral_mode must be a string")
+            kwargs[key] = value.strip()
         elif key == "kill_switch_file":
             if not isinstance(value, str):
                 raise ConfigError("kill_switch_file must be a string")
@@ -381,6 +603,27 @@ def config_from_mapping(data: dict) -> Config:
     cfg = Config(**kwargs)
     cfg.validate()
     return cfg
+
+
+def parse_series_list(value) -> tuple[str, ...]:
+    """Accept a JSON list or a comma-separated CLI string. Order is kept."""
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise ConfigError("small_pair_series must be a list of series slugs")
+    chosen: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise ConfigError("small_pair_series must be a list of series slugs")
+        name = item.strip()
+        if not name or name in chosen:
+            continue
+        chosen.append(name)
+    if not chosen:
+        raise ConfigError("small_pair_series must name at least one series")
+    return tuple(chosen)
 
 
 def load_config(path: str | Path) -> Config:

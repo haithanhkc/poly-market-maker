@@ -1,0 +1,27 @@
+{
+  "success": true,
+  "cursor": null,
+  "data": [
+    {
+      "settlementId": "settle-ask-up",
+      "transactionHash": "0xask",
+      "executedAt": "2023-11-14T22:13:22.000Z",
+      "amountFilled": "20000000000000000000",
+      "priceExecuted": "400000000000000000",
+      "taker": {
+        "quoteType": "Ask",
+        "amount": "20000000000000000000",
+        "price": "400000000000000000",
+        "outcome": {"name": "Up", "indexSet": 1, "onChainId": "111"}
+      },
+      "makers": [
+        {
+          "quoteType": "Bid",
+          "amount": "20000000000000000000",
+          "price": "400000000000000000",
+          "outcome": {"name": "Up", "indexSet": 1, "onChainId": "111"}
+        }
+      ]
+    }
+  ]
+}

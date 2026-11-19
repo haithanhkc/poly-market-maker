@@ -18,6 +18,12 @@ def _d(value: object) -> Decimal:
     return D(value)
 
 
+def _optional_decimal(value: object) -> Optional[Decimal]:
+    if value in (None, ""):
+        return None
+    return D(value)
+
+
 @dataclass
 class LevelBook:
     ts_ms: int = -1
@@ -36,6 +42,12 @@ class LevelBook:
 
     def ask_size_at(self, price: Decimal) -> Decimal:
         for level, size in self.asks:
+            if level == price:
+                return size
+        return ZERO
+
+    def bid_size_at(self, price: Decimal) -> Decimal:
+        for level, size in self.bids:
             if level == price:
                 return size
         return ZERO
@@ -100,10 +112,54 @@ class Market:
     sold_up_proceeds: Decimal = ZERO
     sold_down_shares: Decimal = ZERO
     sold_down_proceeds: Decimal = ZERO
+    bought_up_shares: Decimal = ZERO
+    bought_up_cost: Decimal = ZERO
+    bought_down_shares: Decimal = ZERO
+    bought_down_cost: Decimal = ZERO
+    buy_up_fills: int = 0
+    buy_down_fills: int = 0
+    quoted_as: str = ""
+    book_fetches_ok: int = 0
+    book_fetches_failed: int = 0
+    bids_posted: int = 0
+    trades_seen: int = 0
+    trade_fetches_ok: int = 0
+    trade_fetches_failed: int = 0
+    trade_fetch_status: int = 0
+    trades_returned: int = 0
+    skip_counts: dict = field(default_factory=dict)
     session_stopped: bool = False
     pause_until_ms: int = 0
     last_requote_ts: int = -(10**18)
     pending_split: Decimal = ZERO
+    reference_price: Optional[Decimal] = None
+    reference_source: str = ""
+    reference_logged: bool = False
+    fair_gap_abs_sum: Decimal = ZERO
+    fair_gap_n: int = 0
+    fair_gap_max: Decimal = ZERO
+    binance_implied_winner: str = ""
+    binance_close_locked: bool = False
+    last_binance: Optional[Decimal] = None
+    last_fair_up: Optional[Decimal] = None
+    last_mid_up: Optional[Decimal] = None
+    last_gap: Optional[Decimal] = None
+    last_lean_action: str = ""
+    filter_counts: dict = field(default_factory=dict)
+    fill_edge_sum: Decimal = ZERO
+    fill_edge_n: int = 0
+    last_binance_age_s: Optional[Decimal] = None
+    last_binance_ts_ms: int = 0
+    last_chainlink: Optional[Decimal] = None
+    last_chainlink_age_s: Optional[Decimal] = None
+    last_price_gap: Optional[Decimal] = None
+    last_combined: Optional[Decimal] = None
+    price_spot_source: str = ""
+    price_widen: bool = False
+    last_basis: Optional[Decimal] = None
+    last_residual: Optional[Decimal] = None
+    last_up_target: Optional[Decimal] = None
+    last_down_target: Optional[Decimal] = None
 
     def inventory(self, outcome: str) -> Decimal:
         return self.up if outcome == "up" else self.down
@@ -149,10 +205,68 @@ class Market:
             "sold_up_proceeds": money(self.sold_up_proceeds),
             "sold_down_shares": money(self.sold_down_shares),
             "sold_down_proceeds": money(self.sold_down_proceeds),
+            "bought_up_shares": money(self.bought_up_shares),
+            "bought_up_cost": money(self.bought_up_cost),
+            "bought_down_shares": money(self.bought_down_shares),
+            "bought_down_cost": money(self.bought_down_cost),
+            "buy_up_fills": self.buy_up_fills,
+            "buy_down_fills": self.buy_down_fills,
+            "quoted_as": self.quoted_as,
+            "book_fetches_ok": self.book_fetches_ok,
+            "book_fetches_failed": self.book_fetches_failed,
+            "bids_posted": self.bids_posted,
+            "trades_seen": self.trades_seen,
+            "trade_fetches_ok": self.trade_fetches_ok,
+            "trade_fetches_failed": self.trade_fetches_failed,
+            "trade_fetch_status": self.trade_fetch_status,
+            "trades_returned": self.trades_returned,
+            "skip_counts": dict(self.skip_counts),
             "session_stopped": self.session_stopped,
             "pause_until_ms": self.pause_until_ms,
             "last_requote_ts": self.last_requote_ts,
             "pending_split": money(self.pending_split),
+            "reference_price": money(self.reference_price) if self.reference_price else None,
+            "reference_source": self.reference_source,
+            "reference_logged": self.reference_logged,
+            "fair_gap_abs_sum": money(self.fair_gap_abs_sum),
+            "fair_gap_n": self.fair_gap_n,
+            "fair_gap_max": money(self.fair_gap_max),
+            "binance_implied_winner": self.binance_implied_winner,
+            "binance_close_locked": self.binance_close_locked,
+            "last_binance": money(self.last_binance) if self.last_binance else None,
+            "last_fair_up": money(self.last_fair_up) if self.last_fair_up else None,
+            "last_mid_up": money(self.last_mid_up) if self.last_mid_up else None,
+            "last_gap": money(self.last_gap) if self.last_gap is not None else None,
+            "last_lean_action": self.last_lean_action,
+            "filter_counts": {
+                str(key): int(value) for key, value in (self.filter_counts or {}).items()
+            },
+            "fill_edge_sum": money(self.fill_edge_sum),
+            "fill_edge_n": self.fill_edge_n,
+            "last_binance_age_s": (
+                money(self.last_binance_age_s) if self.last_binance_age_s is not None else None
+            ),
+            "last_binance_ts_ms": self.last_binance_ts_ms,
+            "last_chainlink": money(self.last_chainlink) if self.last_chainlink else None,
+            "last_chainlink_age_s": (
+                money(self.last_chainlink_age_s)
+                if self.last_chainlink_age_s is not None
+                else None
+            ),
+            "last_price_gap": money(self.last_price_gap) if self.last_price_gap is not None else None,
+            "last_combined": money(self.last_combined) if self.last_combined else None,
+            "price_spot_source": self.price_spot_source,
+            "price_widen": self.price_widen,
+            "last_basis": money(self.last_basis) if self.last_basis is not None else None,
+            "last_residual": (
+                money(self.last_residual) if self.last_residual is not None else None
+            ),
+            "last_up_target": (
+                money(self.last_up_target) if self.last_up_target is not None else None
+            ),
+            "last_down_target": (
+                money(self.last_down_target) if self.last_down_target is not None else None
+            ),
         }
 
     @classmethod
@@ -194,10 +308,60 @@ class Market:
             sold_up_proceeds=_d(data.get("sold_up_proceeds", "0")),
             sold_down_shares=_d(data.get("sold_down_shares", "0")),
             sold_down_proceeds=_d(data.get("sold_down_proceeds", "0")),
+            bought_up_shares=_d(data.get("bought_up_shares", "0")),
+            bought_up_cost=_d(data.get("bought_up_cost", "0")),
+            bought_down_shares=_d(data.get("bought_down_shares", "0")),
+            bought_down_cost=_d(data.get("bought_down_cost", "0")),
+            buy_up_fills=int(data.get("buy_up_fills", 0)),
+            buy_down_fills=int(data.get("buy_down_fills", 0)),
+            quoted_as=str(data.get("quoted_as") or ""),
+            book_fetches_ok=int(data.get("book_fetches_ok", 0)),
+            book_fetches_failed=int(data.get("book_fetches_failed", 0)),
+            bids_posted=int(data.get("bids_posted", 0)),
+            trades_seen=int(data.get("trades_seen", 0)),
+            trade_fetches_ok=int(data.get("trade_fetches_ok", 0)),
+            trade_fetches_failed=int(data.get("trade_fetches_failed", 0)),
+            trade_fetch_status=int(data.get("trade_fetch_status", 0)),
+            trades_returned=int(data.get("trades_returned", 0)),
+            skip_counts={
+                str(key): int(value)
+                for key, value in (data.get("skip_counts") or {}).items()
+            },
             session_stopped=bool(data.get("session_stopped", False)),
             pause_until_ms=int(data.get("pause_until_ms", 0)),
             last_requote_ts=int(data.get("last_requote_ts", -(10**18))),
             pending_split=_d(data.get("pending_split", "0")),
+            reference_price=_optional_decimal(data.get("reference_price")),
+            reference_source=str(data.get("reference_source") or ""),
+            reference_logged=bool(data.get("reference_logged", False)),
+            fair_gap_abs_sum=_d(data.get("fair_gap_abs_sum", "0")),
+            fair_gap_n=int(data.get("fair_gap_n", 0) or 0),
+            fair_gap_max=_d(data.get("fair_gap_max", "0")),
+            binance_implied_winner=str(data.get("binance_implied_winner") or ""),
+            binance_close_locked=bool(data.get("binance_close_locked", False)),
+            last_binance=_optional_decimal(data.get("last_binance")),
+            last_fair_up=_optional_decimal(data.get("last_fair_up")),
+            last_mid_up=_optional_decimal(data.get("last_mid_up")),
+            last_gap=_optional_decimal(data.get("last_gap")),
+            last_lean_action=str(data.get("last_lean_action") or ""),
+            filter_counts={
+                str(key): int(value)
+                for key, value in (data.get("filter_counts") or {}).items()
+            },
+            fill_edge_sum=_d(data.get("fill_edge_sum", "0")),
+            fill_edge_n=int(data.get("fill_edge_n", 0) or 0),
+            last_binance_age_s=_optional_decimal(data.get("last_binance_age_s")),
+            last_binance_ts_ms=int(data.get("last_binance_ts_ms", 0) or 0),
+            last_chainlink=_optional_decimal(data.get("last_chainlink")),
+            last_chainlink_age_s=_optional_decimal(data.get("last_chainlink_age_s")),
+            last_price_gap=_optional_decimal(data.get("last_price_gap")),
+            last_combined=_optional_decimal(data.get("last_combined")),
+            price_spot_source=str(data.get("price_spot_source") or ""),
+            price_widen=bool(data.get("price_widen", False)),
+            last_basis=_optional_decimal(data.get("last_basis")),
+            last_residual=_optional_decimal(data.get("last_residual")),
+            last_up_target=_optional_decimal(data.get("last_up_target")),
+            last_down_target=_optional_decimal(data.get("last_down_target")),
         )
 
 
@@ -217,12 +381,14 @@ class Order:
     cancel_ready_ts: Optional[int] = None
     risk_reducing: bool = False
     exchange_id: str = ""
+    side: str = "sell"
 
     def to_dict(self) -> dict:
         return {
             "order_id": self.order_id,
             "market_id": self.market_id,
             "outcome": self.outcome,
+            "side": self.side,
             "price": money(self.price),
             "size": money(self.size),
             "remaining": money(self.remaining),
@@ -242,6 +408,7 @@ class Order:
             order_id=data["order_id"],
             market_id=data["market_id"],
             outcome=data["outcome"],
+            side=str(data.get("side") or "sell"),
             price=_d(data["price"]),
             size=_d(data["size"]),
             remaining=_d(data["remaining"]),

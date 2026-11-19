@@ -1,0 +1,75 @@
+{
+  "success": true,
+  "data": [
+    {
+      "slug": "bitcoin-up-or-down-november-14-2023-5-10pm-et",
+      "title": "Bitcoin Up or Down - November 14, 5:10-5:15PM ET",
+      "startsAt": "2023-11-14T22:10:00Z",
+      "endsAt": "2023-11-14T22:15:00Z",
+      "status": "OPEN",
+      "isNegRisk": false,
+      "isYieldBearing": false,
+      "markets": [
+        {
+          "id": 9001,
+          "conditionId": "0xabc",
+          "question": "Bitcoin Up or Down",
+          "decimalPrecision": 2,
+          "feeRateBps": 200,
+          "makerFeeBps": 0,
+          "tradingStatus": "OPEN",
+          "status": "REGISTERED",
+          "isNegRisk": false,
+          "isYieldBearing": false,
+          "outcomes": [
+            {
+              "name": "Up",
+              "indexSet": 1,
+              "onChainId": "111"
+            },
+            {
+              "name": "Down",
+              "indexSet": 2,
+              "onChainId": "222"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "slug": "bitcoin-up-or-down-november-14-2023-5-15pm-et",
+      "title": "Bitcoin Up or Down - November 14, 5:15-5:20PM ET",
+      "startsAt": "2023-11-14T22:15:00Z",
+      "endsAt": "2023-11-14T22:20:00Z",
+      "status": "OPEN",
+      "isNegRisk": false,
+      "isYieldBearing": false,
+      "markets": [
+        {
+          "id": 9002,
+          "conditionId": "0xdef",
+          "question": "Bitcoin Up or Down",
+          "decimalPrecision": 2,
+          "feeRateBps": 200,
+          "makerFeeBps": 0,
+          "tradingStatus": "OPEN",
+          "status": "REGISTERED",
+          "isNegRisk": false,
+          "isYieldBearing": false,
+          "outcomes": [
+            {
+              "name": "Up",
+              "indexSet": 1,
+              "onChainId": "333"
+            },
+            {
+              "name": "Down",
+              "indexSet": 2,
+              "onChainId": "444"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

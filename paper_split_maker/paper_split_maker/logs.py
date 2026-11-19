@@ -95,10 +95,19 @@ def build_summary(
                 "gross_split_usdc": money(market.gross_split),
                 "net_cash_flow": money(market.net_cash_flow),
                 "worst_contribution": money(market_contribution(state, market)),
+                "books_ok": market.book_fetches_ok,
+                "books_failed": market.book_fetches_failed,
+                "bids_posted": market.bids_posted,
+                "bids_skipped": dict(market.skip_counts),
+                "trades_seen": market.trades_seen,
+                "trades_ok": market.trade_fetches_ok,
+                "trades_failed": market.trade_fetches_failed,
+                "trades_http": market.trade_fetch_status,
+                "trades_returned": market.trades_returned,
                 "orders": orders,
             }
         )
-    return {
+    summary = {
         "mode": mode,
         "resumed": resumed,
         "live_orders": mode == "live",
@@ -135,6 +144,21 @@ def build_summary(
         "disclaimer_en": DISCLAIMER_EN,
         "disclaimer_vi": DISCLAIMER_VI,
     }
+    return _with_rounds(summary, state)
+
+
+def _with_rounds(summary: dict, state: State) -> dict:
+    from paper_split_maker.dual_bid import dual_summary
+    from paper_split_maker.small_pair import small_pair_summary
+
+    markets = state.markets.values()
+    dual = dual_summary(markets)
+    if dual:
+        summary.update(dual)
+    small = small_pair_summary(state.markets.values())
+    if small:
+        summary.update(small)
+    return summary
 
 
 def write_summary(directory: Path, summary: dict) -> Path:

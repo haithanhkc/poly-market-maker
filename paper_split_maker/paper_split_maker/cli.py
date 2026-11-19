@@ -8,7 +8,9 @@ import os
 import sys
 from pathlib import Path
 
-from paper_split_maker.config import ConfigError
+from decimal import Decimal
+
+from paper_split_maker.config import ConfigError, load_config, parse_series_list
 from paper_split_maker.credentials import load_credentials
 from paper_split_maker.envfile import prepare_run
 from paper_split_maker.live_gate import CONFIRMATION, live_gates
@@ -19,7 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m paper_split_maker",
         description=(
-            "Split pUSD, post maker sells on Up and Down, reprice, "
+            "Split USDT, post maker sells on Up and Down, reprice, "
             "unwind a filled leg, then merge or redeem. "
             "Paper unless --live, --yes-i-understand-live-risk, and "
             "live:true are all set."
@@ -34,16 +36,94 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-markets",
         type=int,
-        default=1,
-        help="how many sessions to split, quote, and finish (default 1)",
+        default=None,
+        help=(
+            "sessions to open (default 1, or BOT_MAX_MARKETS). Up to 500. "
+            "0 means no cap. With --duration-seconds 0, omitting this flag is also unlimited."
+        ),
     )
     parser.add_argument(
         "--duration-seconds",
         type=int,
         default=None,
-        help="paper poll window; live uses max_runtime_seconds in the config",
+        help=(
+            "paper poll window. 0 means no time limit. "
+            "Together with --max-markets 0, or with --max-markets omitted, the run "
+            "continues until it cannot fund a session or it is stopped."
+        ),
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=("single", "ladder", "dual_bid", "small_pair"),
+        default=None,
+        help="override the config strategy; dual_bid and small_pair are paper-only",
+    )
+    parser.add_argument(
+        "--capital",
+        default=None,
+        help="bankroll for this run. Overrides the JSON and BOT_CAPITAL.",
+    )
+    parser.add_argument(
+        "--max-loss-fraction",
+        default=None,
+        help="loss fraction for this run. Overrides the JSON and BOT_MAX_LOSS_FRACTION.",
+    )
+    parser.add_argument(
+        "--series",
+        default=None,
+        help=(
+            "comma-separated small_pair series, for example btc-updown-5m. "
+            "Default is btc-updown-5m,btc-updown-15m."
+        ),
+    )
+    parser.add_argument(
+        "--binance-lean",
+        action="store_true",
+        help=(
+            "filter small_pair bids with the public Binance fair value. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--price-source",
+        choices=("binance", "chainlink", "combined"),
+        default=None,
+        help=(
+            "btc price for the fair-value filter. Default binance. "
+            "combined uses the Chainlink level plus the Binance move."
+        ),
+    )
+    parser.add_argument(
+        "--pair-gate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "cap each side at one unpaired lot. Default on for --price-source combined."
+        ),
+    )
+    parser.add_argument(
+        "--catch-up",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "raise the lagging bid so the pair stays within small_pair_catch_up_sum. "
+            "Default on for --price-source combined."
+        ),
+    )
+    parser.add_argument(
+        "--first-leg-seconds",
+        type=int,
+        default=None,
+        help=(
+            "stop opening a new pair after this many seconds of a 5-minute round. "
+            "Default 200 for --price-source combined. 0 turns it off."
+        ),
     )
     parser.add_argument("--live", action="store_true")
+    parser.add_argument(
+        "--check-connection",
+        action="store_true",
+        help="read the API key, log in, and read USDT, then exit",
+    )
     parser.add_argument("--yes-i-understand-live-risk", action="store_true")
     parser.add_argument(
         "--redeem-pending",
@@ -53,8 +133,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        if args.check_connection:
+            return _check_connection(args)
         if args.redeem_pending is not None:
-            return _redeem_pending(args.redeem_pending)
+            return _redeem_pending(args)
         if args.config is None or args.out is None:
             parser.error("--config and --out are required")
         if args.live:
@@ -66,30 +148,146 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _load(args):
-    """JSON defaults, then .env, then BOT_* already set in the process."""
-    settings = prepare_run(args.config, os.environ, max_markets=args.max_markets)
-    args.max_markets = settings.max_markets
+    """JSON defaults, then .env, then BOT_* already set in the process.
+
+    An explicit ``--max-markets`` wins over ``BOT_MAX_MARKETS``. The raw JSON
+    bankroll is kept on the config so a buy strategy can put it back after
+    the ladder derive step.
+    """
+    raw = load_config(args.config)
+    explicit = getattr(args, "max_markets", None) is not None
+    unlimited_markets = explicit and args.max_markets == 0
+    requested = 1 if (not explicit or unlimited_markets) else args.max_markets
+    if requested < 1 or requested > 500:
+        raise ConfigError("max markets must be from 1 to 500")
+    settings = prepare_run(
+        args.config,
+        os.environ,
+        max_markets=requested,
+        honor_env_markets=not explicit,
+    )
+    settings.config.json_initial_capital = raw.initial_capital
+    settings.config.json_max_loss_fraction = raw.max_loss_fraction
+    args.max_markets = 0 if unlimited_markets else settings.max_markets
     return settings.config
 
 
+def _apply_strategy(config, args):
+    choice = getattr(args, "strategy", None)
+    if choice:
+        config.strategy = choice
+    chosen = getattr(args, "series", None)
+    if chosen not in (None, ""):
+        config.small_pair_series = parse_series_list(chosen)
+    if getattr(args, "binance_lean", False):
+        config.small_pair_binance = True
+    source = getattr(args, "price_source", None)
+    if source:
+        config.price_source = source
+    if getattr(args, "pair_gate", None) is not None:
+        config.small_pair_pair_gate = bool(args.pair_gate)
+    if getattr(args, "catch_up", None) is not None:
+        config.small_pair_catch_up = bool(args.catch_up)
+    if getattr(args, "first_leg_seconds", None) is not None:
+        config.small_pair_first_leg_seconds = int(args.first_leg_seconds)
+    _honor_bankroll(config, args)
+    return config
+
+
+def _honor_bankroll(config, args):
+    """Buy strategies keep the JSON bankroll. The ladder still uses the derive.
+
+    ``prepare_run`` always replaces ``initial_capital`` with ``split_clip * 3``
+    and ``max_loss_fraction`` with the ladder's worst-day ratio. A config of
+    5000 and 0.20 therefore became capital 75 and a floor near 68.92 before
+    the strategy flag was applied. ``--capital`` and ``--max-loss-fraction``
+    still win, and so does ``BOT_CAPITAL`` / ``BOT_MAX_LOSS_FRACTION`` when
+    the CLI flag is absent.
+    """
+    buy = config.strategy in {"dual_bid", "small_pair"}
+    cli_capital = getattr(args, "capital", None)
+    cli_fraction = getattr(args, "max_loss_fraction", None)
+    if cli_capital not in (None, ""):
+        try:
+            config.initial_capital = Decimal(str(cli_capital))
+        except (ArithmeticError, ValueError) as exc:
+            raise ConfigError("capital is not a decimal") from exc
+        config.capital_from_env = True
+    elif buy and not getattr(config, "capital_from_env", False):
+        saved = getattr(config, "json_initial_capital", None)
+        if saved is not None:
+            config.initial_capital = saved
+    if cli_fraction not in (None, ""):
+        try:
+            config.max_loss_fraction = Decimal(str(cli_fraction))
+        except (ArithmeticError, ValueError) as exc:
+            raise ConfigError("max_loss_fraction is not a decimal") from exc
+    elif buy and not getattr(config, "fraction_from_env", False):
+        saved = getattr(config, "json_max_loss_fraction", None)
+        if saved is not None:
+            config.max_loss_fraction = saved
+    if config.per_market_budget > config.initial_capital:
+        config.per_market_budget = config.initial_capital
+    if config.strategy == "small_pair":
+        # Current window plus the next one, for each selected series.
+        needed = 2 * len(config.small_pair_series)
+        if config.max_open_markets < needed:
+            config.max_open_markets = needed
+    config.validate()
+
+
 def _run_paper(args) -> int:
-    config = _load(args)
+    asked_markets = args.max_markets
+    asked_duration = args.duration_seconds
+    config = _apply_strategy(_load(args), args)
     if config.live:
         print("config has live:true. Refusing to trade without --live.")
         return 2
-    duration = args.duration_seconds or config.paper_duration_seconds
+    if asked_duration is None:
+        duration = config.paper_duration_seconds
+    else:
+        duration = asked_duration
+    if duration < 0:
+        raise ConfigError("duration_seconds must be zero or positive")
+    if asked_markets is None and duration == 0:
+        markets = 0
+    elif asked_markets == 0:
+        markets = 0
+    else:
+        markets = args.max_markets
     summary = run_paper(
         config,
         Path(args.out),
         duration_seconds=duration,
-        max_markets=args.max_markets,
+        max_markets=markets,
+        env=_credential_env(args.config),
     )
     _print_summary(summary)
     return 0
 
 
+def _credential_env(config_path: Path | None) -> dict:
+    """Process env first, then PREDICT_* lines from the .env beside the config.
+
+    Values are not printed. A variable already set in the process wins.
+    """
+    env = dict(os.environ)
+    if config_path is None:
+        return env
+    from paper_split_maker.envfile import read_env
+
+    file_env = read_env(Path(config_path).resolve().parent / ".env")
+    for key, value in file_env.items():
+        if key.startswith("PREDICT_") and not str(env.get(key) or "").strip():
+            env[key] = value
+    return env
+
+
 def _run_live(args) -> int:
-    config = _load(args)
+    config = _apply_strategy(_load(args), args)
+    if config.strategy in {"dual_bid", "small_pair"}:
+        print(f"{config.strategy} is paper-only and does not send orders.")
+        return 2
     allowed, reason = live_gates(
         config_live=config.live,
         cli_live=True,
@@ -109,7 +307,7 @@ def _run_live(args) -> int:
         print(f"live mode refused: {reason}. Staying paper-only.")
         return 2
     duration = args.duration_seconds or int(config.max_runtime_seconds)
-    creds = load_credentials(dict(os.environ))
+    creds = load_credentials(_credential_env(args.config))
     banner = {
         "mode": "live",
         "loss_floor": str(config.loss_floor()),
@@ -138,17 +336,41 @@ def _run_live(args) -> int:
     return 0
 
 
-def _redeem_pending(path: Path) -> int:
+def _check_connection(args) -> int:
+    """Verify the key, the login, and the USDT balance. Nothing here is an order."""
+    if args.config is None:
+        print("config error: --config is required with --check-connection")
+        return 2
+    from paper_split_maker.live_clob import check_connection
+
+    creds = load_credentials(_credential_env(args.config))
+    series = "btc-updown-5m"
+    try:
+        from paper_split_maker.config import load_config
+
+        series = load_config(args.config).series_slug
+    except ConfigError:
+        pass
+    report = check_connection(creds, series=series)
+    _safe_print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    ok = report.get("login_ok") and int(report.get("rounds_status") or 0) < 400 and report.get("usdt") != ""
+    return 0 if ok else 2
+
+
+def _redeem_pending(args) -> int:
     """Retry a deferred redeem file. Loads keys only on this path."""
     from paper_split_maker.live_runner import redeem_pending_once
     from paper_split_maker.normalize import resolution_settled
 
-    creds = load_credentials(dict(os.environ))
+    path = args.redeem_pending
+    creds = load_credentials(_credential_env(args.config))
 
     def resolved(condition_id: str) -> bool:
         from paper_split_maker.public_client import PublicReadClient
 
-        payload = PublicReadClient().fetch_resolution(condition_id)
+        payload = PublicReadClient(
+            network=creds.network, api_key=creds.api_key
+        ).fetch_resolution(condition_id)
         return resolution_settled(condition_id, payload)
 
     def submit(record: dict) -> None:
@@ -187,6 +409,10 @@ def _print_summary(summary: dict) -> None:
         "rebate_estimate_unguaranteed": summary.get("rebate_estimate_unguaranteed"),
         "at_risk_cap": summary.get("at_risk_cap"),
         "public_data_ok": summary.get("public_data_ok"),
+        "polls": summary.get("polls"),
+        "opened": summary.get("opened"),
+        "discovery": summary.get("discovery"),
+        "notes": summary.get("notes"),
         "disclaimer_vi": summary.get("disclaimer_vi"),
     }
     text = json.dumps(brief, ensure_ascii=False, indent=2, sort_keys=True)

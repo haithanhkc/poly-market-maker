@@ -6,18 +6,11 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
-from paper_split_maker.chain_data import (
-    CTF_ADAPTER,
-    SEL_APPROVE,
-    V2_ROUTER,
-    encode_approve,
-    encode_split,
-    position_target,
-)
+from paper_split_maker.chain_data import exchange_for, shares_to_base_units
 from paper_split_maker.chain_send import (
     approval_needed,
     official_position_call,
-    relayer_body,
+    position_request,
 )
 from paper_split_maker.cli import main
 from paper_split_maker.config import Config, load_config
@@ -44,7 +37,8 @@ from paper_split_maker.live_session import (
 from tests.helpers import both_books, make_engine, market_event, run
 
 ROOT = Path(__file__).resolve().parents[1]
-SECRET = "super-secret-key-value"
+SECRET = "0x" + "ab" * 32
+API_KEY = "api-secret-value"
 
 
 def test_live_requires_all_three_gates(tmp_path):
@@ -81,21 +75,24 @@ def test_live_requires_all_three_gates(tmp_path):
 def test_credentials_are_not_in_public_text():
     creds = load_credentials(
         {
-            "POLY_PRIVATE_KEY": SECRET,
-            "POLY_FUNDER": "0xabc",
-            "POLY_SIGNATURE_TYPE": "2",
-            "POLY_API_SECRET": "api-secret-value",
+            "PREDICT_PRIVATE_KEY": SECRET,
+            "PREDICT_API_KEY": API_KEY,
+            "PREDICT_NETWORK": "testnet",
         }
     )
     public = repr(creds) + json.dumps(creds.public_view())
     public += describe_user_subscribe(creds.funder, 1)
-    subscribe = user_subscribe("key", "api-secret-value", "pass", ["0xcondition"])
+    subscribe = user_subscribe(API_KEY)
     assert SECRET not in public
-    assert "api-secret-value" not in public
-    assert "api-secret-value" not in describe_user_subscribe(creds.funder, 1)
+    assert API_KEY not in public
+    assert API_KEY not in describe_user_subscribe(creds.funder, 1)
     assert creds.redact(f"failed {SECRET}") == "failed [redacted]"
-    assert subscribe["auth"]["secret"] == "api-secret-value"
-    assert market_subscribe(["1"])["type"] == "market"
+    assert subscribe["params"][-1].endswith(API_KEY)
+    assert market_subscribe(["123"]) == {
+        "method": "subscribe",
+        "requestId": 1,
+        "params": ["predictOrderbook/123"],
+    }
 
 
 def test_pre_split_waits_for_confirmation(tmp_path):
@@ -443,36 +440,38 @@ def test_restart_cannot_loosen_the_session_cap(tmp_path):
 def test_calldata_is_labeled_and_the_secret_stays_out():
     engine_config = load_config(ROOT / "config.live.json")
     assert engine_config.live is True
-    plan = split_plan("v1", "0x" + "11" * 32, "5")
-    assert plan["target"] == CTF_ADAPTER
-    assert plan["data"].startswith("0x72ce4275")
+    condition = "0x" + "11" * 32
+    plan = split_plan("v1", condition, "5")
+    assert plan["exchange"] == exchange_for(False, False, "mainnet")
+    assert plan["exchange"] == "0x8BC070BEdAB741406F4B1Eb65A72bee27894B689"
+    assert plan["amount_wei"] == shares_to_base_units("5") == 5 * 10**18
+    assert plan["signature_type"] == 0
+    assert plan["is_yield_bearing"] is False
     assert plan["confirmed"] is False
-    assert position_target("v2", False) == V2_ROUTER
-    assert encode_split("v2", "0x" + "11" * 32, 5_000_000).startswith("0x82d3b9f1")
-    approve = encode_approve(CTF_ADAPTER, 10)
-    assert approve.startswith("0x" + SEL_APPROVE)
     assert approval_needed(0, 10) is True
     assert approval_needed(10, 10) is False
-    body = relayer_body(
-        plan,
-        load_credentials(
-            {
-                "POLY_PRIVATE_KEY": SECRET,
-                "POLY_FUNDER": "0xabc",
-                "POLY_SIGNATURE_TYPE": "1",
-            }
-        ),
+    creds = load_credentials(
+        {
+            "PREDICT_PRIVATE_KEY": SECRET,
+            "PREDICT_NETWORK": "testnet",
+        }
     )
+    body = position_request(plan, creds)
     assert SECRET not in json.dumps(body)
     payload = {
-        "event_type": "trade",
-        "status": "MATCHED",
-        "id": "trade-1",
-        "maker_orders": [{"order_id": "ex-1", "matched_amount": "2", "price": "0.50"}],
+        "type": "orderTransactionSuccess",
+        "orderHash": "ex-1",
+        "settlementId": "trade-1",
+        "isMaker": True,
+        "fill": {
+            "executedSizeWei": str(2 * 10**18),
+            "executedPriceWei": str(5 * 10**17),
+        },
     }
     fills = user_fill_deltas(payload, {})
     assert fills[0]["trade_id"] == "trade-1"
     assert fills[0]["size"] == "2"
+    assert fills[0]["price"] == "0.5"
 
 
 def _quote_rows(engine):
@@ -632,42 +631,43 @@ class _Official:
     def __init__(self):
         self.calls = []
 
-    def split_position(self, condition_id, amount):
-        self.calls.append(("split", condition_id, amount))
+    def split_positions(self, condition_id, amount, is_neg_risk=False, is_yield_bearing=False):
+        self.calls.append(("split", condition_id, amount, is_neg_risk, is_yield_bearing))
         return _Handle("split", condition_id, amount)
 
-    def merge_positions(self, condition_id, amount):
-        self.calls.append(("merge", condition_id, amount))
+    def merge_positions(self, condition_id, amount, is_neg_risk=False, is_yield_bearing=False):
+        self.calls.append(("merge", condition_id, amount, is_neg_risk, is_yield_bearing))
         return _Handle("merge", condition_id, amount)
 
-    def redeem_positions(self, condition_id):
-        self.calls.append(("redeem", condition_id, None))
-        return _Handle("redeem", condition_id, None)
+    def redeem_positions(
+        self, condition_id, index_set, amount, is_neg_risk=False, is_yield_bearing=False
+    ):
+        self.calls.append(("redeem", condition_id, index_set, amount))
+        return _Handle("redeem", condition_id, amount)
 
 
 def test_official_client_signs_proxy_split_merge_redeem():
     creds = load_credentials(
         {
-            "POLY_PRIVATE_KEY": SECRET,
-            "POLY_FUNDER": "0xabc",
-            "POLY_SIGNATURE_TYPE": "1",
-            "RELAYER_API_KEY": "relayer-key",
-            "RELAYER_API_KEY_ADDRESS": "0xsigner",
+            "PREDICT_PRIVATE_KEY": SECRET,
+            "PREDICT_NETWORK": "testnet",
         }
     )
     client = _Official()
     condition = "0x" + "11" * 32
+    amount = 5 * 10**18
     assert official_position_call(
-        creds, "split", condition, 5_000_000, client=client
-    ) == ("0xsplit")
+        creds, "split", condition, amount, client=client
+    ) == "0xsplit"
     assert official_position_call(
-        creds, "merge", condition, 5_000_000, client=client
-    ) == ("0xmerge")
+        creds, "merge", condition, amount, client=client
+    ) == "0xmerge"
     assert (
         official_position_call(creds, "redeem", condition, 0, client=client)
         == "0xredeem"
     )
-    assert [item[0] for item in client.calls] == ["split", "merge", "redeem"]
+    assert [item[0] for item in client.calls] == ["split", "merge", "redeem", "redeem"]
+    assert [item[2] for item in client.calls if item[0] == "redeem"] == [1, 2]
     assert SECRET not in json.dumps(client.calls)
 
 

@@ -219,11 +219,11 @@ class Supervisor:
         hints = wallet["hints"]
         if wallet["signer"]:
             signer = wallet["signer"]
-        elif hints["POLY_PRIVATE_KEY"] != "chưa lưu":
+        elif hints.get("PREDICT_PRIVATE_KEY") != "chưa lưu":
             signer = "không suy ra được"
         else:
             signer = "chưa có"
-        signature = wallet["signature_type"]
+        network = wallet.get("network") or "testnet"
         html = _PAGE.format(
             split=_esc(values["BOT_SPLIT_SIZE"]),
             markets=_esc(values["BOT_MAX_MARKETS"]),
@@ -249,16 +249,10 @@ class Supervisor:
             log=_esc(status["log"]),
             signer=_esc(signer),
             funder=_esc(wallet["funder"] or "chưa lưu"),
-            hint_key=_esc(hints["POLY_PRIVATE_KEY"]),
-            hint_api=_esc(hints["POLY_API_KEY"]),
-            hint_secret=_esc(hints["POLY_API_SECRET"]),
-            hint_pass=_esc(hints["POLY_API_PASSPHRASE"]),
-            hint_relayer=_esc(hints["RELAYER_API_KEY"]),
-            hint_relayer_address=_esc(hints["RELAYER_API_KEY_ADDRESS"]),
-            sig0="selected" if signature == "0" else "",
-            sig1="selected" if signature == "1" else "",
-            sig2="selected" if signature == "2" else "",
-            sig3="selected" if signature == "3" else "",
+            hint_key=_esc(hints.get("PREDICT_PRIVATE_KEY", "chưa lưu")),
+            hint_api=_esc(hints.get("PREDICT_API_KEY", "chưa lưu")),
+            net_testnet="selected" if network != "mainnet" else "",
+            net_mainnet="selected" if network == "mainnet" else "",
             running_note=(
                 "Bot đang chạy — không đổi khóa." if self.running() else ""
             ),
@@ -527,24 +521,24 @@ pre {{ background: #f4f4f4; padding: 0.8rem; max-height: 18rem; overflow: auto; 
 <p>Trang chỉ lắng nghe 127.0.0.1. Khóa bí mật không được gửi lại trang này.</p>
 <h2>Cài đặt</h2>
 <form method="post" action="/settings">
-<label>Khối split (pUSD) <input name="BOT_SPLIT_SIZE" value="{split}" inputmode="decimal"></label>
+<label>Khối split (USDT) <input name="BOT_SPLIT_SIZE" value="{split}" inputmode="decimal"></label>
 <label>Số phiên <input name="BOT_MAX_MARKETS" value="{markets}" inputmode="numeric"></label>
 <button type="submit">Lưu</button>
 </form>
 <h3>Bot sẽ dùng</h3>
 <p>Tính từ khối split theo ví bubblebust (mỗi split của họ là 750). Mỗi phía bán trung bình 9.32% split, clip hay gặp là 10 cổ, và tối thiểu 5 cổ. Split 25 và 50 đều ra clip 5, một bậc, 5 cổ mỗi phía vì 9.32% nhỏ hơn 5 cổ.</p>
 <ul>
-<li>Vốn: {capital} pUSD (3 split, vì họ giữ 2–3 split chồng nhau)</li>
+<li>Vốn: {capital} USDT (3 split, vì họ giữ 2–3 split chồng nhau)</li>
 <li>Mỗi phía bán tối đa: {offered} cổ ({sell_pct} split)</li>
 <li>Clip mỗi bậc: {clip} cổ</li>
 <li>Số bậc cùng lúc: {rungs}</li>
 <li>Cửa sổ cuối: {late}s, winner tối thiểu {winner_px}</li>
 <li>Tách phiên sau trước {lead}s, và vẫn rao phiên này đến vài giây cuối</li>
 <li>Dừng bán thêm khi đã bán {sell_cap} khối split (cả hai phía)</li>
-<li>Dừng một phiên: {session} pUSD</li>
+<li>Dừng một phiên: {session} USDT</li>
 <li>Dừng ngày: ngân sách {budget}, sàn lỗ {floor}</li>
 </ul>
-<p>Live, nếu đọc được số dư pUSD và .env không có BOT_CAPITAL, dùng số dư đó làm vốn khi số dư đủ cho khối split. Dòng BOT_CAPITAL, BOT_CLIP_SIZE, BOT_RUNGS, BOT_MAX_LOSS_FRACTION, BOT_SESSION_STOP vẫn ghi đè, nhưng không có ô trên trang này.</p>
+<p>Live, nếu đọc được số dư USDT và .env không có BOT_CAPITAL, dùng số dư đó làm vốn khi số dư đủ cho khối split. Dòng BOT_CAPITAL, BOT_CLIP_SIZE, BOT_RUNGS, BOT_MAX_LOSS_FRACTION, BOT_SESSION_STOP vẫn ghi đè, nhưng không có ô trên trang này.</p>
 <h2>Chạy</h2>
 <form method="post" action="/start">
 <input type="hidden" name="mode" value="paper">
@@ -564,31 +558,21 @@ pre {{ background: #f4f4f4; padding: 0.8rem; max-height: 18rem; overflow: auto; 
 <p>Funder đang dùng: <strong>{funder}</strong></p>
 <ul>
 <li>Khóa riêng: {hint_key}</li>
-<li>CLOB API key: {hint_api}</li>
-<li>CLOB API secret: {hint_secret}</li>
-<li>CLOB passphrase: {hint_pass}</li>
-<li>Relayer API key: {hint_relayer}</li>
-<li>Relayer API key address: {hint_relayer_address}</li>
+<li>API key (chỉ mainnet): {hint_api}</li>
 </ul>
 <form method="post" action="/wallet">
-<label>Khóa riêng POLY_PRIVATE_KEY <input type="password" name="POLY_PRIVATE_KEY" value="" autocomplete="off" spellcheck="false"></label>
-<label>Funder POLY_FUNDER <input type="text" name="POLY_FUNDER" value="" autocomplete="off" placeholder="để trống nếu giữ nguyên"></label>
-<label>Kiểu chữ ký POLY_SIGNATURE_TYPE
-<select name="POLY_SIGNATURE_TYPE">
-<option value="0" {sig0}>0 EOA</option>
-<option value="1" {sig1}>1 POLY_PROXY</option>
-<option value="2" {sig2}>2 GNOSIS_SAFE</option>
-<option value="3" {sig3}>3 POLY_1271</option>
+<label>Khóa riêng PREDICT_PRIVATE_KEY <input type="password" name="PREDICT_PRIVATE_KEY" value="" autocomplete="off" spellcheck="false"></label>
+<label>Predict account PREDICT_ACCOUNT <input type="text" name="PREDICT_ACCOUNT" value="" autocomplete="off" placeholder="để trống nếu giữ nguyên"></label>
+<label>Mạng PREDICT_NETWORK
+<select name="PREDICT_NETWORK">
+<option value="testnet" {net_testnet}>testnet</option>
+<option value="mainnet" {net_mainnet}>mainnet</option>
 </select>
 </label>
-<label>CLOB API key <input type="password" name="POLY_API_KEY" value="" autocomplete="off"></label>
-<label>CLOB API secret <input type="password" name="POLY_API_SECRET" value="" autocomplete="off"></label>
-<label>CLOB passphrase <input type="password" name="POLY_API_PASSPHRASE" value="" autocomplete="off"></label>
-<label>Relayer API key <input type="password" name="RELAYER_API_KEY" value="" autocomplete="off"></label>
-<label>Relayer API key address <input type="password" name="RELAYER_API_KEY_ADDRESS" value="" autocomplete="off"></label>
+<label>API key PREDICT_API_KEY <input type="password" name="PREDICT_API_KEY" value="" autocomplete="off"></label>
 <button type="submit">Lưu ví</button>
 </form>
-<p>Ô để trống giữ giá trị cũ. Nút dưới xóa khóa, funder và các API key.</p>
+<p>Ô để trống giữ giá trị cũ. Nút dưới xóa khóa và API key, rồi đưa mạng về testnet.</p>
 <form method="post" action="/wallet/clear">
 <button type="submit">Xóa khóa</button>
 </form>

@@ -8,12 +8,16 @@ latency and only while the feed is up.
 
 from __future__ import annotations
 
+import sys
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
+from paper_split_maker.chain_data import series_of, window_seconds
 from paper_split_maker.config import Config
-from paper_split_maker.decimal_utils import ONE, ZERO, ceil_tick, money, on_grid, qdown
+from paper_split_maker.decimal_utils import ONE, ZERO, ceil_tick, floor_cash, money, on_grid, qdown
+from paper_split_maker.dual_bid import plan_bids, quote_phase, round_open_ms
+from paper_split_maker.small_pair import plan_small_pair, session_spend_cap
 from paper_split_maker.logs import LogWriter
 from paper_split_maker.models import (
     WORKING_ORDER_STATUSES,
@@ -31,6 +35,7 @@ from paper_split_maker.quotes import (
 from paper_split_maker.risk import (
     assert_ledger_invariants,
     best_case_equity,
+    conservative_fee,
     net_maker_proceeds,
     reserved,
     session_loss,
@@ -95,6 +100,13 @@ class Engine:
         # Long replays flush the ledger once at the end. Live paper mode keeps
         # the default and writes state after every event.
         self.persist_each_event = True
+        self.binance_feed = None
+        self.chainlink_feed = None
+        self._chainlink_anchor_ms = None
+        self._chainlink_anchor_px = None
+        from paper_split_maker.price_blend import BasisTracker
+
+        self._basis = BasisTracker()
 
     @classmethod
     def create(
@@ -340,7 +352,16 @@ class Engine:
                     bits.append(
                         f"{side}_age_ms={self.state.now_ms - book.received_ms}"
                     )
+        if reason in {"stale_feed", "disconnected"}:
+            for side in ("up", "down"):
+                book = market.book(side)
+                if book.ts_ms >= 0:
+                    bits.append(
+                        f"{side}_exchange_age_ms={self.state.now_ms - book.ts_ms}"
+                    )
         detail = " ".join(bits)
+        market.skip_counts[label] = int(market.skip_counts.get(label, 0)) + 1
+        market.last_skip_reason = label
         self._emit(
             kind="quote_skipped",
             market=market,
@@ -524,12 +545,8 @@ class Engine:
                 kind="book", market=market, outcome=outcome, reason="duplicate_book"
             )
             return
-        if book.ts_ms == stamp and digest and book.digest and book.digest != digest:
-            book.uncertain = True
-            self._emit(
-                kind="book", market=market, outcome=outcome, reason="uncertain_book"
-            )
-            return
+        # Same exchange millisecond with a new top of book is a newer REST
+        # snapshot. Apply those levels. Do not mark the feed uncertain.
         try:
             if "tick_size" in event and event["tick_size"] not in (None, ""):
                 tick = Decimal(str(event["tick_size"]))
@@ -567,6 +584,8 @@ class Engine:
         book.received_ms = self.state.now_ms
         self._record_mid(market, outcome)
         self._emit(kind="book", market=market, outcome=outcome, reason="ok")
+        if self.config.strategy in {"dual_bid", "small_pair"}:
+            return
         # Reprice when the leftover leg's own book moves. The other side's
         # book does not change this bid.
         naked = self._naked_leg(market)
@@ -591,6 +610,7 @@ class Engine:
             )
             return
         self.state.seen_trade_ids.add(trade_id)
+        market.trades_seen += 1
         if self.mode == "live":
             # Live fills come only from the exchange (user_fill).
             self._emit(
@@ -612,7 +632,8 @@ class Engine:
         if outcome not in {"up", "down"}:
             self._emit(kind="trade_ignored", market=market, reason="bad_outcome")
             return
-        if str(event.get("taker_side") or "").upper() != "BUY":
+        taker = str(event.get("taker_side") or "").upper()
+        if taker not in {"BUY", "SELL"}:
             self._emit(
                 kind="trade_ignored",
                 market=market,
@@ -630,9 +651,14 @@ class Engine:
         if volume <= 0:
             self._emit(kind="trade_ignored", market=market, reason="dust")
             return
+        if taker == "SELL":
+            self._fill_bids(market, outcome, price, volume, trade_ts)
+            return
         resting = []
         for order in self.state.orders.values():
             if order.market_id != market.market_id or order.outcome != outcome:
+                continue
+            if getattr(order, "side", "sell") == "buy":
                 continue
             if order.status not in {"live", "cancel_requested"}:
                 continue
@@ -706,6 +732,73 @@ class Engine:
             return
         self._apply_fill(market, order, size, synthetic=True)
 
+    def _fill_bids(
+        self,
+        market: Market,
+        outcome: str,
+        price: Decimal,
+        volume: Decimal,
+        trade_ts: int,
+    ) -> None:
+        """SELL prints fill our bids after the queue, or when price trades through."""
+        resting = []
+        for order in self.state.orders.values():
+            if order.market_id != market.market_id or order.outcome != outcome:
+                continue
+            if getattr(order, "side", "sell") != "buy":
+                continue
+            if order.status != "live":
+                continue
+            if order.live_ts is None or trade_ts < order.live_ts:
+                continue
+            if price > order.price:
+                continue
+            resting.append(order)
+        resting.sort(key=lambda order: (-order.price, order.submit_ts, order.order_id))
+        if not resting:
+            self._emit(
+                kind="trade_ignored",
+                market=market,
+                outcome=outcome,
+                price=price,
+                size=volume,
+                reason="no_resting_order",
+            )
+            return
+        for order in resting:
+            if volume <= 0:
+                break
+            if price < order.price:
+                if order.queue_ahead > 0:
+                    cleared = order.queue_ahead
+                    order.queue_ahead = ZERO
+                    self._emit(
+                        kind="queue_consume",
+                        market=market,
+                        order=order,
+                        size=cleared,
+                        reason="trade_through",
+                    )
+            elif order.queue_ahead > 0:
+                used = order.queue_ahead if order.queue_ahead < volume else volume
+                order.queue_ahead -= used
+                volume -= used
+                self._emit(
+                    kind="queue_consume",
+                    market=market,
+                    order=order,
+                    size=used,
+                    reason="queue_ahead",
+                )
+            if volume <= 0 or order.remaining <= 0:
+                continue
+            fill = order.remaining if order.remaining < volume else volume
+            fill = qdown(fill, Decimal("0.000001"))
+            if fill <= 0:
+                continue
+            self._apply_fill(market, order, fill, synthetic=False)
+            volume -= fill
+
     def _apply_fill(
         self,
         market: Market,
@@ -715,6 +808,9 @@ class Engine:
         synthetic: bool,
         source: str = "model",
     ) -> None:
+        if getattr(order, "side", "sell") == "buy":
+            self._apply_buy_fill(market, order, size, source=source)
+            return
         proceeds = net_maker_proceeds(size, order.price, self.state.maker_fee_rate)
         self.state.cash += proceeds
         market.net_cash_flow += proceeds
@@ -752,6 +848,91 @@ class Engine:
                 if synthetic
                 else ("exchange_fill" if source == "exchange" else "queue_model_fill")
             ),
+        )
+
+    def _apply_buy_fill(
+        self, market: Market, order: Order, size: Decimal, *, source: str = "model"
+    ) -> None:
+        gross = floor_cash(size * order.price)
+        fee = conservative_fee(size, order.price, self.state.maker_fee_rate)
+        cost = gross + fee
+        if cost > self.state.cash:
+            self._emit(
+                kind="reject",
+                market=market,
+                order=order,
+                size=size,
+                reason="insufficient_cash",
+            )
+            return
+        self.state.cash -= cost
+        market.net_cash_flow -= cost
+        if order.outcome == "up":
+            market.up += size
+            market.bought_up_shares += size
+            market.bought_up_cost += cost
+            market.buy_up_fills += 1
+        else:
+            market.down += size
+            market.bought_down_shares += size
+            market.bought_down_cost += cost
+            market.buy_down_fills += 1
+        order.remaining -= size
+        if order.remaining <= 0:
+            order.remaining = ZERO
+            order.status = "filled"
+        market.last_action_ts = self.state.now_ms
+        self._note_binance_fill(market, order, size)
+        self._emit(
+            kind="fill",
+            market=market,
+            order=order,
+            size=size,
+            price=order.price,
+            reason="exchange_fill" if source == "exchange" else "queue_model_fill",
+        )
+
+    def _note_binance_fill(self, market: Market, order: Order, size: Decimal) -> None:
+        """Log fair value against a simulated buy. Only the Binance filter does this."""
+        if not self.config.small_pair_binance or market.quoted_as != "small_pair":
+            return
+        if getattr(order, "side", "sell") != "buy":
+            return
+        fair = market.last_fair_up
+        if fair is None:
+            fair_side = None
+        elif order.outcome == "up":
+            fair_side = fair
+        else:
+            fair_side = Decimal("1") - fair
+        edge = None if fair_side is None else fair_side - order.price
+        if edge is not None:
+            market.fill_edge_sum += edge
+            market.fill_edge_n += 1
+        window = window_seconds(series_of(market.slug))
+        open_ms = round_open_ms(market.slug, market.end_ts_ms, window)
+        sec = (self.state.now_ms - open_ms) // 1000
+        age = market.last_binance_age_s
+        detail = (
+            f"fair_side={fair_side if fair_side is not None else '-'} "
+            f"price={order.price} "
+            f"fair_minus_price={edge if edge is not None else '-'} "
+            f"sec={sec} "
+            f"binance_age_s={age if age is not None else '-'}"
+        )
+        print(
+            f"binance_fill {market.slug or market.market_id} {detail}",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._emit(
+            kind="binance_fill",
+            market=market,
+            order=order,
+            price=order.price,
+            size=size,
+            reason=order.outcome,
+            detail=detail,
         )
 
     def _on_resolution(self, event: dict) -> None:
@@ -849,7 +1030,477 @@ class Engine:
             market, "manual_cancel", outcome=str(outcome) if outcome else None
         )
 
+    def _decide_dual_bid(self, market: Market) -> None:
+        """Buy both sides during the round. Never split, sell, or merge."""
+        if market.status == "redeemed":
+            return
+        market.quoted_as = "dual_bid"
+        self._check_kill_switch()
+        self._check_realized_loss()
+        if self.state.killed:
+            self._cancel_market(market, "killed")
+            self._skip(market, "killed")
+            return
+        if self.state.mismatch_stop:
+            self.state.mismatch_stop = False
+        self._refresh_expiry(market)
+        if market.status == "resolved":
+            self._cancel_market(market, "resolved")
+            self._try_redeem(market)
+            return
+        if market.status == "expired_unresolved":
+            self._cancel_market(market, "expired_unresolved")
+            self._merge_free(market, "expired_unresolved")
+            self._skip(market, "expired_unresolved")
+            return
+        if not self._feeds_ok(market):
+            reason = "disconnected" if not self.state.feed_up else "stale_feed"
+            self._cancel_market(market, reason)
+            self._skip(market, reason)
+            return
+        if not market.accepting_orders:
+            self._cancel_market(market, "not_accepting")
+            self._skip(market, "not_accepting")
+            return
+        if self.state.now_ms < market.pause_until_ms:
+            self._cancel_market(market, "reject_pause")
+            self._skip(market, "reject_pause")
+            return
+        window = window_seconds(self.config.series_slug)
+        open_ms = round_open_ms(market.slug, market.end_ts_ms, window)
+        phase = quote_phase(
+            self.state.now_ms,
+            open_ms,
+            self.config.dual_bid_start_seconds,
+            self.config.dual_bid_stop_seconds,
+        )
+        if phase != "open":
+            self._cancel_market(market, "quote_window")
+            self._skip(market, "before_open" if phase == "before" else "quote_window_closed")
+            return
+        if (
+            self._working_bids(market)
+            and self.state.now_ms
+            < market.last_requote_ts + self.config.dual_bid_requote_ms
+        ):
+            return
+        self._sync_dual_bids(market)
+        market.last_requote_ts = self.state.now_ms
+
+    def _resting_bid_shares(self, market: Market, outcome: str):
+        """Live buy size. A cancel already in flight cannot fill, so it is not counted."""
+        total = ZERO
+        for order in self._working_bids(market):
+            if order.outcome != outcome or order.status not in {"queued", "live"}:
+                continue
+            total += order.remaining
+        return total
+
+    def _working_bids(self, market: Market) -> list[Order]:
+        return [
+            order
+            for order in self.state.orders.values()
+            if order.market_id == market.market_id
+            and getattr(order, "side", "sell") == "buy"
+            and order.status in WORKING_ORDER_STATUSES
+        ]
+
+    def _sync_dual_bids(self, market: Market) -> None:
+        cap = self.config.round_budget
+        if self.config.per_market_budget < cap:
+            cap = self.config.per_market_budget
+        spent = market.bought_up_cost + market.bought_down_cost
+        left = cap - spent
+        if left < 0:
+            left = ZERO
+        tick = market.tick_size if market.tick_size > 0 else self.config.default_tick
+        desired = plan_bids(
+            up_bids=market.up_book.bids,
+            up_ask=market.up_book.best_ask(),
+            down_bids=market.down_book.bids,
+            down_ask=market.down_book.best_ask(),
+            tick=tick,
+            levels=self.config.dual_bid_levels,
+            clip=self.config.dual_bid_clip,
+            max_clip=self.config.dual_bid_max_clip,
+            min_price=self.config.min_bid_price,
+            up_shares=market.bought_up_shares,
+            up_cost=market.bought_up_cost,
+            down_shares=market.bought_down_shares,
+            down_cost=market.bought_down_cost,
+            target_pair_cost=self.config.target_pair_cost,
+            pair_cost_stop=self.config.pair_cost_stop,
+            min_share_balance=self.config.min_share_balance,
+            budget_left=left,
+        )
+        self._sync_bids(market, desired, "dual_bid")
+
+    def _sync_bids(self, market: Market, desired, reason: str) -> None:
+        wanted = {(bid.outcome, bid.price): bid for bid in desired}
+        for order in self._working_bids(market):
+            bid = wanted.get((order.outcome, order.price))
+            if (
+                bid is not None
+                and bid.size == order.size
+                and order.status != "cancel_requested"
+            ):
+                wanted.pop((order.outcome, order.price))
+                continue
+            self._request_cancel(market, order, "reprice")
+        placed = False
+        for bid in wanted.values():
+            if self._place_bid(market, bid, reason):
+                placed = True
+        if not placed and not self._working_bids(market):
+            self._skip(market, "no_bid")
+
+    def _place_bid(self, market: Market, bid, reason: str = "dual_bid") -> bool:
+        notional = floor_cash(bid.size * bid.price)
+        if notional <= 0 or self.state.cash < notional:
+            self._skip(market, "cash", bid.outcome, bid.price)
+            return False
+        self.state.order_seq += 1
+        probe = Order(
+            order_id=f"{market.market_id}-{bid.outcome}-bid-{self.state.order_seq}",
+            market_id=market.market_id,
+            outcome=bid.outcome,
+            price=bid.price,
+            size=bid.size,
+            remaining=bid.size,
+            queue_ahead=bid.queue_ahead if bid.queue_ahead > 0 else ZERO,
+            status="queued",
+            submit_ts=self.state.now_ms,
+            side="buy",
+        )
+        # Flat ladders are not a loss: the round budget caps their spend.
+        # A bid counts against the floor only when filling it would add to
+        # unmatched inventory we already hold.
+        before = worst_case_equity(self.state)
+        after = worst_case_equity(self.state, extra=[probe])
+        if after < self.state.loss_floor and after < before:
+            self.state.order_seq -= 1
+            self._skip(market, "loss_budget", bid.outcome, bid.price)
+            return False
+        self.state.orders[probe.order_id] = probe
+        market.bids_posted += 1
+        market.last_action_ts = self.state.now_ms
+        self._skip_once.clear()
+        self._emit(
+            kind="quote_submit",
+            market=market,
+            order=probe,
+            size=bid.size,
+            price=bid.price,
+            reason=reason,
+        )
+        return True
+
+    def _decide_small_pair(self, market: Market) -> None:
+        """Buy the 0.96 pair. Never split, sell, merge, or take."""
+        if market.status == "redeemed":
+            return
+        market.quoted_as = "small_pair"
+        self._check_kill_switch()
+        self._check_realized_loss()
+        if self.state.killed:
+            self._cancel_market(market, "killed")
+            self._skip(market, "killed")
+            return
+        if self.state.mismatch_stop:
+            self.state.mismatch_stop = False
+        self._refresh_expiry(market)
+        if market.status == "resolved":
+            self._cancel_market(market, "resolved")
+            self._try_redeem(market)
+            return
+        if market.status == "expired_unresolved":
+            self._cancel_market(market, "expired_unresolved")
+            self._skip(market, "expired_unresolved")
+            return
+        if not self._feeds_ok(market):
+            reason = "disconnected" if not self.state.feed_up else "stale_feed"
+            self._cancel_market(market, reason)
+            self._skip(market, reason)
+            return
+        if not market.accepting_orders:
+            self._cancel_market(market, "not_accepting")
+            self._skip(market, "not_accepting")
+            return
+        if self.state.now_ms < market.pause_until_ms:
+            self._cancel_market(market, "reject_pause")
+            self._skip(market, "reject_pause")
+            return
+        window = window_seconds(series_of(market.slug))
+        open_ms = round_open_ms(market.slug, market.end_ts_ms, window)
+        age_s = (self.state.now_ms - open_ms) // 1000
+        cap = session_spend_cap(self.config, self.state.cash)
+        spent = market.bought_up_cost + market.bought_down_cost
+        left = cap - spent
+        if left < 0:
+            left = ZERO
+        tick = market.tick_size if market.tick_size > 0 else self.config.default_tick
+        up_bid = market.up_book.best_bid()
+        up_ask = market.up_book.best_ask()
+        fair = None
+        spot = None
+        s0 = market.reference_price
+        age_binance = None
+        if self.config.small_pair_binance:
+            spot, s0, fair, age_binance = self._apply_binance_lean(
+                market, open_ms, window, age_s, up_bid, up_ask
+            )
+        adverse_gap = self.config.small_pair_adverse_gap
+        adverse_stale = self.config.small_pair_adverse_gap_stale
+        age_for_plan = age_binance
+        fair_quote = (
+            getattr(self.config, "price_source", "binance") == "combined"
+            and self.config.small_pair_binance
+        )
+        if getattr(market, "price_widen", False) and not fair_quote:
+            wider = self.config.small_pair_disagree_gap
+            if wider > adverse_stale:
+                adverse_stale = wider
+            adverse_gap = adverse_stale
+            age_for_plan = 0
+        combined = fair_quote
+        plan = plan_small_pair(
+            up_bid=up_bid,
+            up_ask=up_ask,
+            up_levels=market.up_book.bids,
+            down_bid=market.down_book.best_bid(),
+            down_ask=market.down_book.best_ask(),
+            down_levels=market.down_book.bids,
+            tick=tick,
+            up_shares=market.bought_up_shares,
+            down_shares=market.bought_down_shares,
+            budget_left=left,
+            age_s=age_s,
+            window_s=window,
+            start_s=(
+                self.config.small_pair_start_seconds
+                if self.config.small_pair_binance
+                else 2
+            ),
+            fair_up=fair,
+            loser_fair=self.config.small_pair_loser_fair,
+            loser_after_s=self.config.small_pair_loser_after_seconds,
+            binance_filter=bool(self.config.small_pair_binance),
+            adverse_gap=adverse_gap,
+            adverse_gap_stale=adverse_stale,
+            binance_age_s=age_for_plan,
+            stale_after_s=self.config.small_pair_stale_seconds,
+            favorite_excess=self.config.small_pair_favorite_excess,
+            underdog_excess=self.config.small_pair_underdog_excess,
+            favorite_fair=self.config.small_pair_favorite_fair,
+            neutral_band=self.config.small_pair_neutral_band,
+            neutral_target=self.config.small_pair_neutral_target,
+            neutral_mode=self.config.small_pair_neutral_mode,
+            late_loser_s=self.config.small_pair_late_loser_seconds,
+            fair_quote=fair_quote,
+            widen_pair=bool(getattr(market, "price_widen", False)) and fair_quote,
+            widen_extra=self.config.small_pair_widen_extra,
+            pair_gate=combined and bool(self.config.small_pair_pair_gate),
+            catch_up=combined and bool(self.config.small_pair_catch_up),
+            catch_up_sum=self.config.small_pair_catch_up_sum,
+            up_cost=market.bought_up_cost,
+            down_cost=market.bought_down_cost,
+            first_leg_s=(
+                int(self.config.small_pair_first_leg_seconds) if combined else 0
+            ),
+            resting_up=self._resting_bid_shares(market, "up"),
+            resting_down=self._resting_bid_shares(market, "down"),
+        )
+        if self.config.small_pair_binance:
+            for rule, count in plan.filtered:
+                market.filter_counts[rule] = int(market.filter_counts.get(rule, 0)) + int(count)
+        if self.config.small_pair_binance:
+            if plan.targets:
+                market.last_up_target = plan.targets[0]
+                market.last_down_target = plan.targets[1]
+            self._log_binance_lean(
+                market, spot, s0, fair, up_bid, up_ask, plan.action or plan.reason
+            )
+        if not plan.bids:
+            self._cancel_market(market, plan.reason or "no_bid")
+            self._skip(market, plan.reason or "no_bid")
+            return
+        self._sync_bids(market, plan.bids, "small_pair")
+        if plan.reason:
+            self._skip(market, plan.reason)
+
+    def _apply_binance_lean(self, market, open_ms, window, age_s, up_bid, up_ask):
+        """Record S0, fair value, and the gap. Returns spot, S0, and P(Up)."""
+        from paper_split_maker.binance_btc import fair_up
+        from paper_split_maker.price_blend import combine_prices
+
+        feed = self.binance_feed
+        latest = feed.latest() if feed is not None else None
+        binance_px = latest[1] if latest else None
+        age_binance = None
+        if latest is not None:
+            age_binance = (self.state.now_ms - int(latest[0])) / 1000
+            if age_binance < 0:
+                age_binance = 0
+            market.last_binance_ts_ms = int(latest[0])
+            market.last_binance_age_s = Decimal(str(round(age_binance, 3)))
+        mode = getattr(self.config, "price_source", "binance") or "binance"
+        link_px = None
+        link_age = None
+        anchor = None
+        link_feed = self.chainlink_feed
+        link_latest = link_feed.latest() if link_feed is not None else None
+        if link_latest is not None:
+            link_px = link_latest[1]
+            link_age = (self.state.now_ms - int(link_latest[0])) / 1000
+            if link_age < 0:
+                link_age = 0
+            if self._chainlink_anchor_ms != int(link_latest[0]):
+                self._chainlink_anchor_ms = int(link_latest[0])
+                snapped = None
+                if feed is not None:
+                    snapped = feed.price_at(int(link_latest[0]))
+                    if snapped is None and latest is not None:
+                        snapped = latest[1]
+                self._chainlink_anchor_px = snapped
+                if snapped is not None and link_px is not None:
+                    self._basis.add(int(link_latest[0]), snapped - link_px)
+            anchor = self._chainlink_anchor_px
+        view = combine_prices(
+            mode=mode,
+            binance=binance_px,
+            chainlink=link_px,
+            binance_at_chainlink=anchor,
+            binance_age_s=age_binance,
+            chainlink_age_s=link_age,
+            binance_stale_s=self.config.small_pair_stale_seconds,
+            chainlink_stale_s=self.config.chainlink_stale_seconds,
+            disagree_fraction=self.config.small_pair_price_disagree,
+            basis=self._basis.median(),
+        )
+        spot = binance_px if mode == "binance" else view.spot
+        market.price_widen = bool(view.widen) and mode != "binance"
+        market.last_binance = binance_px
+        market.last_chainlink = link_px
+        market.last_chainlink_age_s = (
+            Decimal(str(round(link_age, 3))) if link_age is not None else None
+        )
+        market.last_price_gap = view.price_gap
+        market.last_basis = view.basis
+        market.last_residual = view.residual
+        market.last_combined = view.spot if mode == "combined" else None
+        market.price_spot_source = view.spot_source
+        if (
+            (market.reference_price is None or market.reference_price <= 0)
+            and self.state.now_ms >= open_ms
+        ):
+            if mode == "binance" and spot is not None:
+                at_open = feed.price_at(open_ms) if feed is not None else None
+                market.reference_price = at_open or spot
+                market.reference_source = "binance"
+            elif mode == "combined" and spot is not None:
+                market.reference_price = spot
+                market.reference_source = "combined"
+            elif mode != "binance":
+                basis_px = link_px if link_px is not None else spot
+                if basis_px is not None:
+                    at_open = (
+                        link_feed.price_at(open_ms)
+                        if link_feed is not None and link_px is not None
+                        else None
+                    )
+                    market.reference_price = at_open or basis_px
+                    market.reference_source = (
+                        "chainlink" if link_px is not None else (view.spot_source or mode)
+                    )
+        if market.reference_price and not market.reference_logged:
+            market.reference_logged = True
+            print(
+                f"small_pair {market.slug or market.market_id} "
+                f"reference source={market.reference_source or 'unknown'} "
+                f"s0={market.reference_price}",
+                file=sys.stderr,
+                flush=True,
+            )
+        s0 = market.reference_price
+        fair = None
+        if spot is not None and s0 is not None and s0 > 0:
+            remaining = (open_ms + int(window) * 1000 - self.state.now_ms) / 1000
+            sigma = feed.vol(self.state.now_ms) if feed is not None else None
+            multiplier = self.config.small_pair_sigma_multiplier
+            if sigma is not None and multiplier != 1:
+                sigma = float(sigma) * float(multiplier)
+            fair = fair_up(
+                spot,
+                s0,
+                sigma,
+                remaining,
+                self.config.small_pair_sigma_floor,
+            )
+            implied = "up" if spot >= s0 else "down"
+            if not market.binance_close_locked:
+                market.binance_implied_winner = implied
+            if remaining <= 1:
+                market.binance_close_locked = True
+                market.binance_implied_winner = implied
+        return spot, s0, fair, age_binance
+
+    def _log_binance_lean(self, market, spot, s0, fair, up_bid, up_ask, action) -> None:
+        mid = None
+        if up_bid is not None and up_ask is not None and up_ask > up_bid:
+            mid = (up_bid + up_ask) / 2
+        gap = None
+        if fair is not None and mid is not None:
+            gap = fair - mid
+            width = abs(gap)
+            market.fair_gap_abs_sum += width
+            market.fair_gap_n += 1
+            if width > market.fair_gap_max:
+                market.fair_gap_max = width
+        if getattr(self.config, "price_source", "binance") == "binance":
+            market.last_binance = spot
+        market.last_fair_up = fair
+        market.last_mid_up = mid
+        market.last_gap = gap
+        market.last_lean_action = action or ""
+        detail = (
+            f"px={spot if spot is not None else '-'} "
+            f"s0={s0 if s0 is not None else '-'} "
+            f"source={market.reference_source or '-'} "
+            f"fair_up={fair if fair is not None else '-'} "
+            f"mid_up={mid if mid is not None else '-'} "
+            f"gap={gap if gap is not None else '-'} "
+            f"action={action or '-'}"
+        )
+        if getattr(self.config, "price_source", "binance") != "binance":
+            detail += (
+                f" binance={market.last_binance if market.last_binance is not None else '-'} "
+                f"chainlink={market.last_chainlink if market.last_chainlink is not None else '-'} "
+                f"link_age_s={market.last_chainlink_age_s if market.last_chainlink_age_s is not None else '-'} "
+                f"price_gap={market.last_price_gap if market.last_price_gap is not None else '-'} "
+                f"combined={market.last_combined if market.last_combined is not None else '-'} "
+                f"spot_source={market.price_spot_source or '-'} "
+                f"basis={market.last_basis if market.last_basis is not None else '-'} "
+                f"residual={market.last_residual if market.last_residual is not None else '-'} "
+                f"widen={1 if market.price_widen else 0} "
+                f"up_target={market.last_up_target if market.last_up_target is not None else '-'} "
+                f"up_best={up_bid if up_bid is not None else '-'} "
+                f"down_target={market.last_down_target if market.last_down_target is not None else '-'} "
+                f"down_best={market.down_book.best_bid() if market.down_book.best_bid() is not None else '-'}"
+            )
+        print(
+            f"binance_lean {market.slug or market.market_id} {detail}",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._emit(kind="binance_lean", market=market, reason=action or "", detail=detail)
+
     def _decide(self, market: Market) -> None:
+        if self.config.strategy == "dual_bid":
+            self._decide_dual_bid(market)
+            return
+        if self.config.strategy == "small_pair":
+            self._decide_small_pair(market)
+            return
         if market.status == "redeemed":
             return
         self._check_kill_switch()
@@ -1996,23 +2647,21 @@ class Engine:
         book = market.book(outcome)
         if book.uncertain:
             return False
-        if self.mode == "live":
-            # Freshness is the last time we received a book, not the exchange
-            # timestamp. A quiet book does not go stale just because nothing
-            # inside it changed. ``stale_after_ms`` stays the paper threshold.
-            if book.received_ms < 0:
-                return False
-            age = self.state.now_ms - book.received_ms
-            limit = int(self.config.stale_feed_seconds) * 1000
-            if age < 0:
-                return -age <= self.config.clock_skew_ms
-            return age <= limit
-        if book.ts_ms < 0:
+        # Receipt time, not predict's updateTimestampMs. That field is the last
+        # time the book changed. A round loaded during the pre-open lead keeps
+        # the first snapshot, and the old stamp is already older than
+        # stale_after_ms by the time quoting starts. A snapshot we just
+        # received is fresh until the next poll fails to replace it.
+        if book.received_ms < 0:
             return False
-        age = self.state.now_ms - book.ts_ms
+        age = self.state.now_ms - book.received_ms
+        if self.mode == "live":
+            limit = int(self.config.stale_feed_seconds) * 1000
+        else:
+            limit = self.config.stale_after_ms
         if age < 0:
             return -age <= self.config.clock_skew_ms
-        return age <= self.config.stale_after_ms
+        return age <= limit
 
     def _in_stop_window(self, market: Market) -> bool:
         return (
@@ -2346,6 +2995,15 @@ def _market_from_event(event: dict, config: Config) -> Market:
         up_book=LevelBook(),
         down_book=LevelBook(),
     )
+    reference = event.get("reference_price")
+    if reference not in (None, ""):
+        try:
+            price = Decimal(str(reference))
+        except (ValueError, ArithmeticError):
+            price = None
+        if price is not None and price > 0:
+            market.reference_price = price
+            market.reference_source = "predict"
     if market.up_token_id == market.down_token_id:
         raise ValueError("duplicate token ids")
     if {market.up_label.casefold(), market.down_label.casefold()} != {"up", "down"}:

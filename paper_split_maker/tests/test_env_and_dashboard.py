@@ -210,7 +210,7 @@ def test_split_must_be_positive_within_capital_and_the_minimum(tmp_path):
 def test_dashboard_write_leaves_secrets_untouched(tmp_path):
     root = _root(tmp_path)
     (root / ".env").write_text(
-        f"POLY_PRIVATE_KEY={SECRET}\nBOT_CAPITAL=59\n# keep me\n",
+        f"PREDICT_PRIVATE_KEY={SECRET}\nBOT_CAPITAL=59\n# keep me\n",
         encoding="utf-8",
     )
     write_bot_values(
@@ -218,12 +218,12 @@ def test_dashboard_write_leaves_secrets_untouched(tmp_path):
         {
             "BOT_CAPITAL": "80",
             "BOT_SPLIT_SIZE": "20",
-            "POLY_PRIVATE_KEY": "replaced",
+            "PREDICT_PRIVATE_KEY": "replaced",
             "NOT_A_SETTING": "nope",
         },
     )
     text = (root / ".env").read_text(encoding="utf-8")
-    assert f"POLY_PRIVATE_KEY={SECRET}" in text
+    assert f"PREDICT_PRIVATE_KEY={SECRET}" in text
     assert "replaced" not in text
     assert "NOT_A_SETTING" not in text
     assert "BOT_CAPITAL=80" in text
@@ -240,7 +240,7 @@ def test_dashboard_write_leaves_secrets_untouched(tmp_path):
             "BOT_SESSION_STOP": "6",
             "BOT_MAX_MARKETS": "2",
             "BOT_MODE": "paper",
-            "POLY_PRIVATE_KEY": "from-the-form",
+            "PREDICT_PRIVATE_KEY": "from-the-form",
         }
     )
     saved = (root / ".env").read_text(encoding="utf-8")
@@ -264,7 +264,7 @@ def test_dashboard_write_leaves_secrets_untouched(tmp_path):
 
 def test_start_is_single_and_stop_writes_the_kill_switch(tmp_path):
     root = _root(tmp_path)
-    (root / ".env").write_text(f"POLY_PRIVATE_KEY={SECRET}\nBOT_MODE=paper\n", encoding="utf-8")
+    (root / ".env").write_text(f"PREDICT_PRIVATE_KEY={SECRET}\nBOT_MODE=paper\n", encoding="utf-8")
     board = Supervisor(root)
     switch = root / "kill.switch"
     switch.write_text("stale\n", encoding="utf-8")
@@ -304,7 +304,7 @@ def test_start_is_single_and_stop_writes_the_kill_switch(tmp_path):
         board.start("paper", runner=runner)
     board.stop()
     assert switch.read_text(encoding="utf-8") == "stop\n"
-    assert holder["env"]["POLY_PRIVATE_KEY"] == SECRET
+    assert holder["env"]["PREDICT_PRIVATE_KEY"] == SECRET
     body = json.dumps(board.status())
     assert SECRET not in body
     with pytest.raises(DashboardError, match="confirmation"):
@@ -327,9 +327,9 @@ def test_wallet_blank_save_keeps_the_key_and_clear_removes_it(tmp_path):
     (root / ".env").write_text(
         "\n".join(
             [
-                f"POLY_PRIVATE_KEY={key}",
-                f"POLY_FUNDER={funder}",
-                "POLY_SIGNATURE_TYPE=2",
+                f"PREDICT_PRIVATE_KEY={key}",
+                f"PREDICT_ACCOUNT={funder}",
+                "PREDICT_NETWORK=testnet",
                 "BOT_SPLIT_SIZE=25",
                 "# keep me",
             ]
@@ -340,15 +340,15 @@ def test_wallet_blank_save_keeps_the_key_and_clear_removes_it(tmp_path):
     board = Supervisor(root)
     board.save_wallet(
         {
-            "POLY_PRIVATE_KEY": "",
-            "POLY_API_SECRET": "",
-            "POLY_FUNDER": "",
+            "PREDICT_PRIVATE_KEY": "",
+            "PREDICT_API_KEY": "",
+            "PREDICT_ACCOUNT": "",
             "BOT_SPLIT_SIZE": "50",
         }
     )
     kept = (root / ".env").read_text(encoding="utf-8")
-    assert f"POLY_PRIVATE_KEY={key}" in kept
-    assert f"POLY_FUNDER={funder}" in kept
+    assert f"PREDICT_PRIVATE_KEY={key}" in kept
+    assert f"PREDICT_ACCOUNT={funder}" in kept
     assert "BOT_SPLIT_SIZE=50" not in kept
     assert "BOT_SPLIT_SIZE=25" in kept
     page = board.page()
@@ -358,18 +358,18 @@ def test_wallet_blank_save_keeps_the_key_and_clear_removes_it(tmp_path):
     assert signer_address(key) in page
     assert funder in page
     assert "đã lưu" in page
-    board.save_wallet({"POLY_FUNDER": "0x" + "cd" * 20, "POLY_SIGNATURE_TYPE": "1"})
+    board.save_wallet({"PREDICT_ACCOUNT": "0x" + "cd" * 20, "PREDICT_NETWORK": "mainnet"})
     changed = (root / ".env").read_text(encoding="utf-8")
-    assert f"POLY_PRIVATE_KEY={key}" in changed
-    assert "POLY_FUNDER=0x" + "cd" * 20 in changed
-    assert "POLY_SIGNATURE_TYPE=1" in changed
+    assert f"PREDICT_PRIVATE_KEY={key}" in changed
+    assert "PREDICT_ACCOUNT=0x" + "cd" * 20 in changed
+    assert "PREDICT_NETWORK=mainnet" in changed
     with pytest.raises(ConfigError, match="must be an address"):
-        board.save_wallet({"POLY_FUNDER": key})
-    assert key not in (root / ".env").read_text(encoding="utf-8").split("POLY_FUNDER=", 1)[-1]
+        board.save_wallet({"PREDICT_ACCOUNT": key})
+    assert key not in (root / ".env").read_text(encoding="utf-8").split("PREDICT_ACCOUNT=", 1)[-1]
     board.clear_wallet()
     cleared = (root / ".env").read_text(encoding="utf-8")
     assert key not in cleared
-    assert "POLY_PRIVATE_KEY=" in cleared
+    assert "PREDICT_PRIVATE_KEY=" in cleared
     assert "BOT_SPLIT_SIZE=25" in cleared
     assert "# keep me" in cleared
     assert "đã lưu" not in board.page() or "chưa lưu" in board.page()
@@ -381,7 +381,7 @@ def test_wallet_change_is_refused_while_a_bot_is_running(tmp_path):
     root = _root(tmp_path)
     key = _dummy_key()
     (root / ".env").write_text(
-        f"POLY_PRIVATE_KEY={key}\nBOT_SPLIT_SIZE=25\nBOT_MAX_MARKETS=1\n",
+        f"PREDICT_PRIVATE_KEY={key}\nBOT_SPLIT_SIZE=25\nBOT_MAX_MARKETS=1\n",
         encoding="utf-8",
     )
     board = Supervisor(root)
@@ -399,13 +399,13 @@ def test_wallet_change_is_refused_while_a_bot_is_running(tmp_path):
     board.start("paper", runner=lambda argv, env, out: Alive())
     before = (root / ".env").read_text(encoding="utf-8")
     with pytest.raises(DashboardError, match="while a bot is running"):
-        board.save_wallet({"POLY_PRIVATE_KEY": _dummy_key()})
+        board.save_wallet({"PREDICT_PRIVATE_KEY": _dummy_key()})
     with pytest.raises(DashboardError, match="while a bot is running"):
         board.clear_wallet()
     assert (root / ".env").read_text(encoding="utf-8") == before
     board.save_form({"BOT_SPLIT_SIZE": "50", "BOT_MAX_MARKETS": "2"})
     after = (root / ".env").read_text(encoding="utf-8")
-    assert f"POLY_PRIVATE_KEY={key}" in after
+    assert f"PREDICT_PRIVATE_KEY={key}" in after
     assert "BOT_SPLIT_SIZE=50" in after
     assert key not in board.page()
     assert key not in json.dumps(board.status())
@@ -415,7 +415,7 @@ def test_foreign_host_or_origin_is_rejected(tmp_path):
     root = _root(tmp_path)
     key = _dummy_key()
     (root / ".env").write_text(
-        f"POLY_PRIVATE_KEY={key}\nPOLY_FUNDER={'0x' + '11' * 20}\nBOT_SPLIT_SIZE=25\n",
+        f"PREDICT_PRIVATE_KEY={key}\nPREDICT_ACCOUNT={'0x' + '11' * 20}\nBOT_SPLIT_SIZE=25\n",
         encoding="utf-8",
     )
     board = Supervisor(root)
@@ -441,7 +441,7 @@ def test_foreign_host_or_origin_is_rejected(tmp_path):
             port,
             "POST",
             "/wallet",
-            f"POLY_PRIVATE_KEY={_dummy_key()}",
+            f"PREDICT_PRIVATE_KEY={_dummy_key()}",
             {"Origin": "http://evil.example", "Host": f"127.0.0.1:{port}"},
         )
         assert status == 403
@@ -451,12 +451,12 @@ def test_foreign_host_or_origin_is_rejected(tmp_path):
             port,
             "POST",
             "/wallet",
-            f"POLY_FUNDER={key}",
+            f"PREDICT_ACCOUNT={key}",
             {"Origin": f"http://127.0.0.1:{port}", "Host": f"127.0.0.1:{port}"},
         )
         assert status == 400
         assert key not in body
-        assert f"POLY_PRIVATE_KEY={key}" in (root / ".env").read_text(encoding="utf-8")
+        assert f"PREDICT_PRIVATE_KEY={key}" in (root / ".env").read_text(encoding="utf-8")
         status, body = _exchange(
             port,
             "POST",
@@ -467,7 +467,7 @@ def test_foreign_host_or_origin_is_rejected(tmp_path):
         assert status == 303
         saved = (root / ".env").read_text(encoding="utf-8")
         assert "BOT_SPLIT_SIZE=50" in saved
-        assert f"POLY_PRIVATE_KEY={key}" in saved
+        assert f"PREDICT_PRIVATE_KEY={key}" in saved
         assert "BOT_CAPITAL" not in saved
         status, body = _exchange(port, "GET", "/status", "", {"Host": "evil.example"})
         assert status == 403
@@ -489,7 +489,7 @@ def test_foreign_host_or_origin_is_rejected(tmp_path):
             {},
         )
         assert status == 200
-        assert f"POLY_PRIVATE_KEY={key}" in (root / ".env").read_text(encoding="utf-8")
+        assert f"PREDICT_PRIVATE_KEY={key}" in (root / ".env").read_text(encoding="utf-8")
         status, body = _exchange(
             port,
             "POST",
@@ -512,8 +512,8 @@ def test_dashboard_paper_start_runs_three_sessions_offline(tmp_path):
     (root / ".env").write_text(
         "\n".join(
             [
-                f"POLY_PRIVATE_KEY={key}",
-                "POLY_FUNDER=0x" + "33" * 20,
+                f"PREDICT_PRIVATE_KEY={key}",
+                "PREDICT_ACCOUNT=0x" + "33" * 20,
                 "BOT_SPLIT_SIZE=25",
                 "BOT_MAX_MARKETS=3",
                 "BOT_MODE=paper",

@@ -1,0 +1,28 @@
+{
+  "label": "fixture dual_bid tape",
+  "open_unix": 1700000100,
+  "book": {
+    "bid": "0.48",
+    "ask": "0.52",
+    "bid_size": "80",
+    "ask_size": "10"
+  },
+  "queue_trade": {
+    "outcome": "up",
+    "taker_side": "SELL",
+    "price": "0.48",
+    "size": "80"
+  },
+  "fill_trade": {
+    "outcome": "up",
+    "taker_side": "SELL",
+    "price": "0.48",
+    "size": "5"
+  },
+  "through_trade": {
+    "outcome": "down",
+    "taker_side": "SELL",
+    "price": "0.40",
+    "size": "5"
+  }
+}
