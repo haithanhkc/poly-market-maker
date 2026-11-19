@@ -178,6 +178,14 @@ class Config:
     # Combined mode subtracts this from the pair sum only when a feed is stale
     # or the de-biased Binance/Chainlink residual is abnormal.
     small_pair_widen_extra: Decimal = Decimal("0.02")
+    # Combined mode only. One live lot on a side, then wait for the other side.
+    small_pair_pair_gate: bool = True
+    # Raise the lagging bid so filled-average + that bid stays within this sum.
+    small_pair_catch_up: bool = True
+    small_pair_catch_up_sum: Decimal = Decimal("0.97")
+    # On a 300s round, stop opening a new pair after this many seconds.
+    # Longer rounds use the same fraction of the window. 0 turns it off.
+    small_pair_first_leg_seconds: int = 200
     # The on-chain aggregator is fresh for this long after updatedAt.
     chainlink_stale_seconds: int = 3600
     chainlink_poll_seconds: int = 5
@@ -368,6 +376,10 @@ class Config:
             raise ConfigError("small_pair_disagree_gap must be below 1")
         if self.small_pair_widen_extra < 0 or self.small_pair_widen_extra > Decimal("0.06"):
             raise ConfigError("small_pair_widen_extra must sit inside [0, 0.06]")
+        if self.small_pair_catch_up_sum <= 0 or self.small_pair_catch_up_sum > 1:
+            raise ConfigError("small_pair_catch_up_sum must sit inside (0, 1]")
+        if self.small_pair_first_leg_seconds < 0:
+            raise ConfigError("small_pair_first_leg_seconds must be non-negative")
         if self.chainlink_stale_seconds < 1:
             raise ConfigError("chainlink_stale_seconds must be at least 1")
         if self.chainlink_poll_seconds < 1:
@@ -480,6 +492,7 @@ _DECIMAL_FIELDS = {
     "small_pair_price_disagree",
     "small_pair_disagree_gap",
     "small_pair_widen_extra",
+    "small_pair_catch_up_sum",
 }
 _INT_FIELDS = {
     "stale_after_ms",
@@ -516,6 +529,7 @@ _INT_FIELDS = {
     "small_pair_late_loser_seconds",
     "chainlink_stale_seconds",
     "chainlink_poll_seconds",
+    "small_pair_first_leg_seconds",
 }
 _BOOL_FIELDS = {
     "trade_through_fills",
@@ -524,6 +538,8 @@ _BOOL_FIELDS = {
     "merge_when_idle",
     "live",
     "small_pair_binance",
+    "small_pair_pair_gate",
+    "small_pair_catch_up",
 }
 
 

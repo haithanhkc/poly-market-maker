@@ -49,6 +49,17 @@ def quiet_after(window_s: int) -> int:
     return window - 60
 
 
+def first_leg_after(window_s: int, first_leg_s: int) -> int:
+    """When a flat book stops opening a new pair. 200s on a 5-minute round.
+
+    Longer rounds keep the same fraction of the window. ``0`` disables it.
+    """
+    if int(first_leg_s) <= 0:
+        return 0
+    scaled = int(int(window_s) * int(first_leg_s) / 300)
+    return scaled if scaled > 0 else 1
+
+
 def lot_for(price: Decimal, max_shares: Decimal = MAX_SHARES) -> Decimal | None:
     """Smallest whole share count worth at least 1 USDT, capped at 8."""
     if price <= 0 or price >= 1 or max_shares < 1:
@@ -83,6 +94,31 @@ def _size_at(levels, price: Decimal) -> Decimal:
         if level_price == price:
             total += size
     return total
+
+
+def _one_lot(touch, lot_cap: Decimal) -> Decimal:
+    """Share count of a single rung at ``touch``. At least one share."""
+    if touch is None:
+        return Decimal("1")
+    lot = lot_for(touch, lot_cap)
+    if lot is None or lot < 1:
+        return Decimal("1")
+    return lot
+
+
+def _catch_up_touch(touch, heavy_avg: Decimal, pair_sum: Decimal, ask, tick: Decimal):
+    """Lift the lagging bid up to the price that keeps the pair inside ``pair_sum``."""
+    if heavy_avg <= 0 or tick <= 0:
+        return touch
+    room = pair_sum - heavy_avg
+    price = _floor_tick(room, tick)
+    if ask is not None and price >= ask:
+        price = _floor_tick(ask - tick, tick)
+    if price <= 0:
+        return None
+    if touch is None or price > touch:
+        return price
+    return price if touch > price else touch
 
 
 def _clip_target(target, best_bid, ask, tick: Decimal):
@@ -238,6 +274,14 @@ def plan_small_pair(
     fair_quote: bool = False,
     widen_pair: bool = False,
     widen_extra: Decimal = Decimal("0.02"),
+    pair_gate: bool = False,
+    catch_up: bool = False,
+    catch_up_sum: Decimal = Decimal("0.97"),
+    up_cost: Decimal = ZERO,
+    down_cost: Decimal = ZERO,
+    first_leg_s: int = 0,
+    resting_up: Decimal = ZERO,
+    resting_down: Decimal = ZERO,
 ) -> Plan:
     """Bids for this heartbeat, plus a short reason when a rule binds.
 
@@ -248,12 +292,20 @@ def plan_small_pair(
     ``fair_quote`` keeps both sides and sets each top bid from fair value
     minus its edge, so the pair sum stays at or under the target. ``fair_gap``
     is accepted so older callers still load. It is not used.
+
+    ``pair_gate`` caps unpaired inventory at one lot. Filled shares and the
+    shares this plan would rest both count, so a four-rung ladder cannot sit
+    live on one side. ``catch_up`` then lifts the lagging bid, and
+    ``first_leg_s`` stops a new pair late in the round.
     """
     del fair_gap
     if age_s < int(start_s):
         return Plan([], "before_open")
     if age_s >= int(window_s):
         return Plan([], "round_closed")
+    leg_at = first_leg_after(window_s, first_leg_s)
+    if leg_at and age_s >= leg_at and up_shares == down_shares:
+        return Plan([], "first_leg", "first_leg")
     late = age_s >= quiet_after(window_s)
     if late and up_shares == down_shares:
         return Plan([], "late_balanced")
@@ -307,6 +359,19 @@ def plan_small_pair(
         if touch is None:
             return Plan([], "cross")
         up_touch, down_touch = touch
+    if catch_up and catch_up_sum > 0:
+        if up_shares > down_shares and up_shares > 0 and up_cost > 0:
+            down_touch = _catch_up_touch(
+                down_touch, up_cost / up_shares, catch_up_sum, down_ask, tick
+            )
+            lean = "catch_up"
+        elif down_shares > up_shares and down_shares > 0 and down_cost > 0:
+            up_touch = _catch_up_touch(
+                up_touch, down_cost / down_shares, catch_up_sum, up_ask, tick
+            )
+            lean = "catch_up"
+    if quoted_targets is not None:
+        quoted_targets = (up_touch, down_touch)
     allowed = {"up", "down"}
     reason = ""
     removed: dict[str, str] = {}
@@ -319,13 +384,34 @@ def plan_small_pair(
     if late:
         allowed = {"down"} if skewed > 0 else {"up"}
         reason = "late_light"
-    elif not fair_ok and skewed >= imbalance_cap:
+    elif not pair_gate and not fair_ok and skewed >= imbalance_cap:
         allowed = {"down"}
         reason = "imbalance"
-    elif not fair_ok and -skewed >= imbalance_cap:
+    elif not pair_gate and not fair_ok and -skewed >= imbalance_cap:
         allowed = {"up"}
         reason = "imbalance"
-    if fair_ok:
+    leg_cut = first_leg_after(window_s, first_leg_s)
+    if leg_cut and age_s >= leg_cut and not late:
+        if up_shares > down_shares:
+            allowed.discard("up")
+            reason = reason or "first_leg"
+        elif down_shares > up_shares:
+            allowed.discard("down")
+            reason = reason or "first_leg"
+    pair_lots = {"up": _one_lot(up_touch, lot_cap), "down": _one_lot(down_touch, lot_cap)}
+    if pair_gate:
+        # The old cap let a favorite lead by 12 filled shares, and it ignored
+        # the live ladder. One lot of filled inventory stops that side. The
+        # loop below also stops a second rung, counting shares already live.
+        if up_shares - down_shares >= pair_lots["up"] and "up" in allowed:
+            allowed.discard("up")
+            removed["up"] = "imbalance"
+            reason = reason or "imbalance"
+        if down_shares - up_shares >= pair_lots["down"] and "down" in allowed:
+            allowed.discard("down")
+            removed["down"] = "imbalance"
+            reason = reason or "imbalance"
+    elif fair_ok:
         up_cap = _excess_cap(
             fair_up, favorite_fair, favorite_excess, underdog_excess, imbalance_cap
         )
@@ -372,6 +458,9 @@ def plan_small_pair(
     books = {"up": up_levels, "down": down_levels}
     touches = {"up": up_touch, "down": down_touch}
     asks = {"up": up_ask, "down": down_ask}
+    filled = {"up": up_shares, "down": down_shares}
+    resting = {"up": resting_up, "down": resting_down}
+    posted = {"up": ZERO, "down": ZERO}
     for step in range(int(levels)):
         for side in ("up", "down"):
             if side not in allowed:
@@ -397,11 +486,28 @@ def plan_small_pair(
             size = lot_for(price, lot_cap)
             if size is None:
                 continue
+            if pair_gate:
+                other = "down" if side == "up" else "up"
+                lead = filled[side] - filled[other]
+                room = pair_lots[side] - lead
+                if room < 0:
+                    room = ZERO
+                # One lot may rest. A live ladder larger than that is replaced
+                # by this plan, not topped up, so those shares cannot all fill.
+                if resting[side] > room and posted[side] + size > room:
+                    counts["imbalance"] = counts.get("imbalance", 0) + 1
+                    reason = reason or "imbalance"
+                    continue
+                if posted[side] + size > room:
+                    counts["imbalance"] = counts.get("imbalance", 0) + 1
+                    reason = reason or "imbalance"
+                    continue
             notional = floor_cash(size * price)
             if notional <= 0 or notional > remaining:
                 trimmed = True
                 continue
             remaining -= notional
+            posted[side] += size
             bids.append(
                 Bid(
                     outcome=side,

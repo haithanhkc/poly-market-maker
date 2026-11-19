@@ -92,6 +92,32 @@ def main(argv: list[str] | None = None) -> int:
             "combined uses the Chainlink level plus the Binance move."
         ),
     )
+    parser.add_argument(
+        "--pair-gate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "cap each side at one unpaired lot. Default on for --price-source combined."
+        ),
+    )
+    parser.add_argument(
+        "--catch-up",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "raise the lagging bid so the pair stays within small_pair_catch_up_sum. "
+            "Default on for --price-source combined."
+        ),
+    )
+    parser.add_argument(
+        "--first-leg-seconds",
+        type=int,
+        default=None,
+        help=(
+            "stop opening a new pair after this many seconds of a 5-minute round. "
+            "Default 200 for --price-source combined. 0 turns it off."
+        ),
+    )
     parser.add_argument("--live", action="store_true")
     parser.add_argument(
         "--check-connection",
@@ -158,6 +184,12 @@ def _apply_strategy(config, args):
     source = getattr(args, "price_source", None)
     if source:
         config.price_source = source
+    if getattr(args, "pair_gate", None) is not None:
+        config.small_pair_pair_gate = bool(args.pair_gate)
+    if getattr(args, "catch_up", None) is not None:
+        config.small_pair_catch_up = bool(args.catch_up)
+    if getattr(args, "first_leg_seconds", None) is not None:
+        config.small_pair_first_leg_seconds = int(args.first_leg_seconds)
     _honor_bankroll(config, args)
     return config
 

@@ -1087,6 +1087,15 @@ class Engine:
         self._sync_dual_bids(market)
         market.last_requote_ts = self.state.now_ms
 
+    def _resting_bid_shares(self, market: Market, outcome: str):
+        """Live buy size. A cancel already in flight cannot fill, so it is not counted."""
+        total = ZERO
+        for order in self._working_bids(market):
+            if order.outcome != outcome or order.status not in {"queued", "live"}:
+                continue
+            total += order.remaining
+        return total
+
     def _working_bids(self, market: Market) -> list[Order]:
         return [
             order
@@ -1253,6 +1262,7 @@ class Engine:
                 adverse_stale = wider
             adverse_gap = adverse_stale
             age_for_plan = 0
+        combined = fair_quote
         plan = plan_small_pair(
             up_bid=up_bid,
             up_ask=up_ask,
@@ -1289,6 +1299,16 @@ class Engine:
             fair_quote=fair_quote,
             widen_pair=bool(getattr(market, "price_widen", False)) and fair_quote,
             widen_extra=self.config.small_pair_widen_extra,
+            pair_gate=combined and bool(self.config.small_pair_pair_gate),
+            catch_up=combined and bool(self.config.small_pair_catch_up),
+            catch_up_sum=self.config.small_pair_catch_up_sum,
+            up_cost=market.bought_up_cost,
+            down_cost=market.bought_down_cost,
+            first_leg_s=(
+                int(self.config.small_pair_first_leg_seconds) if combined else 0
+            ),
+            resting_up=self._resting_bid_shares(market, "up"),
+            resting_down=self._resting_bid_shares(market, "down"),
         )
         if self.config.small_pair_binance:
             for rule, count in plan.filtered:
