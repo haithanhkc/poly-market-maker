@@ -93,6 +93,7 @@ def run_paper(
     now_s: Optional[Callable[[], float]] = None,
     sleep: Optional[Callable[[float], None]] = None,
     env: Optional[dict] = None,
+    on_engine: Optional[Callable[[Engine], None]] = None,
 ) -> dict:
     import time
 
@@ -105,6 +106,8 @@ def run_paper(
     reader = client or client_from_env(env)
     engine = open_engine(config, out_dir)
     engine.mode = "paper"
+    if on_engine is not None:
+        on_engine(engine)
     started = clock()
     deadline = None if duration_seconds == 0 else started + duration_seconds
     bound = (
@@ -188,6 +191,15 @@ def _paper_loop(
             if (out_dir / "STOP").exists():
                 stop_reason = "manual"
                 break
+            control = getattr(engine, "paper_control", None)
+            if control is not None:
+                engine.quoting_enabled = bool(control.enabled())
+                if control.should_reset():
+                    stop_reason = "reset"
+                    break
+                if control.should_stop():
+                    stop_reason = "manual"
+                    break
             polls += 1
             stamp = int(clock() * 1000)
             begin = getattr(reader, "begin_poll", None)

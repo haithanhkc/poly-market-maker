@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bitcoin Up or Down – 5M · Paper</title>
+<style>
+  :root {
+    --bg: #0b0e11;
+    --card: #12161c;
+    --card-2: #161b22;
+    --line: #232a33;
+    --text: #e8eaed;
+    --muted: #8b939e;
+    --green: #00c087;
+    --red: #ff5b6a;
+    --orange: #f0a202;
+    --amber: #e0b15a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+  body {
+    font-family: "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  button, select { font: inherit; color: inherit; }
+  header.top {
+    display: grid;
+    grid-template-columns: minmax(240px, 1.3fr) auto auto auto auto;
+    gap: 18px;
+    align-items: center;
+    padding: 12px 16px 10px;
+    border-bottom: 1px solid var(--line);
+    background: #0e1217;
+  }
+  .title-block { display: flex; gap: 12px; align-items: center; min-width: 0; }
+  .coin {
+    width: 36px; height: 36px; border-radius: 10px; background: #f7931a;
+    color: #1a1206; font-weight: 700; display: grid; place-items: center; flex: none;
+  }
+  h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: 0.1px; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .paper-tag {
+    display: inline-block; margin-left: 8px; padding: 1px 6px; border-radius: 4px;
+    background: #2a2416; color: var(--amber); font-size: 10px; letter-spacing: 0.08em;
+    vertical-align: 1px;
+  }
+  .stat { min-width: 120px; }
+  .stat .k { color: var(--muted); font-size: 11px; letter-spacing: 0.04em; }
+  .stat .k .delta { margin-left: 6px; font-weight: 650; }
+  .stat .v { font-size: 26px; font-weight: 720; font-variant-numeric: tabular-nums; line-height: 1.15; }
+  .stat .v.up { color: var(--green); }
+  .stat .v.down { color: var(--orange); }
+  .stat .v.flat { color: #f2f4f6; }
+  .clock { display: flex; gap: 10px; align-items: flex-end; }
+  .tick { text-align: center; min-width: 52px; }
+  .tick b {
+    display: block; font-size: 30px; font-weight: 720; font-variant-numeric: tabular-nums; line-height: 1;
+  }
+  .tick span { color: var(--muted); font-size: 10px; letter-spacing: 0.12em; }
+  .bot {
+    border: 0; border-radius: 8px; padding: 10px 16px; font-weight: 720; letter-spacing: 0.04em;
+    cursor: pointer; min-width: 108px;
+  }
+  .bot.on { background: var(--green); color: #04261b; }
+  .bot.off { background: #3a2226; color: #ffb4bc; }
+  .sessions {
+    display: flex; gap: 8px; overflow-x: auto; padding: 8px 16px;
+    border-bottom: 1px solid var(--line); background: #0e1217;
+  }
+  .sessions button {
+    background: var(--card); border: 1px solid var(--line); border-radius: 999px;
+    padding: 5px 10px; color: var(--muted); cursor: pointer; white-space: nowrap;
+  }
+  .sessions button.on { color: var(--text); border-color: #3d4a44; background: #17211d; }
+  .live-dot { color: var(--green); margin-right: 4px; }
+  main {
+    flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 320px; min-height: 420px;
+  }
+  .chart-card { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--line); }
+  .toolbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px; gap: 12px;
+  }
+  .toolbar .name { color: var(--muted); font-size: 13px; }
+  .seg { display: flex; background: #1a1f26; border-radius: 8px; padding: 2px; }
+  .seg button {
+    background: transparent; border: 0; color: var(--muted); padding: 5px 12px; border-radius: 6px; cursor: pointer;
+  }
+  .seg button.on { background: #2a313b; color: var(--text); }
+  #chart { width: 100%; height: 100%; min-height: 380px; display: block; }
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 12px; padding: 4px 12px 8px;
+    color: var(--muted); font-size: 11px;
+  }
+  .legend i { display: inline-block; width: 14px; height: 2px; margin-right: 5px; vertical-align: middle; }
+  .legend .g { background: var(--green); }
+  .legend .r { background: var(--red); }
+  .legend .dash { background: repeating-linear-gradient(90deg, #8b939c 0 3px, transparent 3px 6px); height: 2px; }
+  .legend .cur { background: var(--orange); }
+  .legend .bid { background: var(--amber); }
+  aside.book { background: #101418; display: flex; flex-direction: column; min-height: 0; }
+  .book-head {
+    display: flex; align-items: center; justify-content: space-between; padding: 10px 12px 6px;
+  }
+  .book-head h2 { margin: 0; font-size: 14px; font-weight: 650; }
+  .book-head .src { color: var(--muted); font-size: 11px; margin-left: 6px; font-weight: 500; }
+  .cols, .row, .spread {
+    display: grid; grid-template-columns: 1fr 1fr 1.2fr; gap: 8px; padding: 0 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .cols { color: var(--muted); font-size: 11px; padding-top: 4px; padding-bottom: 4px; }
+  .row { font-size: 13px; padding-top: 2px; padding-bottom: 2px; }
+  .row span:nth-child(2), .row span:nth-child(3),
+  .cols span:nth-child(2), .cols span:nth-child(3) { text-align: right; }
+  .ask { color: var(--red); }
+  .bid { color: var(--green); }
+  .spread {
+    margin: 6px 0; padding-top: 6px; padding-bottom: 6px;
+    border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+    color: var(--muted); font-size: 12px;
+  }
+  .spread b { color: var(--text); font-weight: 650; }
+  .ladder { overflow: auto; padding-bottom: 8px; }
+  .lower {
+    display: grid; grid-template-columns: 1.4fr 0.8fr 0.8fr 0.9fr;
+    border-top: 1px solid var(--line); min-height: 196px; background: #0e1217;
+  }
+  .panel { padding: 10px 12px; border-right: 1px solid var(--line); min-width: 0; }
+  .panel h3 { margin: 0 0 8px; font-size: 12px; color: var(--muted); font-weight: 650; letter-spacing: 0.04em; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+  th { text-align: left; color: var(--muted); font-weight: 550; font-size: 11px; }
+  td { padding: 3px 6px 3px 0; }
+  .scroll { max-height: 150px; overflow: auto; }
+  .kv { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; padding: 3px 0; }
+  .kv span { color: var(--muted); }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  #equity { width: 100%; height: 88px; display: block; }
+  .reset {
+    margin-top: 8px; background: transparent; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 6px; padding: 4px 8px; cursor: pointer; font-size: 12px;
+  }
+  .banner {
+    display: none; background: #2a1c14; color: #ffc58a; font-size: 12px; padding: 6px 16px;
+  }
+  .banner.show { display: block; }
+  @media (max-width: 980px) {
+    header.top { grid-template-columns: 1fr 1fr; }
+    main { grid-template-columns: 1fr; }
+    .lower { grid-template-columns: 1fr 1fr; }
+    .chart-card { border-right: 0; border-bottom: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="title-block">
+    <div class="coin">₿</div>
+    <div>
+      <h1 id="title">Bitcoin Up or Down – 5M <span class="paper-tag">PAPER</span></h1>
+      <div class="sub" id="window">Waiting for a round</div>
+    </div>
+  </div>
+  <div class="stat">
+    <div class="k">Current <span id="delta" class="delta"></span></div>
+    <div class="v flat" id="current">—</div>
+  </div>
+  <div class="stat">
+    <div class="k">Price to beat</div>
+    <div class="v flat" id="beat">—</div>
+  </div>
+  <div class="clock">
+    <div class="tick"><b id="mins">00</b><span>MIN</span></div>
+    <div class="tick"><b id="secs">00</b><span>SEC</span></div>
+  </div>
+  <button class="bot on" id="bot" type="button">BOT ON</button>
+</header>
+<div class="banner" id="banner">Bot is off. Resting paper bids are cancelled. Open positions still settle. No orders are sent.</div>
+<div class="sessions" id="sessions"></div>
+<main>
+  <section class="chart-card">
+    <div class="toolbar">
+      <div class="name">Chart</div>
+      <div class="seg" id="sides">
+        <button type="button" data-mode="one">One side</button>
+        <button type="button" data-mode="both" class="on">Both sides</button>
+      </div>
+    </div>
+    <canvas id="chart"></canvas>
+    <div class="legend">
+      <span><i class="g"></i>Up</span>
+      <span><i class="r"></i>Down</span>
+      <span><i class="dash"></i>Price to beat</span>
+      <span><i class="cur"></i>Current</span>
+      <span><i class="bid"></i>Our bid</span>
+      <span>▲ fill</span>
+      <span>× cancel</span>
+      <span>◆ settle 1 / 0</span>
+    </div>
+  </section>
+  <aside class="book">
+    <div class="book-head">
+      <h2>Order Book <span class="src">predict.fun</span></h2>
+      <div class="seg" id="book-side">
+        <button type="button" data-side="up" class="on">Up</button>
+        <button type="button" data-side="down">Down</button>
+      </div>
+    </div>
+    <div class="cols"><span>Price</span><span>Shares</span><span>Total</span></div>
+    <div class="ladder" id="ladder"></div>
+  </aside>
+</main>
+<section class="lower">
+  <div class="panel">
+    <h3>ORDER BLOTTER</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Size</th><th>Status</th></tr></thead>
+        <tbody id="blotter"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="panel">
+    <h3>POSITION</h3>
+    <div id="position"></div>
+  </div>
+  <div class="panel">
+    <h3>PNL</h3>
+    <div id="pnl"></div>
+  </div>
+  <div class="panel">
+    <h3>EQUITY</h3>
+    <canvas id="equity"></canvas>
+    <div class="kv"><span>From</span><b id="eq-from">100</b></div>
+    <div class="kv"><span>Mark</span><b id="eq-now">100</b></div>
+    <button class="reset" id="reset" type="button">Reset ledger</button>
+  </div>
+</section>
+<script>
+const state = { data: null, selected: null, mode: "both", side: "up", skew: 0 };
+
+function num(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+function usd(value) {
+  const n = num(value);
+  if (n === null) return "—";
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
+}
+function cents(price) {
+  const c = price * 100;
+  const rounded = Math.round(c);
+  const text = Math.abs(c - rounded) < 0.05 ? String(rounded) : c.toFixed(1);
+  return text + "¢";
+}
+function shares(n) {
+  if (n >= 1000) {
+    const k = n / 1000;
+    return (k >= 10 ? k.toFixed(1) : k.toFixed(2)).replace(/\.0$/, "") + "K";
+  }
+  return String(Math.round(n));
+}
+function signed(value) {
+  const n = num(value);
+  if (n === null) return "—";
+  const text = (n > 0 ? "+" : "") + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return text;
+}
+function cls(value) {
+  const n = num(value);
+  if (n === null || n === 0) return "";
+  return n > 0 ? "pos" : "neg";
+}
+function pad(n) { return String(n).padStart(2, "0"); }
+function clock(ms, withDate) {
+  if (!ms) return "";
+  try {
+    const time = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      hour: "numeric", minute: "2-digit", hour12: true
+    }).format(new Date(ms));
+    if (!withDate) return time;
+    const day = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      month: "long", day: "numeric"
+    }).format(new Date(ms));
+    return day + ", " + time;
+  } catch (err) {
+    return new Date(ms).toLocaleString();
+  }
+}
+function ageLabel(openMs, ts) {
+  const s = Math.max(0, Math.round((ts - openMs) / 1000));
+  return Math.floor(s / 60) + ":" + pad(s % 60);
+}
+function selectedSession() {
+  const data = state.data;
+  if (!data || !data.sessions.length) return null;
+  return data.sessions.find((item) => item.id === state.selected) || data.sessions[data.sessions.length - 1];
+}
+function remaining(session) {
+  if (!session) return 0;
+  let now = session.status === "open" && state.data && state.data.mode === "live"
+    ? Date.now() + state.skew
+    : (state.data ? state.data.now_ms : session.end_ms);
+  if (session.status !== "open") return 0;
+  return Math.max(0, session.end_ms - now);
+}
+
+function render(data) {
+  state.data = data;
+  if (data.mode === "live" && data.wall_ms) state.skew = data.wall_ms - Date.now();
+  if (!state.selected || !data.sessions.some((item) => item.id === state.selected)) {
+    const open = data.sessions.find((item) => item.status === "open");
+    state.selected = (open || data.sessions[data.sessions.length - 1] || {}).id || null;
+  }
+  const session = selectedSession();
+  document.getElementById("bot").textContent = data.bot_enabled ? "BOT ON" : "BOT OFF";
+  document.getElementById("bot").className = data.bot_enabled ? "bot on" : "bot off";
+  document.getElementById("banner").className = data.bot_enabled ? "banner" : "banner show";
+  renderSessions(data);
+  renderHeader(session);
+  renderBook(session);
+  renderBlotter(data, session);
+  renderPosition(session);
+  renderPnl(data, session);
+  drawChart();
+  drawEquity();
+}
+
+function renderSessions(data) {
+  const bar = document.getElementById("sessions");
+  bar.replaceChildren();
+  data.sessions.forEach((session) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    if (session.id === state.selected) button.className = "on";
+    const when = clock(session.open_ms, false);
+    const flag = session.status === "open" ? "● " : (session.winner ? session.winner.toUpperCase() + " " : "");
+    button.textContent = flag + when;
+    button.addEventListener("click", () => { state.selected = session.id; render(state.data); });
+    bar.appendChild(button);
+  });
+}
+
+function renderHeader(session) {
+  const current = document.getElementById("current");
+  const beatEl = document.getElementById("beat");
+  const delta = document.getElementById("delta");
+  if (!session) {
+    current.textContent = "—";
+    beatEl.textContent = "—";
+    delta.textContent = "";
+    return;
+  }
+  const last = session.points.length ? session.points[session.points.length - 1] : null;
+  const btc = last ? last.btc : null;
+  const beat = num(session.price_to_beat);
+  document.getElementById("window").textContent =
+    clock(session.open_ms, true) + " – " + clock(session.end_ms, false) + " ET";
+  beatEl.textContent = beat === null ? "—" : usd(beat);
+  if (btc === null || beat === null) {
+    current.textContent = "—";
+    current.className = "v flat";
+    delta.textContent = "";
+  } else {
+    const gap = btc - beat;
+    current.textContent = usd(btc);
+    current.className = "v " + (gap < 0 ? "down" : "up");
+    delta.textContent = (gap < 0 ? "▼ " : "▲ ") + usd(Math.abs(gap));
+    delta.className = "delta " + (gap < 0 ? "neg" : "pos");
+  }
+  const left = Math.floor(remaining(session) / 1000);
+  document.getElementById("mins").textContent = pad(Math.floor(left / 60));
+  document.getElementById("secs").textContent = pad(left % 60);
+}
+
+function renderBook(session) {
+  const box = document.getElementById("ladder");
+  box.replaceChildren();
+  if (!session) return;
+  const book = (session.books && session.books[state.side]) || { bids: [], asks: [] };
+  const asks = book.asks.slice().sort((a, b) => a[0] - b[0]);
+  const bids = book.bids.slice().sort((a, b) => b[0] - a[0]);
+  let cum = 0;
+  const askRows = asks.map((level) => {
+    cum += level[0] * level[1];
+    return { price: level[0], size: level[1], total: cum };
+  }).reverse();
+  cum = 0;
+  const bidRows = bids.map((level) => {
+    cum += level[0] * level[1];
+    return { price: level[0], size: level[1], total: cum };
+  });
+  askRows.forEach((row) => box.appendChild(levelRow(row, "ask")));
+  const bestAsk = asks.length ? asks[0][0] : null;
+  const bestBid = bids.length ? bids[0][0] : null;
+  const spread = document.createElement("div");
+  spread.className = "spread";
+  const gap = bestAsk !== null && bestBid !== null ? Math.round((bestAsk - bestBid) * 100) : null;
+  let last = session.last && session.last[state.side] != null
+    ? session.last[state.side]
+    : bestBid;
+  if (bestBid != null && bestAsk != null && last != null && (last > bestAsk + 0.03 || last < bestBid - 0.03)) {
+    last = bestBid;
+  }
+  spread.innerHTML = "<span>Spread: <b>" + (gap === null ? "—" : gap + "¢") + "</b></span><span></span><span>Last: <b>" + (last == null ? "—" : cents(last)) + "</b></span>";
+  box.appendChild(spread);
+  bidRows.forEach((row) => box.appendChild(levelRow(row, "bid")));
+}
+function levelRow(row, kind) {
+  const el = document.createElement("div");
+  el.className = "row " + kind;
+  const price = document.createElement("span");
+  price.textContent = cents(row.price);
+  const size = document.createElement("span");
+  size.textContent = shares(row.size);
+  const total = document.createElement("span");
+  total.textContent = usd(row.total);
+  el.append(price, size, total);
+  return el;
+}
+
+function renderBlotter(data, session) {
+  const body = document.getElementById("blotter");
+  body.replaceChildren();
+  const rows = (data.blotter || []).filter((row) => !session || row.market_id === session.id);
+  rows.slice(0, 40).forEach((row) => {
+    const tr = document.createElement("tr");
+    const time = document.createElement("td");
+    time.textContent = session ? ageLabel(session.open_ms, row.ts) : "";
+    const side = document.createElement("td");
+    side.textContent = (row.side || "").toUpperCase();
+    side.className = row.side === "down" ? "neg" : "pos";
+    const price = document.createElement("td");
+    price.textContent = row.price ? cents(Number(row.price)) : "";
+    const size = document.createElement("td");
+    size.textContent = row.size || "";
+    const status = document.createElement("td");
+    status.textContent = row.status || "";
+    tr.append(time, side, price, size, status);
+    body.appendChild(tr);
+  });
+}
+
+function kv(label, value, className) {
+  const row = document.createElement("div");
+  row.className = "kv";
+  const name = document.createElement("span");
+  name.textContent = label;
+  const val = document.createElement("b");
+  val.textContent = value;
+  if (className) val.className = className;
+  row.append(name, val);
+  return row;
+}
+function renderPosition(session) {
+  const box = document.getElementById("position");
+  box.replaceChildren();
+  const pos = session && session.position;
+  if (!pos) {
+    box.appendChild(kv("Up", "0"));
+    box.appendChild(kv("Down", "0"));
+    return;
+  }
+  box.appendChild(kv("Up shares", pos.shares_up + (pos.avg_up ? " @ " + pos.avg_up : "")));
+  box.appendChild(kv("Down shares", pos.shares_down + (pos.avg_down ? " @ " + pos.avg_down : "")));
+  box.appendChild(kv("Pair cost", pos.pair_cost || "—"));
+  const excess = (pos.excess_shares || "0") + (pos.excess_side ? " " + pos.excess_side : "");
+  box.appendChild(kv("Unpaired", excess));
+  box.appendChild(kv("Fair up", session.fair_up || "—"));
+}
+function renderPnl(data, session) {
+  const box = document.getElementById("pnl");
+  box.replaceChildren();
+  const pos = session && session.position;
+  box.appendChild(kv("Round matched", pos && pos.matched != null ? signed(pos.matched) : "—", pos ? cls(pos.matched) : ""));
+  box.appendChild(kv("Round excess", pos && pos.excess != null ? signed(pos.excess) : "—", pos ? cls(pos.excess) : ""));
+  box.appendChild(kv("Round total", pos && pos.pnl != null ? signed(pos.pnl) : "open", pos ? cls(pos.pnl) : ""));
+  const stats = data.stats || {};
+  box.appendChild(kv("Matched", signed(stats.matched), cls(stats.matched)));
+  box.appendChild(kv("Excess", signed(stats.excess), cls(stats.excess)));
+  box.appendChild(kv("Total", signed(stats.pnl), cls(stats.pnl)));
+  box.appendChild(kv("Wins / losses", (stats.wins || 0) + " / " + (stats.losses || 0)));
+}
+
+function roundRect(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+  g.fill();
+}
+
+function drawChart() {
+  const canvas = document.getElementById("chart");
+  const session = selectedSession();
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 800;
+  const h = canvas.clientHeight || 380;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  g.fillStyle = "#0c1014";
+  g.fillRect(0, 0, w, h);
+  if (!session) return;
+  const inset = { l: 16, r: 54, t: 16, b: 28 };
+  const plotW = Math.max(10, w - inset.l - inset.r);
+  const plotH = Math.max(10, h - inset.t - inset.b);
+  const span = session.window_s || 300;
+  const xOf = (s) => inset.l + (Math.max(0, s) / span) * plotW;
+  const yOf = (pct) => inset.t + (1 - pct / 100) * plotH;
+  g.font = "11px Segoe UI, sans-serif";
+  g.lineWidth = 1;
+  g.strokeStyle = "#2a3441";
+  g.fillStyle = "#6d7580";
+  for (const p of [0, 20, 40, 60, 80, 100]) {
+    const y = yOf(p);
+    g.beginPath();
+    g.moveTo(inset.l, y);
+    g.lineTo(inset.l + plotW, y);
+    g.stroke();
+    g.textAlign = "left";
+    g.fillText(p + "%", inset.l + plotW + 6, y + 4);
+  }
+  g.textAlign = "center";
+  for (let s = 0; s <= span; s += 30) {
+    const x = xOf(s);
+    if (s % 60 === 0) {
+      g.beginPath();
+      g.moveTo(x, inset.t);
+      g.lineTo(x, inset.t + plotH);
+      g.stroke();
+    }
+    g.fillText(Math.floor(s / 60) + ":" + pad(s % 60), x, h - 8);
+  }
+  const beat = num(session.price_to_beat);
+  const last = session.points.length ? session.points[session.points.length - 1] : null;
+  const btc = last && last.btc != null ? last.btc : null;
+  const mapPx = (px) => {
+    if (beat === null || px === null) return 50;
+    const shift = ((px - beat) / beat) * 12000;
+    return Math.max(8, Math.min(92, 50 + shift));
+  };
+  const dash = (pct, color) => {
+    g.save();
+    g.strokeStyle = color;
+    g.setLineDash([5, 4]);
+    g.beginPath();
+    const y = yOf(pct);
+    g.moveTo(inset.l, y);
+    g.lineTo(inset.l + plotW, y);
+    g.stroke();
+    g.restore();
+    return y;
+  };
+  let beatY = null;
+  let curY = null;
+  if (beat !== null) beatY = dash(mapPx(beat), "#8b939c");
+  if (btc !== null) curY = dash(mapPx(btc), btc < beat ? "#f0a202" : "#00c087");
+
+  const show = (side) => state.mode === "both" || side === state.side;
+  const marks = session.marks || [];
+  g.save();
+  g.setLineDash([3, 3]);
+  g.lineWidth = 1.4;
+  marks.forEach((mark) => {
+    if (mark.kind !== "place" || !show(mark.side)) return;
+    const end = marks.find((item) => item.order_id && item.order_id === mark.order_id && (item.kind === "cancel" || item.kind === "fill"));
+    const s1 = end ? end.s : (last ? last.s : mark.s);
+    g.strokeStyle = mark.side === "up" ? "rgba(224,177,90,0.95)" : "rgba(255,140,150,0.8)";
+    const y = yOf(mark.price * 100);
+    g.beginPath();
+    g.moveTo(xOf(mark.s), y);
+    g.lineTo(xOf(Math.max(s1, mark.s)), y);
+    g.stroke();
+  });
+  g.restore();
+
+  const line = (key, color) => {
+    let started = false;
+    let end = null;
+    g.beginPath();
+    session.points.forEach((pt) => {
+      if (pt[key] == null) return;
+      const x = xOf(pt.s);
+      const y = yOf(pt[key] * 100);
+      if (!started) { g.moveTo(x, y); started = true; }
+      else g.lineTo(x, y);
+      end = { x, y, v: pt[key] };
+    });
+    g.strokeStyle = color;
+    g.lineWidth = 2;
+    g.stroke();
+    return end;
+  };
+  const ends = [];
+  if (show("down")) ends.push({ side: "Down", color: "#ff5b6a", end: line("down", "#ff5b6a") });
+  if (show("up")) ends.push({ side: "Up", color: "#00c087", end: line("up", "#00c087") });
+  g.font = "12px Segoe UI, sans-serif";
+  g.textAlign = "left";
+  ends.forEach((item, index) => {
+    if (!item.end) return;
+    const y = item.end.y + (index === 0 ? -8 : 14);
+    g.fillStyle = item.color;
+    g.fillText(item.side + " " + (item.end.v * 100).toFixed(1) + "%", Math.min(item.end.x + 8, inset.l + plotW - 78), y);
+  });
+
+  marks.forEach((mark) => {
+    if (!show(mark.side)) return;
+    const x = xOf(mark.s);
+    const y = yOf(mark.price * 100);
+    if (mark.kind === "fill") {
+      g.fillStyle = mark.side === "up" ? "#00c087" : "#ff5b6a";
+      g.beginPath();
+      g.moveTo(x, y - 7);
+      g.lineTo(x + 6, y + 5);
+      g.lineTo(x - 6, y + 5);
+      g.closePath();
+      g.fill();
+      g.font = "10px Segoe UI, sans-serif";
+      g.fillText(String(Math.round(mark.size)), x + 8, y - 6);
+    } else if (mark.kind === "cancel") {
+      g.strokeStyle = "#c5ccd3";
+      g.lineWidth = 1.2;
+      g.beginPath();
+      g.moveTo(x - 3.5, y - 3.5); g.lineTo(x + 3.5, y + 3.5);
+      g.moveTo(x + 3.5, y - 3.5); g.lineTo(x - 3.5, y + 3.5);
+      g.stroke();
+    } else if (mark.kind === "exit") {
+      g.fillStyle = mark.price >= 1 ? "#00c087" : "#ff5b6a";
+      g.beginPath();
+      g.moveTo(x, y - 6); g.lineTo(x + 6, y); g.lineTo(x, y + 6); g.lineTo(x - 6, y);
+      g.closePath();
+      g.fill();
+      g.font = "11px Segoe UI, sans-serif";
+      g.fillText(mark.price >= 1 ? "1" : "0", x + 8, y + 4);
+    }
+  });
+
+  const pill = (text, y, bg) => {
+    g.font = "11px Segoe UI, sans-serif";
+    const tw = g.measureText(text).width;
+    const x = inset.l + plotW - tw - 18;
+    g.fillStyle = bg;
+    roundRect(g, x - 6, y - 11, tw + 12, 16, 3);
+    g.fillStyle = "#f2f4f6";
+    g.textAlign = "left";
+    g.fillText(text, x, y);
+  };
+  if (beatY !== null) pill("Price to beat " + usd(beat), beatY - 10, "rgba(28, 34, 42, 0.94)");
+  if (curY !== null) pill("Current " + usd(btc), curY + 16, btc < beat ? "rgba(92, 58, 12, 0.94)" : "rgba(8, 72, 52, 0.94)");
+}
+
+function drawEquity() {
+  const canvas = document.getElementById("equity");
+  const data = state.data;
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 220;
+  const h = 88;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const points = (data && data.equity) || [];
+  const capital = data ? Number(data.capital || 100) : 100;
+  document.getElementById("eq-from").textContent = usd(capital);
+  const last = points.length ? points[points.length - 1].v : capital;
+  document.getElementById("eq-now").textContent = usd(last);
+  if (points.length < 2) return;
+  const values = points.map((pt) => pt.v);
+  let min = Math.min(capital, ...values);
+  let max = Math.max(capital, ...values);
+  if (max - min < 0.5) { min -= 0.5; max += 0.5; }
+  g.beginPath();
+  points.forEach((pt, i) => {
+    const x = (i / (points.length - 1)) * (w - 8) + 4;
+    const y = 8 + (1 - (pt.v - min) / (max - min)) * (h - 16);
+    if (i === 0) g.moveTo(x, y);
+    else g.lineTo(x, y);
+  });
+  g.strokeStyle = last >= capital ? "#00c087" : "#ff5b6a";
+  g.lineWidth = 1.6;
+  g.stroke();
+}
+
+document.getElementById("sides").addEventListener("click", (event) => {
+  const mode = event.target.getAttribute("data-mode");
+  if (!mode) return;
+  state.mode = mode;
+  document.querySelectorAll("#sides button").forEach((button) => {
+    button.classList.toggle("on", button.getAttribute("data-mode") === mode);
+  });
+  drawChart();
+});
+document.getElementById("book-side").addEventListener("click", (event) => {
+  const side = event.target.getAttribute("data-side");
+  if (!side) return;
+  state.side = side;
+  document.querySelectorAll("#book-side button").forEach((button) => {
+    button.classList.toggle("on", button.getAttribute("data-side") === side);
+  });
+  renderBook(selectedSession());
+  if (state.mode === "one") drawChart();
+});
+document.getElementById("bot").addEventListener("click", async () => {
+  const enabled = !(state.data && state.data.bot_enabled);
+  const res = await fetch("/api/bot", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled })
+  });
+  const body = await res.json();
+  if (state.data) {
+    state.data.bot_enabled = body.bot_enabled;
+    render(state.data);
+  }
+});
+document.getElementById("reset").addEventListener("click", async () => {
+  if (!window.confirm("Reset the paper ledger in this folder? Open paper positions in this run are wiped. The .env file is not touched.")) return;
+  const res = await fetch("/api/reset", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: "RESET" })
+  });
+  await res.json();
+  const snap = await fetch("/api/state");
+  render(await snap.json());
+});
+window.addEventListener("resize", () => { drawChart(); drawEquity(); });
+
+async function boot() {
+  const res = await fetch("/api/state");
+  const data = await res.json();
+  render(data);
+  if (data.mode === "live") {
+    setInterval(() => renderHeader(selectedSession()), 250);
+  }
+  const stream = new EventSource("/events");
+  stream.onmessage = (event) => render(JSON.parse(event.data));
+}
+boot();
+</script>
+</body>
+</html>

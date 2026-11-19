@@ -81,6 +81,40 @@ cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
 .\run_smallpair_combo100.ps1
 ```
 
+## Paper dashboard
+
+`run_app_combo.ps1` is the same combined run with a local page at `http://127.0.0.1:8766`. Fills are still the paper queue model against the public predict.fun book. The process does not send orders. The ledger is `runs\app_combo`, so it does not share `state.json` with `runs\smallpair_combo100`. The page binds to loopback only and uses the standard library (no FastAPI). `.env` is read the same way as the CLI, for `PREDICT_NETWORK` and `PREDICT_API_KEY` on the public book, and its values are not printed.
+
+The header shows the round window, the current combined BTC price against price-to-beat, and the minute/second countdown. The chart's x-axis is seconds into the round and the right axis is probability. Up is green, Down is red, and the BTC price-to-beat and the current print are dashed horizontals on that same chart. Bid segments, fill triangles, cancels, and the 1/0 settlement sit on top of the lines. One side / Both sides switches the lines. The right panel is the predict.fun ladder for Up or Down (price in cents, shares, cumulative total, spread, last). Under the chart: blotter, position, matched versus excess PnL, and the equity mark from 100 USDT. Past rounds stay on the chip row.
+
+BOT OFF cancels resting paper bids and leaves the open shares to settle. BOT ON quotes again. The choice is saved in `runs\app_combo\bot.json`. Starting the script again resumes `state.json` and the chart file `dashboard.json`. Reset ledger asks for a confirm, then deletes this folder's ledger and chart. It does not touch `.env`.
+
+```powershell
+cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
+.\run_app_combo.ps1
+```
+
+Without the wrapper:
+
+```powershell
+python -m paper_split_maker.app --config config.paper.json --out runs\app_combo --port 8766
+```
+
+`--demo` plays a recorded round through the same engine when you have no API key. It does not call predict.fun. `--replay` rebuilds that tape. Do not point `--demo` at a live `runs\app_combo` ledger you want to keep.
+
+### Bảng giá giấy
+
+Cùng lệnh combined, thêm trang trên máy tại `http://127.0.0.1:8766`. Vẫn là giấy: khớp lệnh mô phỏng trên sổ predict.fun, không gửi lệnh. Sổ nằm ở `runs\app_combo`, tách khỏi `runs\smallpair_combo100`. Trang chỉ mở trên máy này. File `.env` dùng như CLI (`PREDICT_NETWORK`, `PREDICT_API_KEY` cho dữ liệu công khai) và không bị in ra.
+
+Đầu trang là tên phiên, khung giờ, giá BTC hiện tại so với price-to-beat, và đồng hồ phút/giây. Biểu đồ: trục ngang là giây trong vòng 5 phút, trục phải là xác suất. Up màu xanh, Down màu đỏ. Hai đường đứt là price-to-beat và giá BTC hiện tại. Lệnh bid, khớp (tam giác), hủy, và tất toán 1/0 nằm trên biểu đồ. One side / Both sides chọn một hay cả hai đường. Cột phải là sổ predict.fun (Up hoặc Down, giá theo cent, khối lượng, tổng, spread, last). Phía dưới là sổ lệnh, vị thế, PnL matched/excess, và đường vốn từ 100 USDT. Các vòng trước nằm trên hàng chip.
+
+BOT OFF hủy bid giấy đang treo và để vị thế về settlement. BOT ON báo giá lại. Trạng thái ghi ở `bot.json`. Chạy lại script sẽ nối `state.json`. Reset ledger hỏi xác nhận rồi xóa sổ của thư mục này, không đụng `.env`.
+
+```powershell
+cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
+.\run_app_combo.ps1
+```
+
 Check the key, the login, and the USDT balance without placing an order. The JSON it prints does not contain the key or the JWT:
 
 ```powershell

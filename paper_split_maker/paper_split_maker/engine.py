@@ -107,6 +107,12 @@ class Engine:
         from paper_split_maker.price_blend import BasisTracker
 
         self._basis = BasisTracker()
+        # Paper dashboard flips this. Off cancels resting bids and quotes nothing.
+        self.quoting_enabled = True
+        self.listeners: list = []
+        self.listener_error: Optional[str] = None
+        # Set by the paper app so the loop can stop or reset between polls.
+        self.paper_control = None
 
     @classmethod
     def create(
@@ -285,6 +291,11 @@ class Engine:
         if fields:
             row["extra"] = {key: _jsonable(value) for key, value in fields.items()}
         self._batch.append(row)
+        for listener in self.listeners:
+            try:
+                listener(row)
+            except Exception as exc:
+                self.listener_error = f"{type(exc).__name__}: {exc}"
         if kind in {"quote_reject", "risk_freeze"} and row["reason"] in {
             "risk_floor",
             "exposure_frozen",
@@ -1229,6 +1240,10 @@ class Engine:
         if self.state.now_ms < market.pause_until_ms:
             self._cancel_market(market, "reject_pause")
             self._skip(market, "reject_pause")
+            return
+        if not self.quoting_enabled:
+            self._cancel_market(market, "bot_off")
+            self._skip(market, "bot_off")
             return
         window = window_seconds(series_of(market.slug))
         open_ms = round_open_ms(market.slug, market.end_ts_ms, window)
