@@ -127,7 +127,7 @@ def run_paper(
         notes.append(text)
         _stderr(text)
 
-    feed = _start_binance(config, engine, note)
+    feeds = _start_price_feeds(config, engine, note)
     public_ok = True
     polls = 0
     try:
@@ -148,7 +148,7 @@ def run_paper(
             polls,
         )
     finally:
-        if feed is not None:
+        for feed in feeds:
             feed.stop()
 
 
@@ -445,19 +445,31 @@ def _write_run_files(
     return summary
 
 
-def _start_binance(config, engine, note):
-    """Public BTC trade stream. Only small_pair with the lean flag connects."""
+def _start_price_feeds(config, engine, note) -> list:
+    """Public prices for the paper filter. The default source is Binance only."""
     if not getattr(config, "small_pair_binance", False):
-        return None
+        return []
     if str(getattr(config, "strategy", "") or "") != "small_pair":
-        return None
-    from paper_split_maker.binance_btc import BinanceBtcFeed
+        return []
+    source = getattr(config, "price_source", "binance") or "binance"
+    started = []
+    if source in {"binance", "combined"}:
+        from paper_split_maker.binance_btc import BinanceBtcFeed
 
-    feed = BinanceBtcFeed(lookback_s=int(config.small_pair_vol_lookback_seconds))
-    engine.binance_feed = feed
-    feed.start()
-    note("binance btc feed started (public trade stream, no orders)")
-    return feed
+        feed = BinanceBtcFeed(lookback_s=int(config.small_pair_vol_lookback_seconds))
+        engine.binance_feed = feed
+        feed.start()
+        note("binance btc feed started (public trade stream, no orders)")
+        started.append(feed)
+    if source in {"chainlink", "combined"}:
+        from paper_split_maker.chainlink_btc import ChainlinkBtcFeed
+
+        link = ChainlinkBtcFeed(poll_s=int(config.chainlink_poll_seconds))
+        engine.chainlink_feed = link
+        link.start()
+        note("chainlink btc/usd feed started (public bnb aggregator, no orders)")
+        started.append(link)
+    return started
 
 
 def sessions_due(series: str, now_s: int, lead: int, *, include_current: bool) -> list[str]:

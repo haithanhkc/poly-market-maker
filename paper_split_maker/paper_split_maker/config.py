@@ -170,6 +170,14 @@ class Config:
     session_budget_cap: Decimal = Decimal("25")
     session_budget_fraction: Decimal = Decimal("0.25")
     session_budget_min: Decimal = Decimal("1")
+    # binance keeps the current filter. chainlink or combined opt into the blend.
+    price_source: str = "binance"
+    # |binance - chainlink| / chainlink above this widens the adverse gap.
+    small_pair_price_disagree: Decimal = Decimal("0.001")
+    small_pair_disagree_gap: Decimal = Decimal("0.04")
+    # The on-chain aggregator is fresh for this long after updatedAt.
+    chainlink_stale_seconds: int = 3600
+    chainlink_poll_seconds: int = 5
     ladder_levels: int = 3
     ladder_spacing: Decimal = Decimal("0.01")
     # Join the touch on a side once its mid is this far below the other.
@@ -347,6 +355,18 @@ class Config:
             raise ConfigError("session_budget_min must be positive")
         if self.session_budget_min > self.session_budget_cap:
             raise ConfigError("session_budget_min cannot exceed session_budget_cap")
+        if self.price_source not in {"binance", "chainlink", "combined"}:
+            raise ConfigError("price_source must be binance, chainlink, or combined")
+        if self.small_pair_price_disagree <= 0 or self.small_pair_price_disagree >= 1:
+            raise ConfigError("small_pair_price_disagree must sit inside (0, 1)")
+        if self.small_pair_disagree_gap < self.small_pair_adverse_gap_stale:
+            raise ConfigError("small_pair_disagree_gap must be at least the stale gap")
+        if self.small_pair_disagree_gap >= 1:
+            raise ConfigError("small_pair_disagree_gap must be below 1")
+        if self.chainlink_stale_seconds < 1:
+            raise ConfigError("chainlink_stale_seconds must be at least 1")
+        if self.chainlink_poll_seconds < 1:
+            raise ConfigError("chainlink_poll_seconds must be at least 1")
         if self.ladder_levels < 1:
             raise ConfigError("ladder_levels must be at least 1")
         if self.ladder_spacing <= 0:
@@ -452,6 +472,8 @@ _DECIMAL_FIELDS = {
     "session_budget_cap",
     "session_budget_fraction",
     "session_budget_min",
+    "small_pair_price_disagree",
+    "small_pair_disagree_gap",
 }
 _INT_FIELDS = {
     "stale_after_ms",
@@ -486,6 +508,8 @@ _INT_FIELDS = {
     "small_pair_vol_lookback_seconds",
     "small_pair_start_seconds",
     "small_pair_late_loser_seconds",
+    "chainlink_stale_seconds",
+    "chainlink_poll_seconds",
 }
 _BOOL_FIELDS = {
     "trade_through_fills",
@@ -540,6 +564,10 @@ def config_from_mapping(data: dict) -> Config:
             kwargs[key] = tuple(value)
         elif key == "small_pair_series":
             kwargs[key] = parse_series_list(value)
+        elif key == "price_source":
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError("price_source must be a string")
+            kwargs[key] = value.strip()
         elif key == "small_pair_neutral_mode":
             if not isinstance(value, str) or not value.strip():
                 raise ConfigError("small_pair_neutral_mode must be a string")

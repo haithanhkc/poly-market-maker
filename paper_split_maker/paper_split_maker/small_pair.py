@@ -383,6 +383,12 @@ def _fill_edge_avg(market: Market):
     return money(total / Decimal(count))
 
 
+def _money_or_none(value):
+    if value is None:
+        return None
+    return money(value)
+
+
 def _age_text(value) -> str | None:
     if value is None:
         return None
@@ -424,6 +430,13 @@ def _binance_report(market: Market) -> dict:
         "fill_fair_minus_price_avg": _fill_edge_avg(market),
         "fill_fair_n": int(getattr(market, "fill_edge_n", 0) or 0),
         "binance_age_s": _age_text(getattr(market, "last_binance_age_s", None)),
+        "binance_price": _money_or_none(getattr(market, "last_binance", None)),
+        "chainlink_price": _money_or_none(getattr(market, "last_chainlink", None)),
+        "chainlink_age_s": _age_text(getattr(market, "last_chainlink_age_s", None)),
+        "price_gap": _money_or_none(getattr(market, "last_price_gap", None)),
+        "combined_price": _money_or_none(getattr(market, "last_combined", None)),
+        "price_spot_source": getattr(market, "price_spot_source", "") or None,
+        "price_widen": bool(getattr(market, "price_widen", False)),
     }
 
 

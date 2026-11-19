@@ -101,6 +101,9 @@ class Engine:
         # the default and writes state after every event.
         self.persist_each_event = True
         self.binance_feed = None
+        self.chainlink_feed = None
+        self._chainlink_anchor_ms = None
+        self._chainlink_anchor_px = None
 
     @classmethod
     def create(
@@ -1234,6 +1237,15 @@ class Engine:
             spot, s0, fair, age_binance = self._apply_binance_lean(
                 market, open_ms, window, age_s, up_bid, up_ask
             )
+        adverse_gap = self.config.small_pair_adverse_gap
+        adverse_stale = self.config.small_pair_adverse_gap_stale
+        age_for_plan = age_binance
+        if getattr(market, "price_widen", False):
+            wider = self.config.small_pair_disagree_gap
+            if wider > adverse_stale:
+                adverse_stale = wider
+            adverse_gap = adverse_stale
+            age_for_plan = 0
         plan = plan_small_pair(
             up_bid=up_bid,
             up_ask=up_ask,
@@ -1256,9 +1268,9 @@ class Engine:
             loser_fair=self.config.small_pair_loser_fair,
             loser_after_s=self.config.small_pair_loser_after_seconds,
             binance_filter=bool(self.config.small_pair_binance),
-            adverse_gap=self.config.small_pair_adverse_gap,
-            adverse_gap_stale=self.config.small_pair_adverse_gap_stale,
-            binance_age_s=age_binance,
+            adverse_gap=adverse_gap,
+            adverse_gap_stale=adverse_stale,
+            binance_age_s=age_for_plan,
             stale_after_s=self.config.small_pair_stale_seconds,
             favorite_excess=self.config.small_pair_favorite_excess,
             underdog_excess=self.config.small_pair_underdog_excess,
@@ -1284,10 +1296,11 @@ class Engine:
     def _apply_binance_lean(self, market, open_ms, window, age_s, up_bid, up_ask):
         """Record S0, fair value, and the gap. Returns spot, S0, and P(Up)."""
         from paper_split_maker.binance_btc import fair_up
+        from paper_split_maker.price_blend import combine_prices
 
         feed = self.binance_feed
         latest = feed.latest() if feed is not None else None
-        spot = latest[1] if latest else None
+        binance_px = latest[1] if latest else None
         age_binance = None
         if latest is not None:
             age_binance = (self.state.now_ms - int(latest[0])) / 1000
@@ -1295,14 +1308,63 @@ class Engine:
                 age_binance = 0
             market.last_binance_ts_ms = int(latest[0])
             market.last_binance_age_s = Decimal(str(round(age_binance, 3)))
+        mode = getattr(self.config, "price_source", "binance") or "binance"
+        link_px = None
+        link_age = None
+        anchor = None
+        link_feed = self.chainlink_feed
+        link_latest = link_feed.latest() if link_feed is not None else None
+        if link_latest is not None:
+            link_px = link_latest[1]
+            link_age = (self.state.now_ms - int(link_latest[0])) / 1000
+            if link_age < 0:
+                link_age = 0
+            if self._chainlink_anchor_ms != int(link_latest[0]):
+                self._chainlink_anchor_ms = int(link_latest[0])
+                snapped = None
+                if feed is not None:
+                    snapped = feed.price_at(int(link_latest[0]))
+                    if snapped is None and latest is not None:
+                        snapped = latest[1]
+                self._chainlink_anchor_px = snapped
+            anchor = self._chainlink_anchor_px
+        view = combine_prices(
+            mode=mode,
+            binance=binance_px,
+            chainlink=link_px,
+            binance_at_chainlink=anchor,
+            binance_age_s=age_binance,
+            chainlink_age_s=link_age,
+            binance_stale_s=self.config.small_pair_stale_seconds,
+            chainlink_stale_s=self.config.chainlink_stale_seconds,
+            disagree_fraction=self.config.small_pair_price_disagree,
+        )
+        spot = binance_px if mode == "binance" else view.spot
+        market.price_widen = bool(view.widen) and mode != "binance"
+        market.last_binance = binance_px
+        market.last_chainlink = link_px
+        market.last_chainlink_age_s = (
+            Decimal(str(round(link_age, 3))) if link_age is not None else None
+        )
+        market.last_price_gap = view.price_gap
+        market.last_combined = view.spot if mode == "combined" else None
+        market.price_spot_source = view.spot_source
         if (
             (market.reference_price is None or market.reference_price <= 0)
-            and spot is not None
             and self.state.now_ms >= open_ms
         ):
-            at_open = feed.price_at(open_ms) if feed is not None else None
-            market.reference_price = at_open or spot
-            market.reference_source = "binance"
+            if mode == "binance" and spot is not None:
+                at_open = feed.price_at(open_ms) if feed is not None else None
+                market.reference_price = at_open or spot
+                market.reference_source = "binance"
+            elif mode != "binance":
+                basis = link_px if link_px is not None else spot
+                if basis is not None:
+                    at_open = (
+                        link_feed.price_at(open_ms) if link_feed is not None and link_px is not None else None
+                    )
+                    market.reference_price = at_open or basis
+                    market.reference_source = "chainlink" if link_px is not None else (view.spot_source or mode)
         if market.reference_price and not market.reference_logged:
             market.reference_logged = True
             print(
@@ -1347,7 +1409,8 @@ class Engine:
             market.fair_gap_n += 1
             if width > market.fair_gap_max:
                 market.fair_gap_max = width
-        market.last_binance = spot
+        if getattr(self.config, "price_source", "binance") == "binance":
+            market.last_binance = spot
         market.last_fair_up = fair
         market.last_mid_up = mid
         market.last_gap = gap
@@ -1361,6 +1424,16 @@ class Engine:
             f"gap={gap if gap is not None else '-'} "
             f"action={action or '-'}"
         )
+        if getattr(self.config, "price_source", "binance") != "binance":
+            detail += (
+                f" binance={market.last_binance if market.last_binance is not None else '-'} "
+                f"chainlink={market.last_chainlink if market.last_chainlink is not None else '-'} "
+                f"link_age_s={market.last_chainlink_age_s if market.last_chainlink_age_s is not None else '-'} "
+                f"price_gap={market.last_price_gap if market.last_price_gap is not None else '-'} "
+                f"combined={market.last_combined if market.last_combined is not None else '-'} "
+                f"spot_source={market.price_spot_source or '-'} "
+                f"widen={1 if market.price_widen else 0}"
+            )
         print(
             f"binance_lean {market.slug or market.market_id} {detail}",
             file=sys.stderr,

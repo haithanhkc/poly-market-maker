@@ -150,6 +150,12 @@ class Market:
     fill_edge_n: int = 0
     last_binance_age_s: Optional[Decimal] = None
     last_binance_ts_ms: int = 0
+    last_chainlink: Optional[Decimal] = None
+    last_chainlink_age_s: Optional[Decimal] = None
+    last_price_gap: Optional[Decimal] = None
+    last_combined: Optional[Decimal] = None
+    price_spot_source: str = ""
+    price_widen: bool = False
 
     def inventory(self, outcome: str) -> Decimal:
         return self.up if outcome == "up" else self.down
@@ -237,6 +243,16 @@ class Market:
                 money(self.last_binance_age_s) if self.last_binance_age_s is not None else None
             ),
             "last_binance_ts_ms": self.last_binance_ts_ms,
+            "last_chainlink": money(self.last_chainlink) if self.last_chainlink else None,
+            "last_chainlink_age_s": (
+                money(self.last_chainlink_age_s)
+                if self.last_chainlink_age_s is not None
+                else None
+            ),
+            "last_price_gap": money(self.last_price_gap) if self.last_price_gap is not None else None,
+            "last_combined": money(self.last_combined) if self.last_combined else None,
+            "price_spot_source": self.price_spot_source,
+            "price_widen": self.price_widen,
         }
 
     @classmethod
@@ -322,6 +338,12 @@ class Market:
             fill_edge_n=int(data.get("fill_edge_n", 0) or 0),
             last_binance_age_s=_optional_decimal(data.get("last_binance_age_s")),
             last_binance_ts_ms=int(data.get("last_binance_ts_ms", 0) or 0),
+            last_chainlink=_optional_decimal(data.get("last_chainlink")),
+            last_chainlink_age_s=_optional_decimal(data.get("last_chainlink_age_s")),
+            last_price_gap=_optional_decimal(data.get("last_price_gap")),
+            last_combined=_optional_decimal(data.get("last_combined")),
+            price_spot_source=str(data.get("price_spot_source") or ""),
+            price_widen=bool(data.get("price_widen", False)),
         )
 
 

@@ -83,6 +83,15 @@ def main(argv: list[str] | None = None) -> int:
             "filter small_pair bids with the public Binance fair value. Off by default."
         ),
     )
+    parser.add_argument(
+        "--price-source",
+        choices=("binance", "chainlink", "combined"),
+        default=None,
+        help=(
+            "btc price for the fair-value filter. Default binance. "
+            "combined uses the Chainlink level plus the Binance move."
+        ),
+    )
     parser.add_argument("--live", action="store_true")
     parser.add_argument(
         "--check-connection",
@@ -146,6 +155,9 @@ def _apply_strategy(config, args):
         config.small_pair_series = parse_series_list(chosen)
     if getattr(args, "binance_lean", False):
         config.small_pair_binance = True
+    source = getattr(args, "price_source", None)
+    if source:
+        config.price_source = source
     _honor_bankroll(config, args)
     return config
 

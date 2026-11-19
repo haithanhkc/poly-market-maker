@@ -74,6 +74,13 @@ cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
 .\run_smallpair_bn100.ps1
 ```
 
+`--price-source` chooses the BTC print for that filter. The default is `binance`, which is what `run_smallpair_bn100.ps1` uses. `combined` reads the public Chainlink BTC/USD aggregator on BNB Chain (`0x264990fbd0A4796A3E3d8E37C4d5F87a3aCa5Ebf`) and adds the Binance move since that print. predict.fun's own price-to-beat stays the round open when the payload has one. If the two prices differ by more than 0.10%, or either print is stale, the adverse gap widens from 0.02 to 0.04. Each decision logs both prices, the gap, and the combined fair value. `run_smallpair_combo100.ps1` writes `runs\smallpair_combo100` and does not touch the Binance-only directory.
+
+```powershell
+cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
+.\run_smallpair_combo100.ps1
+```
+
 Check the key, the login, and the USDT balance without placing an order. The JSON it prints does not contain the key or the JWT:
 
 ```powershell
