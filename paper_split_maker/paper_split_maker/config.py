@@ -175,6 +175,9 @@ class Config:
     # |binance - chainlink| / chainlink above this widens the adverse gap.
     small_pair_price_disagree: Decimal = Decimal("0.001")
     small_pair_disagree_gap: Decimal = Decimal("0.04")
+    # Combined mode subtracts this from the pair sum only when a feed is stale
+    # or the de-biased Binance/Chainlink residual is abnormal.
+    small_pair_widen_extra: Decimal = Decimal("0.02")
     # The on-chain aggregator is fresh for this long after updatedAt.
     chainlink_stale_seconds: int = 3600
     chainlink_poll_seconds: int = 5
@@ -363,6 +366,8 @@ class Config:
             raise ConfigError("small_pair_disagree_gap must be at least the stale gap")
         if self.small_pair_disagree_gap >= 1:
             raise ConfigError("small_pair_disagree_gap must be below 1")
+        if self.small_pair_widen_extra < 0 or self.small_pair_widen_extra > Decimal("0.06"):
+            raise ConfigError("small_pair_widen_extra must sit inside [0, 0.06]")
         if self.chainlink_stale_seconds < 1:
             raise ConfigError("chainlink_stale_seconds must be at least 1")
         if self.chainlink_poll_seconds < 1:
@@ -474,6 +479,7 @@ _DECIMAL_FIELDS = {
     "session_budget_min",
     "small_pair_price_disagree",
     "small_pair_disagree_gap",
+    "small_pair_widen_extra",
 }
 _INT_FIELDS = {
     "stale_after_ms",

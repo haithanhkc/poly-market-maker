@@ -156,6 +156,10 @@ class Market:
     last_combined: Optional[Decimal] = None
     price_spot_source: str = ""
     price_widen: bool = False
+    last_basis: Optional[Decimal] = None
+    last_residual: Optional[Decimal] = None
+    last_up_target: Optional[Decimal] = None
+    last_down_target: Optional[Decimal] = None
 
     def inventory(self, outcome: str) -> Decimal:
         return self.up if outcome == "up" else self.down
@@ -253,6 +257,16 @@ class Market:
             "last_combined": money(self.last_combined) if self.last_combined else None,
             "price_spot_source": self.price_spot_source,
             "price_widen": self.price_widen,
+            "last_basis": money(self.last_basis) if self.last_basis is not None else None,
+            "last_residual": (
+                money(self.last_residual) if self.last_residual is not None else None
+            ),
+            "last_up_target": (
+                money(self.last_up_target) if self.last_up_target is not None else None
+            ),
+            "last_down_target": (
+                money(self.last_down_target) if self.last_down_target is not None else None
+            ),
         }
 
     @classmethod
@@ -344,6 +358,10 @@ class Market:
             last_combined=_optional_decimal(data.get("last_combined")),
             price_spot_source=str(data.get("price_spot_source") or ""),
             price_widen=bool(data.get("price_widen", False)),
+            last_basis=_optional_decimal(data.get("last_basis")),
+            last_residual=_optional_decimal(data.get("last_residual")),
+            last_up_target=_optional_decimal(data.get("last_up_target")),
+            last_down_target=_optional_decimal(data.get("last_down_target")),
         )
 
 

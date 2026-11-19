@@ -104,6 +104,9 @@ class Engine:
         self.chainlink_feed = None
         self._chainlink_anchor_ms = None
         self._chainlink_anchor_px = None
+        from paper_split_maker.price_blend import BasisTracker
+
+        self._basis = BasisTracker()
 
     @classmethod
     def create(
@@ -1240,7 +1243,11 @@ class Engine:
         adverse_gap = self.config.small_pair_adverse_gap
         adverse_stale = self.config.small_pair_adverse_gap_stale
         age_for_plan = age_binance
-        if getattr(market, "price_widen", False):
+        fair_quote = (
+            getattr(self.config, "price_source", "binance") == "combined"
+            and self.config.small_pair_binance
+        )
+        if getattr(market, "price_widen", False) and not fair_quote:
             wider = self.config.small_pair_disagree_gap
             if wider > adverse_stale:
                 adverse_stale = wider
@@ -1279,12 +1286,20 @@ class Engine:
             neutral_target=self.config.small_pair_neutral_target,
             neutral_mode=self.config.small_pair_neutral_mode,
             late_loser_s=self.config.small_pair_late_loser_seconds,
+            fair_quote=fair_quote,
+            widen_pair=bool(getattr(market, "price_widen", False)) and fair_quote,
+            widen_extra=self.config.small_pair_widen_extra,
         )
         if self.config.small_pair_binance:
             for rule, count in plan.filtered:
                 market.filter_counts[rule] = int(market.filter_counts.get(rule, 0)) + int(count)
         if self.config.small_pair_binance:
-            self._log_binance_lean(market, spot, s0, fair, up_bid, up_ask, plan.action or plan.reason)
+            if plan.targets:
+                market.last_up_target = plan.targets[0]
+                market.last_down_target = plan.targets[1]
+            self._log_binance_lean(
+                market, spot, s0, fair, up_bid, up_ask, plan.action or plan.reason
+            )
         if not plan.bids:
             self._cancel_market(market, plan.reason or "no_bid")
             self._skip(market, plan.reason or "no_bid")
@@ -1327,6 +1342,8 @@ class Engine:
                     if snapped is None and latest is not None:
                         snapped = latest[1]
                 self._chainlink_anchor_px = snapped
+                if snapped is not None and link_px is not None:
+                    self._basis.add(int(link_latest[0]), snapped - link_px)
             anchor = self._chainlink_anchor_px
         view = combine_prices(
             mode=mode,
@@ -1338,6 +1355,7 @@ class Engine:
             binance_stale_s=self.config.small_pair_stale_seconds,
             chainlink_stale_s=self.config.chainlink_stale_seconds,
             disagree_fraction=self.config.small_pair_price_disagree,
+            basis=self._basis.median(),
         )
         spot = binance_px if mode == "binance" else view.spot
         market.price_widen = bool(view.widen) and mode != "binance"
@@ -1347,6 +1365,8 @@ class Engine:
             Decimal(str(round(link_age, 3))) if link_age is not None else None
         )
         market.last_price_gap = view.price_gap
+        market.last_basis = view.basis
+        market.last_residual = view.residual
         market.last_combined = view.spot if mode == "combined" else None
         market.price_spot_source = view.spot_source
         if (
@@ -1357,14 +1377,21 @@ class Engine:
                 at_open = feed.price_at(open_ms) if feed is not None else None
                 market.reference_price = at_open or spot
                 market.reference_source = "binance"
+            elif mode == "combined" and spot is not None:
+                market.reference_price = spot
+                market.reference_source = "combined"
             elif mode != "binance":
-                basis = link_px if link_px is not None else spot
-                if basis is not None:
+                basis_px = link_px if link_px is not None else spot
+                if basis_px is not None:
                     at_open = (
-                        link_feed.price_at(open_ms) if link_feed is not None and link_px is not None else None
+                        link_feed.price_at(open_ms)
+                        if link_feed is not None and link_px is not None
+                        else None
                     )
-                    market.reference_price = at_open or basis
-                    market.reference_source = "chainlink" if link_px is not None else (view.spot_source or mode)
+                    market.reference_price = at_open or basis_px
+                    market.reference_source = (
+                        "chainlink" if link_px is not None else (view.spot_source or mode)
+                    )
         if market.reference_price and not market.reference_logged:
             market.reference_logged = True
             print(
@@ -1432,7 +1459,13 @@ class Engine:
                 f"price_gap={market.last_price_gap if market.last_price_gap is not None else '-'} "
                 f"combined={market.last_combined if market.last_combined is not None else '-'} "
                 f"spot_source={market.price_spot_source or '-'} "
-                f"widen={1 if market.price_widen else 0}"
+                f"basis={market.last_basis if market.last_basis is not None else '-'} "
+                f"residual={market.last_residual if market.last_residual is not None else '-'} "
+                f"widen={1 if market.price_widen else 0} "
+                f"up_target={market.last_up_target if market.last_up_target is not None else '-'} "
+                f"up_best={up_bid if up_bid is not None else '-'} "
+                f"down_target={market.last_down_target if market.last_down_target is not None else '-'} "
+                f"down_best={market.down_book.best_bid() if market.down_book.best_bid() is not None else '-'}"
             )
         print(
             f"binance_lean {market.slug or market.market_id} {detail}",

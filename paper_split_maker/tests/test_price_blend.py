@@ -29,31 +29,88 @@ def _view(**overrides):
         binance_stale_s=2,
         chainlink_stale_s=3600,
         disagree_fraction=Decimal("0.001"),
+        basis=None,
     )
     values.update(overrides)
     return combine_prices(**values)
 
 
-def test_combined_spot_is_the_chainlink_level_plus_the_binance_move():
-    view = _view()
-    assert view.spot == Decimal("100030")
-    assert view.spot_source == "combined"
-    assert view.price_gap == Decimal("40")
-    assert view.disagree is False
-    assert view.widen is False
+def test_structural_basis_is_removed_and_the_binance_move_is_kept():
+    steady = _view(
+        binance=Decimal("100120"),
+        binance_at_chainlink=Decimal("100120"),
+        basis=Decimal("120"),
+    )
+    assert steady.spot == Decimal("100120")
+    assert steady.residual == Decimal("0")
+    assert steady.disagree is False
+    assert steady.widen is False
+    moved = _view(basis=Decimal("10"))
+    assert moved.spot == Decimal("100040")
+    assert moved.residual == Decimal("0")
+    assert moved.widen is False
 
 
-def test_disagreement_or_a_stale_feed_widens():
-    rich = _view(binance=Decimal("101200"))
+def test_only_a_real_residual_or_a_stale_feed_widens():
+    rich = _view(
+        binance=Decimal("101200"),
+        binance_at_chainlink=Decimal("101200"),
+        basis=Decimal("10"),
+    )
+    assert rich.residual == Decimal("1190")
     assert rich.disagree is True
     assert rich.widen is True
-    stale = _view(binance_age_s=3)
+    stale = _view(binance_age_s=3, basis=Decimal("10"))
     assert stale.disagree is False
     assert stale.widen is True
     missing = _view(chainlink=None, binance_at_chainlink=None)
     assert missing.spot == Decimal("100040")
     assert missing.spot_source == "binance"
     assert missing.widen is True
+
+
+def test_fair_targets_quote_both_sides_under_the_pair_sum():
+    from paper_split_maker.price_blend import fair_side_targets
+    from paper_split_maker.small_pair import plan_small_pair
+
+    up, down = fair_side_targets(Decimal("0.62"), Decimal("0.96"), Decimal("0.01"))
+    assert up > Decimal("0.5")
+    assert down < Decimal("0.5")
+    assert up + down <= Decimal("0.96")
+    assert up <= Decimal("0.62")
+    assert down <= Decimal("0.38")
+    plan = plan_small_pair(
+        up_bid=Decimal("0.55"),
+        up_ask=Decimal("0.70"),
+        up_levels=[],
+        down_bid=Decimal("0.45"),
+        down_ask=Decimal("0.70"),
+        down_levels=[],
+        tick=Decimal("0.01"),
+        up_shares=Decimal("0"),
+        down_shares=Decimal("0"),
+        budget_left=Decimal("25"),
+        age_s=40,
+        window_s=300,
+        fair_up=Decimal("0.62"),
+        binance_filter=True,
+        binance_age_s=0,
+        fair_quote=True,
+        neutral_band=Decimal("0.10"),
+    )
+    sides = {bid.outcome for bid in plan.bids}
+    assert sides == {"up", "down"}
+    tops = {}
+    for bid in plan.bids:
+        tops[bid.outcome] = max(tops.get(bid.outcome, Decimal("0")), bid.price)
+    assert tops["up"] + tops["down"] <= Decimal("0.96")
+    assert tops["down"] <= Decimal("0.38")
+    assert tops["down"] < Decimal("0.45")
+    assert plan.action == "fair_quote"
+    down_count = sum(1 for bid in plan.bids if bid.outcome == "down")
+    up_count = sum(1 for bid in plan.bids if bid.outcome == "up")
+    assert down_count >= 1
+    assert down_count < up_count
 
 
 def test_binance_mode_ignores_chainlink():
@@ -145,18 +202,23 @@ def test_engine_logs_both_prices_and_the_combined_spot(tmp_path, capsys):
     market = engine.state.markets["m1"]
     assert market.reference_source == "predict"
     assert market.reference_price == Decimal("100000")
-    assert market.last_combined == Decimal("100030")
+    assert market.last_combined == Decimal("100040")
+    assert market.last_basis == Decimal("10")
+    assert market.last_residual == Decimal("0")
     assert market.last_fair_up is not None
     assert market.price_widen is False
+    assert market.last_up_target is not None
+    assert market.last_down_target is not None
     text = capsys.readouterr().err
     assert "binance=100040" in text
     assert "chainlink=100000" in text
-    assert "price_gap=40" in text
-    assert "combined=100030" in text
-    assert "fair_up=" in text
+    assert "combined=100040" in text
+    assert "up_target=" in text
+    assert "down_target=" in text
+    assert "up_best=" in text
     row = round_report(market)
-    assert Decimal(row["combined_price"]) == Decimal("100030")
-    assert Decimal(row["price_gap"]) == Decimal("40")
+    assert Decimal(row["combined_price"]) == Decimal("100040")
+    assert Decimal(row["residual"]) == Decimal("0")
 
 
 def test_cli_price_source_defaults_to_binance(tmp_path, monkeypatch):

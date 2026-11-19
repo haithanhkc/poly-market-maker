@@ -38,6 +38,7 @@ class Plan:
     reason: str = ""
     action: str = ""
     filtered: tuple[tuple[str, int], ...] = ()
+    targets: tuple = ()
 
 
 def quiet_after(window_s: int) -> int:
@@ -82,6 +83,20 @@ def _size_at(levels, price: Decimal) -> Decimal:
         if level_price == price:
             total += size
     return total
+
+
+def _clip_target(target, best_bid, ask, tick: Decimal):
+    """Post the fair target. Never cross the ask or pay more than the target."""
+    if target is None or tick <= 0:
+        return None
+    price = _floor_tick(target, tick)
+    if ask is not None and price >= ask:
+        price = _floor_tick(ask - tick, tick)
+    if best_bid is not None and price > target:
+        price = _floor_tick(target, tick)
+    if not _post_only(price, ask):
+        return None
+    return price
 
 
 def _post_only(price: Decimal, ask: Decimal | None) -> bool:
@@ -220,6 +235,9 @@ def plan_small_pair(
     neutral_target: Decimal = Decimal("0.94"),
     neutral_mode: str = "sum",
     late_loser_s: int = 240,
+    fair_quote: bool = False,
+    widen_pair: bool = False,
+    widen_extra: Decimal = Decimal("0.02"),
 ) -> Plan:
     """Bids for this heartbeat, plus a short reason when a rule binds.
 
@@ -227,7 +245,9 @@ def plan_small_pair(
     ``target``. With the filter, fair value does not move the centre. It drops
     bids that sit too far above fair, stops a losing side, and widens the
     imbalance cap only for the side that is ahead on the Binance probability.
-    ``fair_gap`` is accepted so older callers still load. It is not used.
+    ``fair_quote`` keeps both sides and sets each top bid from fair value
+    minus its edge, so the pair sum stays at or under the target. ``fair_gap``
+    is accepted so older callers still load. It is not used.
     """
     del fair_gap
     if age_s < int(start_s):
@@ -259,13 +279,34 @@ def plan_small_pair(
         else:
             active_target = neutral_target
             lean = "neutral_sum"
-    half = (Decimal("1") - active_target) / 2
-    raw_up = _on_tick(mid - half, tick)
-    raw_down = active_target - raw_up
-    touch = fit_pair(raw_up, raw_down, up_ask, down_ask, tick, active_target)
-    if touch is None:
-        return Plan([], "cross")
-    up_touch, down_touch = touch
+    quoted_targets: tuple[Decimal, Decimal] | None = None
+    use_fair_prices = (
+        fair_quote
+        and fair_up is not None
+        and Decimal("0") < fair_up < Decimal("1")
+    )
+    if use_fair_prices and widen_pair and widen_extra > 0:
+        active_target = active_target - widen_extra
+        if active_target < Decimal("0.90"):
+            active_target = Decimal("0.90")
+    if use_fair_prices:
+        from paper_split_maker.price_blend import fair_side_targets
+
+        up_raw, down_raw = fair_side_targets(fair_up, active_target, tick)
+        up_touch = _clip_target(up_raw, up_bid, up_ask, tick)
+        down_touch = _clip_target(down_raw, down_bid, down_ask, tick)
+        if up_touch is None and down_touch is None:
+            return Plan([], "cross", "fair_quote", (), (up_raw, down_raw))
+        quoted_targets = (up_raw, down_raw)
+        lean = "fair_quote"
+    else:
+        half = (Decimal("1") - active_target) / 2
+        raw_up = _on_tick(mid - half, tick)
+        raw_down = active_target - raw_up
+        touch = fit_pair(raw_up, raw_down, up_ask, down_ask, tick, active_target)
+        if touch is None:
+            return Plan([], "cross")
+        up_touch, down_touch = touch
     allowed = {"up", "down"}
     reason = ""
     removed: dict[str, str] = {}
@@ -307,6 +348,8 @@ def plan_small_pair(
             if side not in allowed or side in removed:
                 continue
             probability = fair_up if side == "up" else Decimal("1") - fair_up
+            if use_fair_prices:
+                continue
             if age_s >= int(late_loser_s) and probability < Decimal("0.5"):
                 allowed.discard(side)
                 removed[side] = "late_loser"
@@ -333,10 +376,18 @@ def plan_small_pair(
         for side in ("up", "down"):
             if side not in allowed:
                 continue
-            price = touches[side] - (tick * step)
+            touch = touches[side]
+            if touch is None:
+                continue
+            if use_fair_prices and fair_up is not None:
+                fair_here = fair_up if side == "up" else Decimal("1") - fair_up
+                risky_steps = max(1, int(levels) // 2)
+                if fair_here < Decimal("0.45") and step >= risky_steps:
+                    continue
+            price = touch - (tick * step)
             if not _post_only(price, asks[side]):
                 continue
-            if fair_ok:
+            if fair_ok and not use_fair_prices:
                 fair_side = fair_up if side == "up" else Decimal("1") - fair_up
                 if price - fair_side > gap:
                     counts["adverse"] = counts.get("adverse", 0) + 1
@@ -363,10 +414,10 @@ def plan_small_pair(
     if not bids:
         empty = "budget" if trimmed else (reason or "no_bid")
         kept = lean if lean != "mid" else ""
-        return Plan([], empty, kept, filtered)
+        return Plan([], empty, kept, filtered, quoted_targets or ())
     if trimmed and not reason:
         reason = "budget"
-    return Plan(bids, reason, lean, filtered)
+    return Plan(bids, reason, lean, filtered, quoted_targets or ())
 
 
 def _avg(shares: Decimal, cost: Decimal) -> Decimal | None:
@@ -437,6 +488,10 @@ def _binance_report(market: Market) -> dict:
         "combined_price": _money_or_none(getattr(market, "last_combined", None)),
         "price_spot_source": getattr(market, "price_spot_source", "") or None,
         "price_widen": bool(getattr(market, "price_widen", False)),
+        "basis": _money_or_none(getattr(market, "last_basis", None)),
+        "residual": _money_or_none(getattr(market, "last_residual", None)),
+        "up_target": _money_or_none(getattr(market, "last_up_target", None)),
+        "down_target": _money_or_none(getattr(market, "last_down_target", None)),
     }
 
 
