@@ -9,6 +9,7 @@ latency and only while the feed is up.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -125,6 +126,14 @@ class Engine:
         self.persist_gap_s = 0.0
         self._last_persist = 0.0
         self._lean_log_at: dict[str, tuple] = {}
+        # The fast loop sets this. Events only queue rows. A writer thread
+        # owns state.json, the log files, and the dashboard file.
+        self.defer_disk = False
+        self._state_dirty = False
+        self._pending_logs: list[dict] = []
+        self._io_lock = threading.Lock()
+        self._quiet_trades = False
+        self.dashboard = None
 
     @classmethod
     def create(
@@ -250,6 +259,60 @@ class Engine:
         self._finish()
         return list(self._batch)
 
+    def absorb_public_trades(self, events: list[dict]) -> list[dict]:
+        """Apply a REST match page in one pass and emit one row.
+
+        Each print used to call ``handle_event``, and each call rewrote
+        ``state.json`` and the dashboard on this thread. Ignored prints
+        stay in memory. A fill still emits, because the blotter needs it.
+        """
+        self._batch = []
+        if not events:
+            self._finish()
+            return []
+        ignored = 0
+        self._quiet_trades = True
+        try:
+            for event in events:
+                if not isinstance(event, dict) or event.get("type") != "trade":
+                    ignored += 1
+                    continue
+                event_id = event.get("event_id")
+                if event_id is not None:
+                    event_id = str(event_id)
+                    if event_id in self.state.applied_event_ids:
+                        ignored += 1
+                        continue
+                    self.state.applied_event_ids.add(event_id)
+                if event.get("ts") is not None:
+                    try:
+                        stamp = int(event["ts"])
+                    except (TypeError, ValueError):
+                        ignored += 1
+                        continue
+                    if stamp >= self.state.now_ms:
+                        self.state.now_ms = stamp
+                        self._promote()
+                before = len(self._batch)
+                self._on_trade(event)
+                if len(self._batch) == before:
+                    ignored += 1
+        finally:
+            self._quiet_trades = False
+        market = None
+        if events:
+            market = self.state.markets.get(str(events[0].get("market_id") or ""))
+        self._emit(
+            kind="trade_batch",
+            market=market,
+            reason="public",
+            detail=f"n={len(events)} ignored={ignored}",
+        )
+        self._note_cap()
+        self.assert_invariants()
+        self._finish()
+        return list(self._batch)
+
     def summary(self, notes: Optional[list[str]] = None) -> dict:
         from paper_split_maker.logs import build_summary
 
@@ -258,6 +321,12 @@ class Engine:
         )
 
     def _finish(self) -> None:
+        if getattr(self, "defer_disk", False):
+            with self._io_lock:
+                if self._batch:
+                    self._pending_logs.extend(self._batch)
+                self._state_dirty = True
+            return
         if self.writer is not None:
             self.writer.write(self._batch)
         if self.state_path is None or not self.persist_each_event:
@@ -315,6 +384,13 @@ class Engine:
         }
         if fields:
             row["extra"] = {key: _jsonable(value) for key, value in fields.items()}
+        if getattr(self, "_quiet_trades", False) and kind in {
+            "trade_ignored",
+            "queue_consume",
+            "duplicate_trade",
+            "duplicate_event",
+        }:
+            return
         self._batch.append(row)
         for listener in self.listeners:
             try:
@@ -531,7 +607,9 @@ class Engine:
         )
         if open_count >= self.config.max_open_markets:
             self._emit(
-                kind="reject", reason="max_open_markets", detail=market.market_id
+                kind="reject",
+                reason="max_open_markets",
+                detail=market.market_id,
             )
             return
         for item in self.state.markets.values():
@@ -2642,9 +2720,24 @@ class Engine:
             )
         return True
 
+    def _past_resolve_grace(self, market: Market) -> bool:
+        """True once a still-open round may be marked unresolved.
+
+        small_pair keeps the window open for 10 minutes so a resolution
+        that arrives after the close can still redeem. The slot is already
+        free because ``_holds_slot`` releases a market at its end time.
+        """
+        end = int(market.end_ts_ms or 0)
+        if end <= 0 or self.state.now_ms < end:
+            return False
+        if self.config.strategy != "small_pair":
+            return True
+        return self.state.now_ms >= end + 600_000
+
     def _refresh_expiry(self, market: Market) -> None:
-        if market.status == "open" and self.state.now_ms >= market.end_ts_ms:
+        if market.status == "open" and self._past_resolve_grace(market):
             market.status = "expired_unresolved"
+            market.reserve_active = False
             self._emit(kind="expiry", market=market, reason="expired_unresolved")
 
     def _small_pair_start_seconds(self) -> int:
@@ -2849,9 +2942,10 @@ class Engine:
                 market.reserve_active = False
                 continue
             if market.status == "open" and market.end_ts_ms and now >= market.end_ts_ms:
-                market.status = "expired_unresolved"
                 market.reserve_active = False
-                self._emit(kind="expiry", market=market, reason="expired_unresolved")
+                if self._past_resolve_grace(market):
+                    market.status = "expired_unresolved"
+                    self._emit(kind="expiry", market=market, reason="expired_unresolved")
 
     def _feeds_ok(self, market: Market) -> bool:
         return (

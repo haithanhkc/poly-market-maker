@@ -630,9 +630,52 @@ def test_expired_rounds_do_not_block_the_next_session(tmp_path):
         fresh,
         [market_event("live", end_ts=8_000, ts=2_000, event_id="open-live")],
     )
-    assert fresh.state.markets["old"].status == "expired_unresolved"
+    assert fresh.state.markets["old"].status == "open"
     assert "live" in fresh.state.markets
     assert not any(row.get("reason") == "max_open_markets" for row in opened)
+    run(fresh, [{"type": "heartbeat", "event_id": "grace", "ts": 1_000 + 600_000}])
+    assert fresh.state.markets["old"].status == "expired_unresolved"
+
+
+def test_a_trade_page_stays_off_the_disk(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, ack_latency_ms=0, cancel_latency_ms=0)
+    engine.defer_disk = True
+    writes = []
+    monkeypatch.setattr(
+        "paper_split_maker.engine.save_state",
+        lambda *args, **kwargs: writes.append("state"),
+    )
+    run(engine, [_open(), *_books(T0 + 2_000)])
+    seen = []
+    engine.listeners.append(seen.append)
+    trades = [
+        {
+            "type": "trade",
+            "event_id": f"t-{index}",
+            "ts": T0 + 5_000,
+            "market_id": "m1",
+            "outcome": "up",
+            "price": "0.99",
+            "size": "1",
+            "taker_side": "SELL",
+            "trade_id": f"id-{index}",
+        }
+        for index in range(300)
+    ]
+    rows = engine.absorb_public_trades(trades)
+    assert writes == []
+    assert engine.state.markets["m1"].trades_seen == 300
+    assert sum(row["kind"] == "trade_batch" for row in rows) == 1
+    assert not any(row["kind"] == "trade_ignored" for row in rows)
+    assert not any(row["kind"] == "trade_ignored" for row in seen)
+    from paper_split_maker.app import Hub
+
+    hub = Hub(tmp_path / "hub", mode="live", config=engine.config)
+    hub.attach(engine)
+    hub.ingest({"kind": "clock", "ts": T0 + 5_000, "market_id": "m1"})
+    assert not (hub.out / "dashboard.json").exists()
+    hub.flush_disk()
+    assert (hub.out / "dashboard.json").is_file()
 
 
 def test_save_state_retries_a_locked_windows_file(tmp_path, monkeypatch):

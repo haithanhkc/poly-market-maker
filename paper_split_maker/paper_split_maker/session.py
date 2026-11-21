@@ -624,6 +624,65 @@ def _start_watchdog(engine, feed, stop: threading.Event) -> threading.Thread:
     return thread
 
 
+class _DiskWriter:
+    """Write state.json, the event log, and dashboard.json off the decision thread.
+
+    At most one pass per second. The files are replaced atomically.
+    """
+
+    def __init__(self, engine):
+        self.engine = engine
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="paper-disk", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self.flush()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(1.0):
+            self.flush()
+
+    def flush(self) -> None:
+        engine = self.engine
+        with engine._io_lock:
+            rows = engine._pending_logs
+            engine._pending_logs = []
+            dirty = bool(engine._state_dirty)
+            engine._state_dirty = False
+        if rows and engine.writer is not None:
+            try:
+                engine.writer.write(rows)
+            except Exception as exc:
+                engine.listener_error = f"{type(exc).__name__}: {exc}"
+        if dirty and engine.state_path is not None and engine.persist_each_event:
+            try:
+                from paper_split_maker.store import save_state
+
+                save_state(engine.state_path, engine.state)
+            except RuntimeError:
+                with engine._io_lock:
+                    engine._state_dirty = True
+            except Exception as exc:
+                with engine._io_lock:
+                    engine._state_dirty = True
+                engine.listener_error = f"{type(exc).__name__}: {exc}"
+        hub = getattr(engine, "dashboard", None)
+        flush = getattr(hub, "flush_disk", None)
+        if flush is not None:
+            try:
+                flush()
+            except Exception as exc:
+                engine.listener_error = f"{type(exc).__name__}: {exc}"
+
+
 def _paper_fast_loop(
     config,
     out_dir,
@@ -656,8 +715,11 @@ def _paper_fast_loop(
     if transport is not None and float(getattr(transport, "timeout", 0) or 0) > _FAST_HTTP_TIMEOUT_S:
         transport.timeout = _FAST_HTTP_TIMEOUT_S
     engine.persist_gap_s = 1.0
+    engine.defer_disk = True
     engine.stalled = False
     engine.restart_paper = False
+    disk = _DiskWriter(engine)
+    disk.start()
     worker = _RestWorker(reader)
     worker.start()
     stop_watch = threading.Event()
@@ -707,6 +769,9 @@ def _paper_fast_loop(
             if stamp >= engine.state.now_ms:
                 engine.state.now_ms = stamp
             engine._retire_closed()
+            # A fake clock does not block, so yield once and let the REST
+            # thread publish the job queued on the previous pass.
+            time.sleep(0)
             rest_frames, book_error, token_applied = _take_rest(
                 worker, engine, reader, stamp, polls, max_markets, note, opened_slugs
             )
@@ -831,6 +896,7 @@ def _paper_fast_loop(
         stop_reason = "manual"
     finally:
         stop_watch.set()
+        disk.stop()
         worker.stop()
         if own_feed and feed is not None:
             feed.stop()
@@ -942,10 +1008,13 @@ def _apply_market_fetch(engine, stamp, note, market_id, payload, info, resolutio
         "down_token_id": market.down_token_id,
     }
     body = _poll_trades(None, market, note, payload=payload, info=info)
+    trades = []
     for trade in data_api_trade_events(view, body):
         trade["trade_ts"] = trade["ts"]
         trade["ts"] = stamp
-        engine.handle_event(trade)
+        trades.append(trade)
+    if trades:
+        engine.absorb_public_trades(trades)
     if not isinstance(resolution, dict):
         return
     event = data_api_resolution_event(view, resolution)

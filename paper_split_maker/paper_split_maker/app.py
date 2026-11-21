@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import threading
 import time
 import webbrowser
@@ -112,6 +113,7 @@ class Hub:
         engine.quoting_enabled = self.control.enabled()
         if self.ingest not in engine.listeners:
             engine.listeners.append(self.ingest)
+        engine.dashboard = self
 
     def start_live(self) -> None:
         """Run the public-data paper loop until stop or reset.
@@ -180,25 +182,21 @@ class Hub:
         return {"ok": True}
 
     def ingest(self, row: dict) -> None:
+        """Memory only. The disk writer flushes the dashboard off the decision thread."""
         with self.lock:
             self._apply(row)
-            body = self._body()
-        kind = str(row.get("kind") or "")
-        now = time.time()
-        urgent = kind in {
-            "fill",
-            "redeem",
-            "quote_submit",
-            "cancel_confirm",
-            "resolution",
-            "market_open",
-            "order_live",
-        }
-        last = getattr(self, "_last_flush", 0.0)
-        if not urgent and now - last < 0.2:
-            return
-        self._last_flush = now
-        self._write_dashboard(body)
+            self._dirty = True
+
+    def flush_disk(self) -> None:
+        with self.lock:
+            if not getattr(self, "_dirty", False):
+                return
+            try:
+                text = json.dumps(self._body())
+            except RuntimeError:
+                return
+            self._dirty = False
+        self._write_dashboard(text)
         self._notify()
 
     def snapshot(self) -> dict:
@@ -231,8 +229,8 @@ class Hub:
 
     def save(self) -> None:
         with self.lock:
-            body = self._body()
-        self._write_dashboard(body)
+            self._dirty = True
+        self.flush_disk()
 
     def _capital(self) -> float:
         config = self.config
@@ -513,11 +511,22 @@ class Hub:
             "now_ms": self.now_ms,
         }
 
-    def _write_dashboard(self, body: dict) -> None:
+    def _write_dashboard(self, text: str) -> None:
         path = self.out / _DASH
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(body), encoding="utf-8")
-        tmp.replace(path)
+        tmp.write_text(text, encoding="utf-8")
+        last = None
+        for attempt in range(6):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError as exc:
+                last = exc
+                time.sleep(0.05 * (attempt + 1))
+        if last is not None:
+            if self.engine is not None:
+                self.engine.listener_error = f"PermissionError: {last}"
+            print(f"dashboard save skipped: {last}", file=sys.stderr, flush=True)
 
     def _load_dashboard(self) -> None:
         path = self.out / _DASH
