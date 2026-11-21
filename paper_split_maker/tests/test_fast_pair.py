@@ -572,6 +572,120 @@ def test_fast_loop_wakes_on_a_book_and_does_not_sleep_the_poll_interval(tmp_path
     assert live
 
 
+def test_watchdog_stays_quiet_during_startup(tmp_path):
+    engine = _engine(tmp_path, small_pair_fast=True)
+    engine.decision_wall_ms = 1_000
+
+    class Feed:
+        def __init__(self):
+            self.dropped = 0
+
+        def drop(self):
+            self.dropped += 1
+
+    feed = Feed()
+    dumped = []
+    assert (
+        _watch_once(
+            engine,
+            feed,
+            dumped.append,
+            now_ms=10_000,
+            started_ms=8_000,
+        )
+        is False
+    )
+    assert engine.stalled is False
+    assert feed.dropped == 0
+    assert dumped == []
+    assert _watch_once(engine, feed, dumped.append, now_ms=80_000, started_ms=8_000) is True
+    assert feed.dropped == 1
+
+
+def test_expired_rounds_do_not_block_the_next_session(tmp_path):
+    engine = _engine(tmp_path / "held", max_open_markets=1)
+    for index, end in enumerate((1_000, 2_000, 3_000)):
+        run(
+            engine,
+            [
+                market_event(
+                    f"old{index}",
+                    end_ts=end,
+                    ts=0,
+                    event_id=f"open-old{index}",
+                )
+            ],
+        )
+        engine.state.markets[f"old{index}"].status = "expired_unresolved"
+    opened = run(
+        engine,
+        [market_event("live", end_ts=20_000, ts=5_000, event_id="open-live")],
+    )
+    assert "live" in engine.state.markets
+    assert not any(row.get("reason") == "max_open_markets" for row in opened)
+
+    fresh = _engine(tmp_path / "past", max_open_markets=1)
+    run(fresh, [market_event("old", end_ts=1_000, ts=0, event_id="open-old")])
+    opened = run(
+        fresh,
+        [market_event("live", end_ts=8_000, ts=2_000, event_id="open-live")],
+    )
+    assert fresh.state.markets["old"].status == "expired_unresolved"
+    assert "live" in fresh.state.markets
+    assert not any(row.get("reason") == "max_open_markets" for row in opened)
+
+
+def test_save_state_retries_a_locked_windows_file(tmp_path, monkeypatch):
+    import os
+
+    from paper_split_maker.store import save_state
+
+    engine = _engine(tmp_path)
+    calls = {"n": 0}
+    real = os.replace
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(13, "state.json is in use")
+        return real(src, dst)
+
+    monkeypatch.setattr("paper_split_maker.store.os.replace", flaky)
+    save_state(tmp_path / "state.json", engine.state)
+    assert calls["n"] == 3
+    assert (tmp_path / "state.json").is_file()
+
+    def locked(src, dst):
+        raise PermissionError(13, "state.json is in use")
+
+    monkeypatch.setattr("paper_split_maker.store.os.replace", locked)
+    run(engine, [_open()])
+    assert engine.listener_error is not None
+    assert "PermissionError" in engine.listener_error
+
+
+def test_a_skip_still_draws_a_chart_point(tmp_path):
+    from paper_split_maker.app import Hub
+
+    engine = _engine(tmp_path)
+    run(engine, [_open(), *_books(T0 + 2_000)])
+    engine.state.markets["m1"].last_binance = Decimal("60334")
+    hub = Hub(tmp_path / "hub", mode="live", config=engine.config)
+    hub.attach(engine)
+    hub.ingest(
+        {
+            "kind": "quote_skipped",
+            "ts": T0 + 5_000,
+            "market_id": "m1",
+            "reason": "stale_feed",
+        }
+    )
+    points = hub.snapshot()["sessions"][0]["points"]
+    assert points
+    assert points[-1]["s"] >= 0
+    assert points[-1]["btc"] == 60334.0
+
+
 def test_watchdog_dumps_and_requests_a_restart_when_decisions_stop(tmp_path):
     engine = _engine(tmp_path, small_pair_fast=True)
     engine.decision_wall_ms = 1_000

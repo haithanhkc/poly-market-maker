@@ -324,7 +324,14 @@ class Hub:
                 "bids": [[float(price), float(size)] for price, size in book.bids[:8]],
                 "asks": [[float(price), float(size)] for price, size in book.asks[:8]],
             }
-        if kind in {"book", "binance_lean", "clock", "fill", "quote_submit"}:
+        if kind in {
+            "book",
+            "binance_lean",
+            "clock",
+            "fill",
+            "quote_submit",
+            "quote_skipped",
+        }:
             self._touch_point(market)
         if kind in {"fill", "redeem", "resolution", "quote_submit"}:
             self._touch_point(market)

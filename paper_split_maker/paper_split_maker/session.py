@@ -388,6 +388,9 @@ _FAST_BOOK_S = 2.0
 _FAST_HTTP_TIMEOUT_S = 2.5
 _STALL_MS = 3000
 _RESTART_MS = 8000
+# The first minute is discovery and the book socket coming up. A 3s gap
+# there is not a hung loop, and dropping the socket makes the book stay empty.
+_WATCH_GRACE_MS = 60_000
 
 
 class _RestWorker:
@@ -516,8 +519,21 @@ class _RestWorker:
         return ("market", market_id, payload, info, resolution)
 
 
-def _watch_once(engine, feed, dump, *, now_ms: int, stall_ms: int = _STALL_MS, restart_ms: int = _RESTART_MS) -> bool:
+def _watch_once(
+    engine,
+    feed,
+    dump,
+    *,
+    now_ms: int,
+    stall_ms: int = _STALL_MS,
+    restart_ms: int = _RESTART_MS,
+    started_ms: int = 0,
+    grace_ms: int = _WATCH_GRACE_MS,
+) -> bool:
     """Mark a stalled decision loop, dump stacks, and fall back to REST."""
+    if started_ms and int(now_ms) - int(started_ms) < int(grace_ms):
+        engine.stalled = False
+        return False
     decision = int(getattr(engine, "decision_wall_ms", 0) or 0)
     if not decision:
         return False
@@ -556,9 +572,13 @@ def _start_watchdog(engine, feed, stop: threading.Event) -> threading.Thread:
     def run() -> None:
         armed = False
         started = time.time()
+        started_ms = int(started * 1000)
         while not stop.wait(1.0):
             decision = int(getattr(engine, "decision_wall_ms", 0) or 0)
             now_ms = int(time.time() * 1000)
+            if now_ms - started_ms < _WATCH_GRACE_MS:
+                engine.stalled = False
+                continue
             if not decision:
                 if time.time() - started > 5 and not armed:
                     armed = True
@@ -668,6 +688,9 @@ def _paper_fast_loop(
                     break
             now = clock()
             stamp = int(now * 1000)
+            if stamp >= engine.state.now_ms:
+                engine.state.now_ms = stamp
+            engine._retire_closed()
             rest_frames, book_error = _take_rest(
                 worker, engine, reader, stamp, max_markets, note, opened_slugs
             )
@@ -932,32 +955,35 @@ def _queue_rest(
     routes = _predict_routes(reader, engine)
     connected = bool(getattr(feed, "connected", False))
     book_age = time.time() * 1000 - float(last_book_wall or 0)
-    need_books = bool(routes) and (
-        not connected or book_age >= _FAST_BOOK_S * 1000
+    missing = _books_missing(engine)
+    # A slow discover used to stay "late" and never let a book GET run.
+    # Fetch a missing or quiet book first, but still discover at least
+    # every 2s so the next round is not stuck behind a dead socket.
+    need_refresh = bool(routes) and (
+        missing or not connected or book_age >= _FAST_BOOK_S * 1000
     )
     discover_due = now - last_discover >= _FAST_DISCOVER_S
-    # Books win the worker, but a rollover still has to be fetched. A discover
-    # that has already waited 2s runs even while the book is due.
-    discover_late = now - last_discover >= 2.0
-    if not engine.state.markets or (discover_due and (not need_books or discover_late)):
-        if discover_due:
-            planned = []
-            for series in _series_list(config):
-                if _hit_cap(len(opened_slugs), max_markets):
-                    break
-                slugs = _discovery_slugs(config, stamp, max_markets, note, series)
-                if slugs:
-                    planned.append(
-                        (series, slugs, stamp // 1000, max(len(slugs), 1))
-                    )
-                if str(getattr(config, "strategy", "") or "") != "small_pair":
-                    break
-            if planned and worker.submit(("discover", planned)):
-                last_discover = now
-            elif not planned:
-                last_discover = now
+    discover_starved = now - last_discover >= 2.0
+    if need_refresh and not discover_starved:
+        pairs = [(ident, routes[ident][0].up_token_id) for ident in routes]
+        if pairs and worker.submit(("books", pairs)):
+            return last_discover, last_trades, trade_cursor
+    if not engine.state.markets or discover_due:
+        planned = []
+        for series in _series_list(config):
+            if _hit_cap(len(opened_slugs), max_markets):
+                break
+            slugs = _discovery_slugs(config, stamp, max_markets, note, series)
+            if slugs:
+                planned.append((series, slugs, stamp // 1000, max(len(slugs), 1)))
+            if str(getattr(config, "strategy", "") or "") != "small_pair":
+                break
+        if planned and worker.submit(("discover", planned)):
+            last_discover = now
+        elif not planned:
+            last_discover = now
         return last_discover, last_trades, trade_cursor
-    if need_books:
+    if need_refresh:
         pairs = [(ident, routes[ident][0].up_token_id) for ident in routes]
         if pairs and worker.submit(("books", pairs)):
             return last_discover, last_trades, trade_cursor
@@ -1101,6 +1127,16 @@ def _poll_resolutions(engine, reader) -> None:
         if resolution is not None:
             resolution["ts"] = engine.state.now_ms
             engine.handle_event(resolution)
+
+
+def _books_missing(engine) -> bool:
+    for market in engine.state.markets.values():
+        if market.status != "open":
+            continue
+        for outcome in ("up", "down"):
+            if market.book(outcome).received_ms < 0:
+                return True
+    return False
 
 
 def _hit_cap(opened: int, max_markets: int) -> bool:

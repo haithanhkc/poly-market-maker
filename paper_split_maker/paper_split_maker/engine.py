@@ -263,12 +263,17 @@ class Engine:
         if self.state_path is None or not self.persist_each_event:
             return
         gap = float(getattr(self, "persist_gap_s", 0) or 0)
-        noisy = {"clock", "binance_lean", "skip", "feed", "book"}
+        noisy = {"clock", "binance_lean", "skip", "feed", "book", "quote_skipped", "quote_reject"}
         important = gap <= 0 or any(row.get("kind") not in noisy for row in self._batch)
         now = time.monotonic()
         if not important and now - self._last_persist < gap:
             return
-        save_state(self.state_path, self.state)
+        try:
+            save_state(self.state_path, self.state)
+        except PermissionError as exc:
+            self.listener_error = f"PermissionError: {exc}"
+            print(f"state save skipped: {exc}", file=sys.stderr, flush=True)
+            return
         self._last_persist = now
 
     def flush(self) -> None:
@@ -516,6 +521,9 @@ class Engine:
             return
         # A finished flat session, including one whose merge is still on chain,
         # does not hold a slot. An open window we have not traded yet does.
+        # Expire anything already past its end before counting, so a round
+        # that died while the app was down cannot reject the new one.
+        self._retire_closed()
         open_count = sum(
             1
             for item in self.state.markets.values()
@@ -1260,11 +1268,6 @@ class Engine:
             self._cancel_market(market, "expired_unresolved")
             self._skip(market, "expired_unresolved")
             return
-        if not self._feeds_ok(market):
-            reason = "disconnected" if not self.state.feed_up else "stale_feed"
-            self._cancel_market(market, reason)
-            self._skip(market, reason)
-            return
         if not market.accepting_orders:
             self._cancel_market(market, "not_accepting")
             self._skip(market, "not_accepting")
@@ -1296,6 +1299,15 @@ class Engine:
             spot, s0, fair, age_binance = self._apply_binance_lean(
                 market, open_ms, window, age_s, up_bid, up_ask
             )
+        blocked = self._quote_feed_block(market, age_binance)
+        if blocked:
+            if self.config.small_pair_binance:
+                self._log_binance_lean(
+                    market, spot, s0, fair, up_bid, up_ask, blocked
+                )
+            self._cancel_market(market, blocked)
+            self._skip(market, blocked)
+            return
         adverse_gap = self.config.small_pair_adverse_gap
         adverse_stale = self.config.small_pair_adverse_gap_stale
         age_for_plan = age_binance
@@ -2817,6 +2829,42 @@ class Engine:
 
     def _working_outcome(self, market: Market, outcome: str) -> bool:
         return bool(self._working(market, outcome))
+
+    def _quote_feed_block(self, market: Market, binance_age_s: float | None) -> str:
+        """Why this decision must not quote, or "" when it may.
+
+        For small_pair with a Binance feed, the book timer and the Chainlink
+        heartbeat are not a reason to stop. Chainlink only changes the blend.
+        ``stale_feed`` means Binance itself has had no tick for more than 5s.
+        A feed that has not printed yet does not block: the book is enough
+        until the first trade arrives. Other strategies still use book age.
+        """
+        feed = self.binance_feed
+        if (
+            self.config.strategy == "small_pair"
+            and self.config.small_pair_binance
+            and feed is not None
+        ):
+            if binance_age_s is None:
+                return ""
+            if float(binance_age_s) > 5:
+                return "stale_feed"
+            return ""
+        if not self._feeds_ok(market):
+            return "disconnected" if not self.state.feed_up else "stale_feed"
+        return ""
+
+    def _retire_closed(self) -> None:
+        """Drop ended rounds out of the open-market slot before the next open."""
+        now = self.state.now_ms
+        for market in self.state.markets.values():
+            if market.status in {"expired_unresolved", "resolved", "redeemed"}:
+                market.reserve_active = False
+                continue
+            if market.status == "open" and market.end_ts_ms and now >= market.end_ts_ms:
+                market.status = "expired_unresolved"
+                market.reserve_active = False
+                self._emit(kind="expiry", market=market, reason="expired_unresolved")
 
     def _feeds_ok(self, market: Market) -> bool:
         return (
