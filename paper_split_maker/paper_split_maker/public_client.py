@@ -98,6 +98,7 @@ class PublicReadClient:
     ):
         self.network = "mainnet" if str(network).lower() == "mainnet" else "testnet"
         self.base = rest_base(self.network)
+        self.api_key = str(api_key or "")
         headers = {}
         if self.network == "mainnet" and api_key:
             headers["x-api-key"] = api_key
@@ -310,6 +311,35 @@ class PublicReadClient:
         book = yes_book(payload)
         self._yes_cache[str(market_id)] = book
         return book
+
+    def fetch_orderbooks(self, market_ids: list[str]) -> dict[str, dict]:
+        """Yes books for up to 100 markets. Used when the book socket is down."""
+        ids: list[str] = []
+        for item in market_ids:
+            text = str(item).strip()
+            if text and text not in ids:
+                ids.append(text)
+        if not ids:
+            return {}
+        query = "&".join("ids=" + urllib.parse.quote(item, safe="") for item in ids[:100])
+        payload = self._get(f"{self.base}/v1/markets/orderbooks?{query}", decimal_floats=True)
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        found: dict[str, dict] = {}
+        if not isinstance(rows, list):
+            return found
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                book = yes_book(row if "bids" in row else {"data": row})
+            except PublicDataError:
+                continue
+            mid = str(row.get("marketId") or "")
+            if not mid:
+                continue
+            self._yes_cache[mid] = book
+            found[mid] = book
+        return found
 
     def _remember(self, market: dict) -> None:
         precision = int(market.get("decimalPrecision") or 2)

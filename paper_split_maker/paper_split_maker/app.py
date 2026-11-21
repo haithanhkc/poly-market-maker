@@ -76,11 +76,19 @@ class PaperControl:
 class Hub:
     """Chart, book, blotter, and equity derived from engine events."""
 
-    def __init__(self, out_dir: Path, *, mode: str, config: Optional[Config] = None):
+    def __init__(
+        self,
+        out_dir: Path,
+        *,
+        mode: str,
+        config: Optional[Config] = None,
+        env: Optional[dict] = None,
+    ):
         self.out = Path(out_dir)
         self.out.mkdir(parents=True, exist_ok=True)
         self.mode = mode
         self.config = config
+        self.env = env
         self.lock = threading.Lock()
         self.engine = None
         self.control = PaperControl(self._read_bot())
@@ -106,8 +114,14 @@ class Hub:
             engine.listeners.append(self.ingest)
 
     def start_live(self) -> None:
-        """Run the public-data paper loop until stop or reset."""
+        """Run the public-data paper loop until stop or reset.
+
+        ``env`` is the same map the CLI passes to the public client. Without
+        it the client reads only the process environment and defaults to
+        testnet, which 404s the mainnet series.
+        """
         self.mode = "live"
+        env = self.env
 
         def loop() -> None:
             while not self.control.should_stop():
@@ -116,6 +130,7 @@ class Hub:
                     self.out,
                     duration_seconds=0,
                     max_markets=0,
+                    env=env,
                     on_engine=self.attach,
                 )
                 if summary.get("stop_reason") == "reset":
@@ -193,6 +208,7 @@ class Hub:
             "blotter": blotter,
             "sessions": sessions,
             "listener_error": getattr(self.engine, "listener_error", None),
+            "feed": _feed_view(self.engine, self.config),
         }
 
     def save(self) -> None:
@@ -959,8 +975,11 @@ def _push(engine, tape, event, px: Decimal) -> None:
     engine.handle_event(event)
 
 
-def live_config(path: Path) -> Config:
-    """Same bankroll and price source as run_smallpair_combo100, own output folder."""
+def live_config(path: Path, *, fast: bool = True) -> Config:
+    """Same bankroll and price source as run_smallpair_combo100, own output folder.
+
+    ``fast`` is the event-driven book. Pass False for the old REST poll.
+    """
     from paper_split_maker.cli import _apply_strategy, _load
 
     args = Namespace(
@@ -973,10 +992,24 @@ def live_config(path: Path) -> Config:
         pair_gate=None,
         catch_up=None,
         first_leg_seconds=None,
+        fast=fast,
         capital="100",
         max_loss_fraction="0.99",
     )
     return _apply_strategy(_load(args), args)
+
+
+def _feed_view(engine, config) -> dict:
+    decision = int(getattr(engine, "decision_wall_ms", 0) or 0) if engine is not None else 0
+    age = None
+    if decision:
+        age = max(0, int(time.time() * 1000) - decision)
+    return {
+        "book": str(getattr(engine, "book_transport", "") or "") if engine is not None else "",
+        "connected": bool(getattr(engine, "book_connected", False)) if engine is not None else False,
+        "decision_age_ms": age,
+        "fast": bool(getattr(config, "small_pair_fast", False)),
+    }
 
 
 def serve(hub: Hub, port: int, *, open_browser: bool = False) -> None:
@@ -1095,13 +1128,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--replay", action="store_true")
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--fast",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "event-driven book and pair take. Default on. "
+            "--no-fast is the old REST poll, for a side-by-side comparison."
+        ),
+    )
     args = parser.parse_args(argv)
     out = Path(args.out)
     if args.demo:
         hub = play_demo(out, replay=args.replay)
     else:
-        config = live_config(Path(args.config))
-        hub = Hub(out, mode="live", config=config)
+        path = Path(args.config)
+        from paper_split_maker.cli import _credential_env
+
+        config = live_config(path, fast=bool(args.fast))
+        hub = Hub(out, mode="live", config=config, env=_credential_env(path))
         hub.start_live()
     if args.port == 8765:
         raise SystemExit("port 8765 is the other local page; use 8766")

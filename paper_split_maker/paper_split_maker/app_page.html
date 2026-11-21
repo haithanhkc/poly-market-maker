@@ -162,6 +162,7 @@
     <div>
       <h1 id="title">Bitcoin Up or Down – 5M <span class="paper-tag">PAPER</span></h1>
       <div class="sub" id="window">Waiting for a round</div>
+      <div class="sub" id="latency">—</div>
     </div>
   </div>
   <div class="stat">
@@ -325,12 +326,30 @@ function render(data) {
   document.getElementById("banner").className = data.bot_enabled ? "banner" : "banner show";
   renderSessions(data);
   renderHeader(session);
+  renderLatency(data);
   renderBook(session);
   renderBlotter(data, session);
   renderPosition(session);
   renderPnl(data, session);
   drawChart();
   drawEquity();
+}
+
+function renderLatency(data) {
+  const el = document.getElementById("latency");
+  if (!el) return;
+  const feed = data.feed || {};
+  if (data.mode !== "live") {
+    el.textContent = "Demo tape";
+    return;
+  }
+  const src = feed.connected ? "WS" : "REST fallback";
+  let age = "";
+  if (feed.decision_age_ms != null) {
+    const ms = feed.decision_age_ms;
+    age = ms < 1000 ? " · " + ms + "ms" : " · " + (ms / 1000).toFixed(1) + "s";
+  }
+  el.textContent = (feed.fast ? "fast" : "poll") + " · " + src + age;
 }
 
 function renderSessions(data) {

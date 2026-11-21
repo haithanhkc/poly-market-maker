@@ -17,7 +17,7 @@ from paper_split_maker.chain_data import series_of, window_seconds
 from paper_split_maker.config import Config
 from paper_split_maker.decimal_utils import ONE, ZERO, ceil_tick, floor_cash, money, on_grid, qdown
 from paper_split_maker.dual_bid import plan_bids, quote_phase, round_open_ms
-from paper_split_maker.small_pair import plan_small_pair, session_spend_cap
+from paper_split_maker.small_pair import plan_small_pair, session_spend_cap, take_completion
 from paper_split_maker.logs import LogWriter
 from paper_split_maker.models import (
     WORKING_ORDER_STATUSES,
@@ -113,6 +113,10 @@ class Engine:
         self.listener_error: Optional[str] = None
         # Set by the paper app so the loop can stop or reset between polls.
         self.paper_control = None
+        # The paper loop sets these. "ws" or "rest", and the wall time of the last quote pass.
+        self.book_transport = "rest"
+        self.book_connected = False
+        self.decision_wall_ms = 0
 
     @classmethod
     def create(
@@ -410,6 +414,8 @@ class Engine:
                 self._emit(
                     kind="order_live", market=market, order=order, size=order.remaining
                 )
+                if order.exchange_id == "taker" and getattr(order, "side", "sell") == "buy":
+                    self._fill_taker(market, order)
             if (
                 order.status == "cancel_requested"
                 and not self.config.live
@@ -900,7 +906,11 @@ class Engine:
             order=order,
             size=size,
             price=order.price,
-            reason="exchange_fill" if source == "exchange" else "queue_model_fill",
+            reason=(
+                "exchange_fill"
+                if source == "exchange"
+                else ("taker_take" if source == "taker" else "queue_model_fill")
+            ),
         )
 
     def _note_binance_fill(self, market: Market, order: Order, size: Decimal) -> None:
@@ -1149,6 +1159,8 @@ class Engine:
     def _sync_bids(self, market: Market, desired, reason: str) -> None:
         wanted = {(bid.outcome, bid.price): bid for bid in desired}
         for order in self._working_bids(market):
+            if order.exchange_id == "taker":
+                continue
             bid = wanted.get((order.outcome, order.price))
             if (
                 bid is not None
@@ -1207,7 +1219,11 @@ class Engine:
         return True
 
     def _decide_small_pair(self, market: Market) -> None:
-        """Buy the 0.96 pair. Never split, sell, merge, or take."""
+        """Buy the 0.96 pair. Never split, sell, or merge.
+
+        Fast mode may also take the opposite ask to finish one unpaired lot
+        when that pair still costs at most ``small_pair_take_sum``.
+        """
         if market.status == "redeemed":
             return
         market.quoted_as = "small_pair"
@@ -1278,6 +1294,17 @@ class Engine:
             adverse_gap = adverse_stale
             age_for_plan = 0
         combined = fair_quote
+        take = None
+        extra_up = ZERO
+        extra_down = ZERO
+        if self.config.small_pair_fast and age_s >= self._small_pair_start_seconds():
+            planned = self._completion_take(market)
+            if planned is not None and not self._taker_working(market, planned[0]):
+                take = planned
+                if planned[0] == "up":
+                    extra_up = planned[2]
+                else:
+                    extra_down = planned[2]
         plan = plan_small_pair(
             up_bid=up_bid,
             up_ask=up_ask,
@@ -1291,11 +1318,7 @@ class Engine:
             budget_left=left,
             age_s=age_s,
             window_s=window,
-            start_s=(
-                self.config.small_pair_start_seconds
-                if self.config.small_pair_binance
-                else 2
-            ),
+            start_s=self._small_pair_start_seconds(),
             fair_up=fair,
             loser_fair=self.config.small_pair_loser_fair,
             loser_after_s=self.config.small_pair_loser_after_seconds,
@@ -1322,8 +1345,9 @@ class Engine:
             first_leg_s=(
                 int(self.config.small_pair_first_leg_seconds) if combined else 0
             ),
-            resting_up=self._resting_bid_shares(market, "up"),
-            resting_down=self._resting_bid_shares(market, "down"),
+            resting_up=self._resting_bid_shares(market, "up") + extra_up,
+            resting_down=self._resting_bid_shares(market, "down") + extra_down,
+            shade_loser=bool(self.config.small_pair_shade_loser),
         )
         if self.config.small_pair_binance:
             for rule, count in plan.filtered:
@@ -1336,10 +1360,14 @@ class Engine:
                 market, spot, s0, fair, up_bid, up_ask, plan.action or plan.reason
             )
         if not plan.bids:
-            self._cancel_market(market, plan.reason or "no_bid")
+            self._cancel_market(market, plan.reason or "no_bid", skip_taker=True)
+            if take is not None and plan.reason != "round_closed":
+                self._place_taker(market, take[0], take[1], take[2])
             self._skip(market, plan.reason or "no_bid")
             return
         self._sync_bids(market, plan.bids, "small_pair")
+        if take is not None:
+            self._place_taker(market, take[0], take[1], take[2])
         if plan.reason:
             self._skip(market, plan.reason)
 
@@ -2562,14 +2590,119 @@ class Engine:
             market.status = "expired_unresolved"
             self._emit(kind="expiry", market=market, reason="expired_unresolved")
 
+    def _small_pair_start_seconds(self) -> int:
+        if self.config.small_pair_fast:
+            return int(self.config.small_pair_fast_start_seconds)
+        if self.config.small_pair_binance:
+            return int(self.config.small_pair_start_seconds)
+        return 2
+
+    def _completion_take(self, market: Market):
+        up_ask = market.up_book.best_ask()
+        down_ask = market.down_book.best_ask()
+        return take_completion(
+            up_shares=market.bought_up_shares,
+            down_shares=market.bought_down_shares,
+            up_cost=market.bought_up_cost,
+            down_cost=market.bought_down_cost,
+            up_ask=up_ask,
+            down_ask=down_ask,
+            up_ask_size=market.up_book.ask_size_at(up_ask) if up_ask is not None else ZERO,
+            down_ask_size=(
+                market.down_book.ask_size_at(down_ask) if down_ask is not None else ZERO
+            ),
+            cap=self.config.small_pair_take_sum,
+        )
+
+    def _taker_working(self, market: Market, outcome: str) -> bool:
+        for order in self.state.orders.values():
+            if order.market_id != market.market_id or order.outcome != outcome:
+                continue
+            if order.exchange_id == "taker" and order.status in WORKING_ORDER_STATUSES:
+                return True
+        return False
+
+    def _place_taker(self, market: Market, outcome: str, price: Decimal, size: Decimal) -> bool:
+        """Queue a marketable buy. It fills on ack only if the ask is still there."""
+        if self._taker_working(market, outcome):
+            return False
+        cap = session_spend_cap(self.config, self.state.cash)
+        spent = market.bought_up_cost + market.bought_down_cost
+        left = cap - spent
+        if left < 0:
+            left = ZERO
+        if price <= 0 or size < 1:
+            return False
+        notional = floor_cash(size * price)
+        if notional > left:
+            size = qdown(left / price, Decimal("1"))
+            notional = floor_cash(size * price)
+        if size < 1 or notional <= 0 or self.state.cash < notional:
+            self._skip(market, "budget", outcome, price)
+            return False
+        self.state.order_seq += 1
+        probe = Order(
+            order_id=f"{market.market_id}-{outcome}-take-{self.state.order_seq}",
+            market_id=market.market_id,
+            outcome=outcome,
+            price=price,
+            size=size,
+            remaining=size,
+            queue_ahead=ZERO,
+            status="queued",
+            submit_ts=self.state.now_ms,
+            side="buy",
+            exchange_id="taker",
+        )
+        before = worst_case_equity(self.state)
+        after = worst_case_equity(self.state, extra=[probe])
+        if after < self.state.loss_floor and after < before:
+            self.state.order_seq -= 1
+            self._skip(market, "loss_budget", outcome, price)
+            return False
+        self.state.orders[probe.order_id] = probe
+        market.bids_posted += 1
+        market.last_action_ts = self.state.now_ms
+        self._skip_once.clear()
+        self._emit(
+            kind="quote_submit",
+            market=market,
+            order=probe,
+            size=size,
+            price=price,
+            reason="taker_take",
+        )
+        return True
+
+    def _fill_taker(self, market: Market, order: Order) -> None:
+        """Fill a live taker at the ask, or cancel it when the ask has moved away."""
+        book = market.book(order.outcome)
+        ask = book.best_ask()
+        available = book.ask_size_at(ask) if ask is not None else ZERO
+        if ask is None or ask > order.price or available <= 0 or book.uncertain:
+            self._request_cancel(market, order, "taker_missed")
+            return
+        if ask < order.price:
+            order.price = ask
+        fill = order.remaining if order.remaining < available else available
+        fill = qdown(fill, Decimal("0.000001"))
+        if fill <= 0:
+            self._request_cancel(market, order, "taker_missed")
+            return
+        self._apply_buy_fill(market, order, fill, source="taker")
+        if order.status == "live" and order.remaining > 0:
+            self._request_cancel(market, order, "taker_done")
+
     def _cancel_market(
-        self, market: Market, reason: str, outcome: Optional[str] = None
+        self, market: Market, reason: str, outcome: Optional[str] = None, skip_taker: bool = False
     ) -> None:
         for order in list(self.state.orders.values()):
             if (
                 order.market_id != market.market_id
                 or order.status not in WORKING_ORDER_STATUSES
             ):
+                continue
+            if skip_taker and order.exchange_id == "taker":
                 continue
             if outcome and order.outcome != outcome:
                 continue

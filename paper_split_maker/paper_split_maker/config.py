@@ -186,6 +186,14 @@ class Config:
     # On a 300s round, stop opening a new pair after this many seconds.
     # Longer rounds use the same fraction of the window. 0 turns it off.
     small_pair_first_leg_seconds: int = 200
+    # Fast paper loop. Off keeps the REST poll and the maker-only pair.
+    # On uses the book socket, quotes from small_pair_fast_start_seconds,
+    # shades the losing bid, and may take the opposite ask.
+    small_pair_fast: bool = False
+    small_pair_shade_loser: bool = False
+    small_pair_fast_start_seconds: int = 1
+    # Unpaired average plus the opposite ask must be at or under this to take.
+    small_pair_take_sum: Decimal = Decimal("0.99")
     # The on-chain aggregator is fresh for this long after updatedAt.
     chainlink_stale_seconds: int = 3600
     chainlink_poll_seconds: int = 5
@@ -380,6 +388,10 @@ class Config:
             raise ConfigError("small_pair_catch_up_sum must sit inside (0, 1]")
         if self.small_pair_first_leg_seconds < 0:
             raise ConfigError("small_pair_first_leg_seconds must be non-negative")
+        if self.small_pair_fast_start_seconds < 0:
+            raise ConfigError("small_pair_fast_start_seconds must be non-negative")
+        if self.small_pair_take_sum <= 0 or self.small_pair_take_sum > 1:
+            raise ConfigError("small_pair_take_sum must sit inside (0, 1]")
         if self.chainlink_stale_seconds < 1:
             raise ConfigError("chainlink_stale_seconds must be at least 1")
         if self.chainlink_poll_seconds < 1:
@@ -493,6 +505,7 @@ _DECIMAL_FIELDS = {
     "small_pair_disagree_gap",
     "small_pair_widen_extra",
     "small_pair_catch_up_sum",
+    "small_pair_take_sum",
 }
 _INT_FIELDS = {
     "stale_after_ms",
@@ -530,6 +543,7 @@ _INT_FIELDS = {
     "chainlink_stale_seconds",
     "chainlink_poll_seconds",
     "small_pair_first_leg_seconds",
+    "small_pair_fast_start_seconds",
 }
 _BOOL_FIELDS = {
     "trade_through_fills",
@@ -540,6 +554,8 @@ _BOOL_FIELDS = {
     "small_pair_binance",
     "small_pair_pair_gate",
     "small_pair_catch_up",
+    "small_pair_fast",
+    "small_pair_shade_loser",
 }
 
 

@@ -94,10 +94,23 @@ cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
 .\run_app_combo.ps1
 ```
 
-Without the wrapper:
+`run_app_fast.ps1` is the same strategy on a faster loop, at `http://127.0.0.1:8767`, ledger `runs\app_fast`. It can run beside `run_app_combo.ps1`. The book comes from the predict.fun websocket (`predictOrderbook` and `predictTopOfBook`) and falls back to `GET /v1/markets/orderbooks` when the socket is down. There is no public trade stream, so matches are polled every 250 ms. A decision runs on each book update and each Binance or Chainlink tick. The loop wakes every 50 ms, and a 100 ms clock promotes orders. Ack stays 250 ms and cancel stays 500 ms, the values in `config.paper.json`. Quotes start at second 1. When one side is ahead and its average cost plus the other side's ask is at most `small_pair_take_sum` (0.99), the bot takes that ask. That fill is a taker: it waits out the ack, then fills only the size still on the ask. The losing side's bid is shaded down by up to 3 ticks and is not removed. `--fast` turns this on for the CLI. `--no-fast` keeps the old poll. The combo wrapper passes `--no-fast`.
 
 ```powershell
-python -m paper_split_maker.app --config config.paper.json --out runs\app_combo --port 8766
+cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
+.\run_app_fast.ps1
+```
+
+Without the wrapper, the old poll:
+
+```powershell
+python -m paper_split_maker.app --config config.paper.json --out runs\app_combo --port 8766 --no-fast
+```
+
+The fast page, which is also what `python -m paper_split_maker.app` does if you omit `--no-fast`:
+
+```powershell
+python -m paper_split_maker.app --config config.paper.json --out runs\app_fast --port 8767 --fast
 ```
 
 `--demo` plays a recorded round through the same engine when you have no API key. It does not call predict.fun. `--replay` rebuilds that tape. Do not point `--demo` at a live `runs\app_combo` ledger you want to keep.
@@ -113,6 +126,13 @@ BOT OFF hủy bid giấy đang treo và để vị thế về settlement. BOT ON
 ```powershell
 cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
 .\run_app_combo.ps1
+```
+
+Bản nhanh cùng chiến lược, cổng `8767`, sổ `runs\app_fast`. Có thể chạy song song với bản poll ở `8766`. Sổ lệnh qua websocket, REST khi socket rớt. Báo giá từ giây thứ 1, và mua ask bên kia khi giá vốn lệnh lệch cộng ask còn ≤ 0.99. Ack vẫn 250 ms, cancel vẫn 500 ms.
+
+```powershell
+cd C:\Users\danny\Desktop\poly-market-maker\paper_split_maker
+.\run_app_fast.ps1
 ```
 
 Check the key, the login, and the USDT balance without placing an order. The JSON it prints does not contain the key or the JWT:
