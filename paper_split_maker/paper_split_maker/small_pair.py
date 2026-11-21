@@ -1,8 +1,9 @@
 """Paper small_pair: a 0.96 bid pair on BTC 5m and 15m, then hold.
 
-This mode does not split, sell, merge, or take. It posts a post-only bid
-ladder on Up and on Down after the round has been open for 2 seconds, and
-keeps the tokens until resolution.
+The default path does not split, sell, merge, or take. It posts a post-only
+bid ladder on Up and on Down and keeps the tokens until resolution. Fast
+mode can also buy the opposite ask when that finishes a pair under the
+take cap, and it shades the losing bid down instead of pulling it.
 
 The centre is the Up book's mid. Each top bid sits ``(1 - 0.96) / 2`` under
 its mid, so the two top bids sum to 0.96. Four rungs step down by one tick.
@@ -282,6 +283,7 @@ def plan_small_pair(
     first_leg_s: int = 0,
     resting_up: Decimal = ZERO,
     resting_down: Decimal = ZERO,
+    shade_loser: bool = False,
 ) -> Plan:
     """Bids for this heartbeat, plus a short reason when a rule binds.
 
@@ -370,6 +372,10 @@ def plan_small_pair(
                 up_touch, down_cost / down_shares, catch_up_sum, up_ask, tick
             )
             lean = "catch_up"
+    if shade_loser and fair_up is not None and Decimal("0") < fair_up < Decimal("1"):
+        # BTC has moved against this side. Bid less, but keep the bid.
+        up_touch = shade_losing_touch(up_touch, fair_up, tick)
+        down_touch = shade_losing_touch(down_touch, Decimal("1") - fair_up, tick)
     if quoted_targets is not None:
         quoted_targets = (up_touch, down_touch)
     allowed = {"up", "down"}
@@ -524,6 +530,82 @@ def plan_small_pair(
     if trimmed and not reason:
         reason = "budget"
     return Plan(bids, reason, lean, filtered, quoted_targets or ())
+
+
+def shade_losing_touch(touch, fair_side, tick: Decimal):
+    """Lower a bid that is losing value. Never drop it off the book.
+
+    One tick per 0.10 of fair value under 0.50, and at most three ticks.
+    If the lower price is too cheap to be a lot, step back up to a price
+    that still quotes.
+    """
+    if touch is None or fair_side is None or tick <= 0 or fair_side >= Decimal("0.5"):
+        return touch
+    steps = int((Decimal("0.5") - fair_side) / Decimal("0.10"))
+    if steps < 1:
+        steps = 1
+    if steps > 3:
+        steps = 3
+    price = touch - tick * steps
+    while price < touch and lot_for(price) is None:
+        price += tick
+    if price <= 0:
+        return touch
+    return price
+
+
+def take_completion(
+    *,
+    up_shares: Decimal,
+    down_shares: Decimal,
+    up_cost: Decimal,
+    down_cost: Decimal,
+    up_ask,
+    down_ask,
+    up_ask_size: Decimal,
+    down_ask_size: Decimal,
+    cap: Decimal,
+):
+    """Buy the light side at its ask when that pair still costs at most ``cap``.
+
+    Returns ``(outcome, price, size)`` or None. Size is the unpaired shares,
+    capped by the size sitting on the ask, and at least one share. The caller
+    waits out ack latency and fills only if that ask is still there.
+    """
+    if cap <= 0:
+        return None
+    if up_shares > down_shares and up_shares > 0 and up_cost > 0:
+        return _take_leg(
+            "down",
+            up_cost / up_shares,
+            up_shares - down_shares,
+            down_ask,
+            down_ask_size,
+            cap,
+        )
+    if down_shares > up_shares and down_shares > 0 and down_cost > 0:
+        return _take_leg(
+            "up",
+            down_cost / down_shares,
+            down_shares - up_shares,
+            up_ask,
+            up_ask_size,
+            cap,
+        )
+    return None
+
+
+def _take_leg(outcome: str, heavy_avg: Decimal, deficit: Decimal, ask, ask_size: Decimal, cap: Decimal):
+    if ask is None or ask <= 0 or ask >= 1:
+        return None
+    if heavy_avg + ask > cap:
+        return None
+    if deficit < 1 or ask_size < 1:
+        return None
+    size = deficit if deficit < ask_size else ask_size
+    if size < 1:
+        return None
+    return outcome, ask, size
 
 
 def _avg(shares: Decimal, cost: Decimal) -> Decimal | None:

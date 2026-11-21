@@ -69,6 +69,43 @@ def test_only_a_real_residual_or_a_stale_feed_widens():
     assert missing.widen is True
 
 
+def test_stale_chainlink_does_not_replace_binance():
+    """Field print: on-chain 60186.846 at 50s, Binance 60334, predict S0 60324.875."""
+    from paper_split_maker.binance_btc import fair_up
+
+    stale = _view(
+        binance=Decimal("60334"),
+        chainlink=Decimal("60186.846"),
+        binance_at_chainlink=Decimal("60334"),
+        basis=Decimal("10"),
+        chainlink_age_s=50,
+        binance_age_s=0.2,
+    )
+    assert stale.spot == Decimal("60334")
+    assert stale.spot_source == "binance"
+    assert stale.widen is False
+    missing_anchor = _view(
+        binance=Decimal("60334"),
+        chainlink=Decimal("60186.846"),
+        binance_at_chainlink=None,
+        basis=None,
+        chainlink_age_s=10,
+    )
+    assert missing_anchor.spot == Decimal("60334")
+    assert missing_anchor.spot_source == "binance"
+    assert missing_anchor.widen is False
+    dead = _view(
+        binance=Decimal("60334"),
+        chainlink=Decimal("60186.846"),
+        binance_at_chainlink=None,
+        chainlink_age_s=4000,
+    )
+    assert dead.spot == Decimal("60334")
+    assert dead.widen is True
+    fair = fair_up(Decimal("60334"), Decimal("60324.875"), None, 200, 0.0001)
+    assert Decimal("0.40") < fair < Decimal("0.70")
+
+
 def test_fair_targets_quote_both_sides_under_the_pair_sum():
     from paper_split_maker.price_blend import fair_side_targets
     from paper_split_maker.small_pair import plan_small_pair
@@ -219,6 +256,185 @@ def test_engine_logs_both_prices_and_the_combined_spot(tmp_path, capsys):
     row = round_report(market)
     assert Decimal(row["combined_price"]) == Decimal("100040")
     assert Decimal(row["residual"]) == Decimal("0")
+
+
+def test_stale_chainlink_still_bids_both_sides(tmp_path, capsys):
+    engine = make_engine(
+        tmp_path,
+        strategy="small_pair",
+        round_budget=Decimal("25"),
+        per_market_budget=Decimal("25"),
+        stale_after_ms=500_000,
+        ack_latency_ms=0,
+        cancel_latency_ms=0,
+        small_pair_binance=True,
+        price_source="combined",
+        initial_capital=Decimal("100"),
+        max_loss_fraction=Decimal("0.99"),
+    )
+
+    class Binance:
+        def __init__(self):
+            self.snap = None
+
+        def latest(self):
+            return (engine.state.now_ms, Decimal("60334"))
+
+        def price_at(self, ts_ms):
+            return self.snap
+
+        def vol(self, now_ms):
+            return None
+
+    class Link:
+        def latest(self):
+            return (engine.state.now_ms - 50_000, Decimal("60186.846"))
+
+        def price_at(self, ts_ms):
+            return Decimal("60186.846")
+
+    binance = Binance()
+    engine.binance_feed = binance
+    engine.chainlink_feed = Link()
+    quote = T0 + 50_000
+    run(
+        engine,
+        [
+            market_event(
+                slug=f"btc-updown-5m-{OPEN}",
+                end_ts=(OPEN + 300) * 1000,
+                ts=T0,
+                reference_price="60324.875",
+            ),
+            book_event("m1", "up", "0.54", "0.57", ts=quote, bid_size="20", digest="up"),
+            book_event("m1", "down", "0.43", "0.46", ts=quote, bid_size="20", digest="down"),
+            {"type": "heartbeat", "event_id": "hb-stale-link", "ts": quote, "market_id": "m1"},
+        ],
+    )
+    market = engine.state.markets["m1"]
+    assert market.reference_source == "predict"
+    assert market.reference_price == Decimal("60324.875")
+    assert market.last_combined == Decimal("60334")
+    assert market.price_spot_source == "binance"
+    assert market.last_fair_up is not None and market.last_fair_up > Decimal("0.40")
+    assert market.last_up_target is not None and market.last_up_target > Decimal("0.20")
+    assert "stale_feed" not in (market.skip_counts or {})
+    sides = {order.outcome for order in engine.state.orders.values()}
+    assert sides == {"up", "down"}
+    binance.snap = Decimal("60334")
+    run(
+        engine,
+        [{"type": "heartbeat", "event_id": "hb-anchor", "ts": quote + 1000, "market_id": "m1"}],
+    )
+    assert engine._chainlink_anchor_px == Decimal("60334")
+    assert market.last_combined == Decimal("60334")
+    text = capsys.readouterr().err
+    assert "chainlink=60186.846" in text
+    assert "binance=60334" in text
+
+
+def test_old_book_and_chainlink_heartbeat_still_quote_from_binance(tmp_path, capsys):
+    engine = make_engine(
+        tmp_path,
+        strategy="small_pair",
+        round_budget=Decimal("25"),
+        per_market_budget=Decimal("25"),
+        stale_after_ms=10_000,
+        ack_latency_ms=0,
+        cancel_latency_ms=0,
+        small_pair_binance=True,
+        price_source="combined",
+        initial_capital=Decimal("100"),
+        max_loss_fraction=Decimal("0.99"),
+    )
+
+    class Binance:
+        def __init__(self, owner, age_ms):
+            self.owner = owner
+            self.age_ms = age_ms
+
+        def latest(self):
+            return (self.owner.state.now_ms - self.age_ms, Decimal("60334"))
+
+        def price_at(self, ts_ms):
+            return Decimal("60334")
+
+        def vol(self, now_ms):
+            return None
+
+    class Link:
+        def latest(self):
+            return (engine.state.now_ms - 50_000, Decimal("60186.846"))
+
+        def price_at(self, ts_ms):
+            return Decimal("60186.846")
+
+    engine.binance_feed = Binance(engine, 200)
+    engine.chainlink_feed = Link()
+    quote = T0 + 50_000
+    run(
+        engine,
+        [
+            market_event(
+                slug=f"btc-updown-5m-{OPEN}",
+                end_ts=(OPEN + 300) * 1000,
+                ts=T0,
+                reference_price="60324.875",
+            ),
+            book_event("m1", "up", "0.54", "0.57", ts=quote, bid_size="20", digest="up"),
+            book_event("m1", "down", "0.43", "0.46", ts=quote, bid_size="20", digest="down"),
+        ],
+    )
+    market = engine.state.markets["m1"]
+    market.up_book.received_ms = quote - 30_000
+    market.down_book.received_ms = quote - 30_000
+    run(
+        engine,
+        [{"type": "heartbeat", "event_id": "hb-old-book", "ts": quote + 1, "market_id": "m1"}],
+    )
+    # A book older than stale_after_ms is the poll-loop stale_feed.
+    # The Chainlink heartbeat is not.
+    assert market.skip_counts.get("stale_feed", 0) >= 1
+    assert market.bids_posted == 0
+    assert market.reference_price == Decimal("60324.875")
+    assert "binance_lean" in capsys.readouterr().err
+
+    quiet = make_engine(
+        tmp_path / "quiet",
+        strategy="small_pair",
+        round_budget=Decimal("25"),
+        per_market_budget=Decimal("25"),
+        stale_after_ms=500_000,
+        ack_latency_ms=0,
+        cancel_latency_ms=0,
+        small_pair_binance=True,
+        price_source="combined",
+        initial_capital=Decimal("100"),
+        max_loss_fraction=Decimal("0.99"),
+    )
+    quiet.binance_feed = Binance(quiet, 6_000)
+    quiet.chainlink_feed = Link()
+    run(
+        quiet,
+        [
+            market_event(
+                slug=f"btc-updown-5m-{OPEN}",
+                end_ts=(OPEN + 300) * 1000,
+                ts=T0,
+                reference_price="60324.875",
+            ),
+            book_event("m1", "up", "0.54", "0.57", ts=quote, bid_size="20", digest="upq"),
+            book_event("m1", "down", "0.43", "0.46", ts=quote, bid_size="20", digest="downq"),
+            {"type": "heartbeat", "event_id": "hb-quiet", "ts": quote, "market_id": "m1"},
+        ],
+    )
+    quiet_market = quiet.state.markets["m1"]
+    # Binance age and a 50s Chainlink print do not cancel a fresh book.
+    assert "stale_feed" not in (quiet_market.skip_counts or {})
+    assert quiet_market.bids_posted > 0
+    sides = {order.outcome for order in quiet.state.orders.values()}
+    assert sides == {"up", "down"}
+    assert "binance_lean" in capsys.readouterr().err
 
 
 def test_cli_price_source_defaults_to_binance(tmp_path, monkeypatch):

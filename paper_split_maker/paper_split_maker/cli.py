@@ -118,6 +118,17 @@ def main(argv: list[str] | None = None) -> int:
             "Default 200 for --price-source combined. 0 turns it off."
         ),
     )
+    parser.add_argument(
+        "--fast",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "event-driven predict.fun book and a take of the opposite ask when "
+            "the pair still costs at most small_pair_take_sum (0.99). "
+            "Default off, so the REST poll run is unchanged. "
+            "--no-fast forces that poll run."
+        ),
+    )
     parser.add_argument("--live", action="store_true")
     parser.add_argument(
         "--check-connection",
@@ -190,6 +201,9 @@ def _apply_strategy(config, args):
         config.small_pair_catch_up = bool(args.catch_up)
     if getattr(args, "first_leg_seconds", None) is not None:
         config.small_pair_first_leg_seconds = int(args.first_leg_seconds)
+    if getattr(args, "fast", None) is not None:
+        config.small_pair_fast = bool(args.fast)
+        config.small_pair_shade_loser = bool(args.fast)
     _honor_bankroll(config, args)
     return config
 

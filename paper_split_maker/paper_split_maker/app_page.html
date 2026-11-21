@@ -47,6 +47,13 @@
     background: #2a2416; color: var(--amber); font-size: 10px; letter-spacing: 0.08em;
     vertical-align: 1px;
   }
+  .stalled {
+    display: none; margin-left: 8px; padding: 1px 6px; border-radius: 4px;
+    background: #5a1420; color: var(--red); font-size: 10px; font-weight: 800;
+    letter-spacing: 0.08em; vertical-align: 1px;
+  }
+  .stalled.show { display: inline-block; }
+  #status { color: #d5dae1; }
   .stat { min-width: 120px; }
   .stat .k { color: var(--muted); font-size: 11px; letter-spacing: 0.04em; }
   .stat .k .delta { margin-left: 6px; font-weight: 650; }
@@ -160,8 +167,10 @@
   <div class="title-block">
     <div class="coin">₿</div>
     <div>
-      <h1 id="title">Bitcoin Up or Down – 5M <span class="paper-tag">PAPER</span></h1>
+      <h1 id="title">Bitcoin Up or Down – 5M <span class="paper-tag">PAPER</span><span class="stalled" id="stalled">STALLED</span></h1>
       <div class="sub" id="window">Waiting for a round</div>
+      <div class="sub" id="status">—</div>
+      <div class="sub" id="latency">—</div>
     </div>
   </div>
   <div class="stat">
@@ -240,7 +249,7 @@
   </div>
 </section>
 <script>
-const state = { data: null, selected: null, mode: "both", side: "up", skew: 0 };
+const state = { data: null, selected: null, mode: "both", side: "up", skew: 0, liveId: null, pinned: null, snapAt: 0 };
 
 function num(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -298,6 +307,14 @@ function ageLabel(openMs, ts) {
   const s = Math.max(0, Math.round((ts - openMs) / 1000));
   return Math.floor(s / 60) + ":" + pad(s % 60);
 }
+function currentOpen(data) {
+  const rows = (data.sessions || []).filter((item) => item.status === "open");
+  if (!rows.length) return null;
+  const now = data.mode === "live" && data.wall_ms ? data.wall_ms : (data.now_ms || 0);
+  const live = rows.filter((item) => item.open_ms <= now && now < item.end_ms);
+  const pool = live.length ? live : rows;
+  return pool[pool.length - 1];
+}
 function selectedSession() {
   const data = state.data;
   if (!data || !data.sessions.length) return null;
@@ -314,6 +331,7 @@ function remaining(session) {
 
 function render(data) {
   state.data = data;
+  state.snapAt = Date.now();
   if (data.mode === "live" && data.wall_ms) state.skew = data.wall_ms - Date.now();
   if (!state.selected || !data.sessions.some((item) => item.id === state.selected)) {
     const open = data.sessions.find((item) => item.status === "open");
@@ -325,12 +343,62 @@ function render(data) {
   document.getElementById("banner").className = data.bot_enabled ? "banner" : "banner show";
   renderSessions(data);
   renderHeader(session);
+  renderStatus(data);
+  renderLatency(data);
   renderBook(session);
   renderBlotter(data, session);
   renderPosition(session);
   renderPnl(data, session);
   drawChart();
   drawEquity();
+}
+
+function decisionAgeMs(data) {
+  const feed = data.feed || {};
+  if (feed.decision_age_ms == null) return null;
+  const extra = state.snapAt ? Date.now() - state.snapAt : 0;
+  return feed.decision_age_ms + Math.max(0, extra);
+}
+function renderStatus(data) {
+  const el = document.getElementById("status");
+  const badge = document.getElementById("stalled");
+  if (!el) return;
+  const feed = data.feed || {};
+  const age = decisionAgeMs(data);
+  const stalled = !!(feed.stalled || (age != null && age > 3000));
+  if (badge) badge.className = stalled ? "stalled show" : "stalled";
+  const bot = data.bot_enabled ? "bot ON" : "bot OFF";
+  let alive = "engine starting";
+  if (age != null) {
+    const text = age < 1000 ? age + "ms" : (age / 1000).toFixed(1) + "s";
+    alive = stalled ? "STALLED · last decision " + text + " ago" : "engine alive · last decision " + text + " ago";
+  }
+  const open = currentOpen(data);
+  let session = "no open session";
+  let bids = 0;
+  if (open) {
+    const now = data.mode === "live" && data.wall_ms ? data.wall_ms : (data.now_ms || open.open_ms);
+    const sec = Math.max(0, Math.round((now - open.open_ms) / 1000));
+    session = (open.slug || open.id) + " · " + sec + "s";
+    bids = (open.resting || []).length;
+  }
+  el.textContent = bot + " · " + alive + " · " + session + " · " + bids + " open bids";
+}
+function renderLatency(data) {
+  const el = document.getElementById("latency");
+  if (!el) return;
+  const feed = data.feed || {};
+  if (data.mode !== "live") {
+    el.textContent = "Demo tape";
+    return;
+  }
+  const src = feed.connected ? "WS" : "REST fallback";
+  let age = "";
+  if (feed.decision_age_ms != null) {
+    const ms = feed.decision_age_ms;
+    age = ms < 1000 ? " · " + ms + "ms" : " · " + (ms / 1000).toFixed(1) + "s";
+  }
+  el.textContent = (feed.fast ? "fast" : "poll") + " · " + src + age;
 }
 
 function renderSessions(data) {
@@ -745,7 +813,10 @@ async function boot() {
   const data = await res.json();
   render(data);
   if (data.mode === "live") {
-    setInterval(() => renderHeader(selectedSession()), 250);
+    setInterval(() => {
+      renderHeader(selectedSession());
+      if (state.data) renderStatus(state.data);
+    }, 250);
   }
   const stream = new EventSource("/events");
   stream.onmessage = (event) => render(JSON.parse(event.data));

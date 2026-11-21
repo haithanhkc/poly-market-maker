@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import threading
 import time
 import webbrowser
@@ -76,11 +77,19 @@ class PaperControl:
 class Hub:
     """Chart, book, blotter, and equity derived from engine events."""
 
-    def __init__(self, out_dir: Path, *, mode: str, config: Optional[Config] = None):
+    def __init__(
+        self,
+        out_dir: Path,
+        *,
+        mode: str,
+        config: Optional[Config] = None,
+        env: Optional[dict] = None,
+    ):
         self.out = Path(out_dir)
         self.out.mkdir(parents=True, exist_ok=True)
         self.mode = mode
         self.config = config
+        self.env = env
         self.lock = threading.Lock()
         self.engine = None
         self.control = PaperControl(self._read_bot())
@@ -104,10 +113,17 @@ class Hub:
         engine.quoting_enabled = self.control.enabled()
         if self.ingest not in engine.listeners:
             engine.listeners.append(self.ingest)
+        engine.dashboard = self
 
     def start_live(self) -> None:
-        """Run the public-data paper loop until stop or reset."""
+        """Run the public-data paper loop until stop or reset.
+
+        ``env`` is the same map the CLI passes to the public client. Without
+        it the client reads only the process environment and defaults to
+        testnet, which 404s the mainnet series.
+        """
         self.mode = "live"
+        env = self.env
 
         def loop() -> None:
             while not self.control.should_stop():
@@ -116,12 +132,16 @@ class Hub:
                     self.out,
                     duration_seconds=0,
                     max_markets=0,
+                    env=env,
                     on_engine=self.attach,
                 )
                 if summary.get("stop_reason") == "reset":
                     self._wipe_files()
                     with self.lock:
                         self._clear_memory()
+                    continue
+                if summary.get("stop_reason") == "stall":
+                    time.sleep(1.0)
                     continue
                 break
 
@@ -162,10 +182,21 @@ class Hub:
         return {"ok": True}
 
     def ingest(self, row: dict) -> None:
+        """Memory only. The disk writer flushes the dashboard off the decision thread."""
         with self.lock:
             self._apply(row)
-            body = self._body()
-        self._write_dashboard(body)
+            self._dirty = True
+
+    def flush_disk(self) -> None:
+        with self.lock:
+            if not getattr(self, "_dirty", False):
+                return
+            try:
+                text = json.dumps(self._body())
+            except RuntimeError:
+                return
+            self._dirty = False
+        self._write_dashboard(text)
         self._notify()
 
     def snapshot(self) -> dict:
@@ -193,12 +224,13 @@ class Hub:
             "blotter": blotter,
             "sessions": sessions,
             "listener_error": getattr(self.engine, "listener_error", None),
+            "feed": _feed_view(self.engine, self.config),
         }
 
     def save(self) -> None:
         with self.lock:
-            body = self._body()
-        self._write_dashboard(body)
+            self._dirty = True
+        self.flush_disk()
 
     def _capital(self) -> float:
         config = self.config
@@ -290,7 +322,14 @@ class Hub:
                 "bids": [[float(price), float(size)] for price, size in book.bids[:8]],
                 "asks": [[float(price), float(size)] for price, size in book.asks[:8]],
             }
-        if kind in {"book", "binance_lean", "clock", "fill", "quote_submit"}:
+        if kind in {
+            "book",
+            "binance_lean",
+            "clock",
+            "fill",
+            "quote_submit",
+            "quote_skipped",
+        }:
             self._touch_point(market)
         if kind in {"fill", "redeem", "resolution", "quote_submit"}:
             self._touch_point(market)
@@ -472,11 +511,22 @@ class Hub:
             "now_ms": self.now_ms,
         }
 
-    def _write_dashboard(self, body: dict) -> None:
+    def _write_dashboard(self, text: str) -> None:
         path = self.out / _DASH
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(body), encoding="utf-8")
-        tmp.replace(path)
+        tmp.write_text(text, encoding="utf-8")
+        last = None
+        for attempt in range(6):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError as exc:
+                last = exc
+                time.sleep(0.05 * (attempt + 1))
+        if last is not None:
+            if self.engine is not None:
+                self.engine.listener_error = f"PermissionError: {last}"
+            print(f"dashboard save skipped: {last}", file=sys.stderr, flush=True)
 
     def _load_dashboard(self) -> None:
         path = self.out / _DASH
@@ -959,8 +1009,11 @@ def _push(engine, tape, event, px: Decimal) -> None:
     engine.handle_event(event)
 
 
-def live_config(path: Path) -> Config:
-    """Same bankroll and price source as run_smallpair_combo100, own output folder."""
+def live_config(path: Path, *, fast: bool = True) -> Config:
+    """Same bankroll and price source as run_smallpair_combo100, own output folder.
+
+    ``fast`` is the event-driven book. Pass False for the old REST poll.
+    """
     from paper_split_maker.cli import _apply_strategy, _load
 
     args = Namespace(
@@ -973,10 +1026,25 @@ def live_config(path: Path) -> Config:
         pair_gate=None,
         catch_up=None,
         first_leg_seconds=None,
+        fast=fast,
         capital="100",
         max_loss_fraction="0.99",
     )
     return _apply_strategy(_load(args), args)
+
+
+def _feed_view(engine, config) -> dict:
+    decision = int(getattr(engine, "decision_wall_ms", 0) or 0) if engine is not None else 0
+    age = None
+    if decision:
+        age = max(0, int(time.time() * 1000) - decision)
+    return {
+        "book": str(getattr(engine, "book_transport", "") or "") if engine is not None else "",
+        "connected": bool(getattr(engine, "book_connected", False)) if engine is not None else False,
+        "decision_age_ms": age,
+        "fast": bool(getattr(config, "small_pair_fast", False)),
+        "stalled": bool(getattr(engine, "stalled", False)) or (age is not None and age > 3000),
+    }
 
 
 def serve(hub: Hub, port: int, *, open_browser: bool = False) -> None:
@@ -1095,13 +1163,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--replay", action="store_true")
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--fast",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "event-driven book and pair take. Default on. "
+            "--no-fast is the old REST poll, for a side-by-side comparison."
+        ),
+    )
     args = parser.parse_args(argv)
     out = Path(args.out)
     if args.demo:
         hub = play_demo(out, replay=args.replay)
     else:
-        config = live_config(Path(args.config))
-        hub = Hub(out, mode="live", config=config)
+        path = Path(args.config)
+        from paper_split_maker.cli import _credential_env
+
+        config = live_config(path, fast=bool(args.fast))
+        hub = Hub(out, mode="live", config=config, env=_credential_env(path))
         hub.start_live()
     if args.port == 8765:
         raise SystemExit("port 8765 is the other local page; use 8766")

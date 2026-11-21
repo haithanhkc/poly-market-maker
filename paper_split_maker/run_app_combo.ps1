@@ -1,7 +1,8 @@
-# Paper dashboard for the combined small_pair run (run B).
+# Paper dashboard for the combined small_pair run (run B), the slow poll.
 # Simulated fills against the live predict.fun book. No orders are sent.
 # Ledger: runs\app_combo  (separate from runs\smallpair_combo100).
 # Browser: http://127.0.0.1:8766
+# The event-driven version is run_app_fast.ps1 on port 8767.
 #
 # Run this again after a reboot. It resumes runs\app_combo\state.json when
 # the capital is still 100 and the loss fraction is still 0.99.
@@ -40,7 +41,8 @@ try {
     python -m paper_split_maker.app `
         --config config.paper.json `
         --out runs\app_combo `
-        --port 8766
+        --port 8766 `
+        --no-fast
     exit $LASTEXITCODE
 }
 finally {
