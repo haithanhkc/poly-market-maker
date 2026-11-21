@@ -461,6 +461,8 @@ class _RestWorker:
             return ("discover", self._discover(job[1]))
         if kind == "books":
             return ("books", self._books(job[1]))
+        if kind == "token_books":
+            return ("token_books", self._token_books(job[1]))
         if kind == "market":
             return self._market(job[1], job[2])
         return ("error", "job", str(kind))
@@ -502,6 +504,20 @@ class _RestWorker:
         for ident, token in pairs:
             books[ident] = reader.fetch_book(token)
         return books
+
+    def _token_books(self, jobs):
+        """Per-outcome snapshots, the same ``fetch_book`` the poll loop uses."""
+        rows = []
+        fetch = getattr(self.reader, "fetch_book", None)
+        for market_id, outcome, token in jobs:
+            if fetch is None:
+                rows.append((market_id, outcome, None, "no fetch_book"))
+                continue
+            try:
+                rows.append((market_id, outcome, fetch(token), ""))
+            except Exception as exc:
+                rows.append((market_id, outcome, None, str(exc) or exc.__class__.__name__))
+        return rows
 
     def _market(self, market_id, condition_id):
         reader = self.reader
@@ -691,8 +707,8 @@ def _paper_fast_loop(
             if stamp >= engine.state.now_ms:
                 engine.state.now_ms = stamp
             engine._retire_closed()
-            rest_frames, book_error = _take_rest(
-                worker, engine, reader, stamp, max_markets, note, opened_slugs
+            rest_frames, book_error, token_applied = _take_rest(
+                worker, engine, reader, stamp, polls, max_markets, note, opened_slugs
             )
             last_discover, last_trades, trade_cursor = _queue_rest(
                 worker,
@@ -718,7 +734,7 @@ def _paper_fast_loop(
                 frames = []
                 note(f"book socket read failed: {exc}")
             frames = _latest_frames(list(frames) + list(rest_frames))
-            applied = False
+            applied = bool(token_applied)
             failed = bool(book_error) and not getattr(feed, "connected", False)
             if frames:
                 applied, frame_failed, polls = _apply_yes_frames(
@@ -865,9 +881,10 @@ def _book_rows(books) -> list:
     return frames
 
 
-def _take_rest(worker, engine, reader, stamp, max_markets, note, opened_slugs):
+def _take_rest(worker, engine, reader, stamp, polls, max_markets, note, opened_slugs):
     frames = []
     book_error = False
+    token_applied = False
     for item in worker.take():
         kind = item[0]
         if kind == "discover":
@@ -876,13 +893,16 @@ def _take_rest(worker, engine, reader, stamp, max_markets, note, opened_slugs):
             )
         elif kind == "books":
             frames.extend(_book_rows(item[1]))
+        elif kind == "token_books":
+            applied, polls = _apply_token_books(engine, item[1], stamp, polls)
+            token_applied = token_applied or applied
         elif kind == "market":
             _apply_market_fetch(engine, stamp, note, item[1], item[2], item[3], item[4])
         elif kind == "error":
             note(f"rest {item[1]} failed: {item[2]}")
-            if item[1] == "books":
+            if item[1] in {"books", "token_books"}:
                 book_error = True
-    return frames, book_error
+    return frames, book_error, token_applied
 
 
 def _apply_discover_rows(engine, reader, stamp, max_markets, note, opened_slugs, rows) -> None:
@@ -956,6 +976,9 @@ def _queue_rest(
     connected = bool(getattr(feed, "connected", False))
     book_age = time.time() * 1000 - float(last_book_wall or 0)
     missing = _books_missing(engine)
+    # No best bid/ask is not a book, even when the socket is connected.
+    # Fetch the same per-token snapshot the poll loop writes, immediately.
+    blind = _markets_without_touch(engine)
     # A slow discover used to stay "late" and never let a book GET run.
     # Fetch a missing or quiet book first, but still discover at least
     # every 2s so the next round is not stuck behind a dead socket.
@@ -964,6 +987,13 @@ def _queue_rest(
     )
     discover_due = now - last_discover >= _FAST_DISCOVER_S
     discover_starved = now - last_discover >= 2.0
+    if blind and hasattr(reader, "fetch_book") and not discover_starved:
+        jobs = []
+        for market in blind:
+            jobs.append((market.market_id, "up", market.up_token_id))
+            jobs.append((market.market_id, "down", market.down_token_id))
+        if jobs and worker.submit(("token_books", jobs)):
+            return last_discover, last_trades, trade_cursor
     if need_refresh and not discover_starved:
         pairs = [(ident, routes[ident][0].up_token_id) for ident in routes]
         if pairs and worker.submit(("books", pairs)):
@@ -1047,12 +1077,18 @@ def _apply_yes_frames(engine, frames, routes, stamp, polls, yes_to_events):
             continue
         market, info = pair
         polls += 1
+        if not (yes.get("bids") and yes.get("asks")):
+            continue
         events = yes_to_events(
             market.market_id,
             yes,
             stamp,
             int(info.get("precision") or 2),
             f"{polls}",
+            tick=info.get("tick") or market.tick_size,
+            min_size=market.min_order_size,
+            up_token=market.up_token_id,
+            down_token=market.down_token_id,
         )
         if not events:
             market.book_fetches_failed += 1
@@ -1127,6 +1163,53 @@ def _poll_resolutions(engine, reader) -> None:
         if resolution is not None:
             resolution["ts"] = engine.state.now_ms
             engine.handle_event(resolution)
+
+
+def _apply_token_books(engine, rows, stamp, polls):
+    """Write REST snapshots the way the poll loop does, one outcome at a time."""
+    applied = False
+    for market_id, outcome, book, error in rows or []:
+        market = engine.state.markets.get(str(market_id))
+        if market is None:
+            continue
+        if error or not isinstance(book, dict) or not book.get("bids") or not book.get("asks"):
+            market.book_fetches_failed += 1
+            continue
+        payload = dict(book)
+        if _stamp_missing(payload.get("timestamp")):
+            payload["timestamp"] = stamp
+        polls += 1
+        event = clob_book_event(
+            market.market_id,
+            str(outcome),
+            payload,
+            event_id=(
+                f"book:{market.market_id}:{outcome}:{payload.get('hash')}:"
+                f"{payload.get('timestamp')}:{polls}"
+            ),
+        )
+        if event is None:
+            market.book_fetches_failed += 1
+            continue
+        market.book_fetches_ok += 1
+        event["book_ts"] = event["ts"]
+        event["ts"] = stamp
+        engine.handle_event(event)
+        applied = True
+    return applied, polls
+
+
+def _markets_without_touch(engine) -> list:
+    found = []
+    for market in engine.state.markets.values():
+        if market.status != "open":
+            continue
+        for outcome in ("up", "down"):
+            book = market.book(outcome)
+            if book.best_bid() is None or book.best_ask() is None:
+                found.append(market)
+                break
+    return found
 
 
 def _books_missing(engine) -> bool:

@@ -1007,6 +1007,203 @@ def _gamma(open_s: int) -> dict:
     }
 
 
+def test_rollover_rest_book_fills_the_dashboard(tmp_path):
+    """A new round whose socket snapshot has no touch still gets the poll book.
+
+    The chart, the price to beat, and the ladder read that book. Bids post
+    while the bot is on.
+    """
+    from paper_split_maker.app import Hub
+
+    round_s = 1_700_000_100
+    engine = _engine(
+        tmp_path,
+        small_pair_fast=True,
+        small_pair_fast_start_seconds=1,
+        small_pair_binance=True,
+        price_source="combined",
+        max_open_markets=1,
+        ack_latency_ms=0,
+        cancel_latency_ms=0,
+    )
+
+    class Px:
+        def latest(self):
+            return (int(engine.state.now_ms or 0), Decimal("60495.55"))
+
+        def price_at(self, ts_ms):
+            return Decimal("60495.55")
+
+        def vol(self, now_ms):
+            return None
+
+    engine.binance_feed = Px()
+    run(
+        engine,
+        [
+            market_event(
+                "m1",
+                slug=f"btc-updown-5m-{round_s}",
+                end_ts=(round_s + 300) * 1000,
+                ts=round_s * 1000,
+                event_id="open-a",
+            ),
+            * [
+                book_event(
+                    "m1",
+                    outcome,
+                    "0.48",
+                    "0.52",
+                    ts=round_s * 1000 + 2_000,
+                    bid_size="10",
+                    digest=f"a-{outcome}",
+                )
+                for outcome in ("up", "down")
+            ],
+        ],
+    )
+    hub = Hub(tmp_path / "hub", mode="live", config=engine.config)
+    hub.attach(engine)
+
+    class Feed:
+        def __init__(self):
+            self.connected = True
+            self.markets = []
+            self._sent = False
+
+        def set_markets(self, ids):
+            self.markets = list(ids)
+
+        def drain(self):
+            if self._sent:
+                return []
+            self._sent = True
+            return [
+                {
+                    "market_id": "999",
+                    "bids": [],
+                    "asks": [],
+                    "timestamp": 1,
+                    "hash": "empty",
+                }
+            ]
+
+        def stop(self):
+            self.connected = False
+
+    class Reader:
+        network = "mainnet"
+        api_key = ""
+        last_discovery = {
+            "error": "",
+            "rounds": 1,
+            "network": "mainnet",
+            "series": "btc-updown-5m",
+            "http_status": 200,
+            "parsed": 1,
+            "matched": 1,
+            "unparsed": 0,
+        }
+        _by_condition = {}
+
+        def begin_poll(self):
+            return None
+
+        def discover_btc_updown(self, now_s, limit, slugs=None, series=None):
+            found = []
+            for slug in slugs or []:
+                tail = str(slug).rsplit("-", 1)[-1]
+                if not tail.isdigit():
+                    continue
+                open_s = int(tail)
+                if open_s < round_s + 300:
+                    continue
+                payload = _gamma(open_s)
+                self._by_condition[str(payload["conditionId"]).lower()] = {
+                    "market_id": "999",
+                    "precision": 2,
+                    "tick": "0.01",
+                }
+                found.append(payload)
+                if len(found) >= max(int(limit or 1), 1):
+                    break
+            return found
+
+        def fetch_book(self, token):
+            token = str(token)
+            bid, ask = ("0.46", "0.54") if token.endswith("up") else ("0.44", "0.52")
+            return {
+                "timestamp": "1",
+                "hash": token,
+                "bids": [{"price": bid, "size": "20"}],
+                "asks": [{"price": ask, "size": "20"}],
+                "asset_id": token,
+                "tick_size": "0.01",
+                "min_order_size": "1",
+            }
+
+        def fetch_trades(self, *args, **kwargs):
+            return {"data": []}
+
+        def fetch_resolution(self, *args, **kwargs):
+            return {"data": []}
+
+        def fetch_orderbooks(self, ids):
+            return {}
+
+    class Clock:
+        def __init__(self):
+            self.t = round_s + 20
+            self.n = 0
+
+        def __call__(self):
+            return self.t
+
+        def sleep(self, seconds):
+            self.n += 1
+            if self.n == 4:
+                self.t = round_s + 301
+            else:
+                self.t += 0.05
+            if self.n >= 40:
+                (tmp_path / "STOP").write_text("stop", encoding="utf-8")
+
+    clock = Clock()
+    summary = _paper_fast_loop(
+        engine.config,
+        tmp_path,
+        engine,
+        Reader(),
+        clock,
+        clock.sleep,
+        None,
+        0,
+        0,
+        lambda text: None,
+        ["rollover"],
+        set(),
+        True,
+        0,
+        book_feed=Feed(),
+    )
+    assert summary["stop_reason"] == "manual"
+    nxt = f"btc-updown-5m-{round_s + 300}"
+    market = next(item for item in engine.state.markets.values() if item.slug == nxt)
+    assert market.bids_posted > 0
+    assert market.up_book.best_bid() == Decimal("0.46")
+    assert market.down_book.best_bid() == Decimal("0.44")
+    assert market.reference_price == Decimal("60495.55")
+    assert market.reference_source == "combined"
+    snap = hub.snapshot()
+    session = next(item for item in snap["sessions"] if item["slug"] == nxt)
+    assert session["price_to_beat"] == "60495.55"
+    assert session["books"]["up"]["bids"]
+    assert session["books"]["up"]["asks"]
+    assert session["books"]["down"]["bids"]
+    priced = [point for point in session["points"] if point["up"] is not None and point["down"] is not None]
+    assert priced
+
+
 def test_fast_flag_defaults_off_and_dashboard_env_is_forwarded(tmp_path, monkeypatch):
     assert Config().small_pair_fast is False
     config = Config()

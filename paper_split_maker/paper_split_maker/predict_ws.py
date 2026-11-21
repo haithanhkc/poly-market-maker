@@ -174,15 +174,23 @@ def yes_to_events(
     local_stamp: int,
     precision: int,
     seq: str,
+    *,
+    tick=None,
+    min_size=None,
+    up_token: str = "",
+    down_token: str = "",
 ) -> list[dict]:
     """Up book plus the Down complement. Both use the local receipt time.
 
     Exchange timestamps can sit behind the receipt clock. Driving ``book_ts``
     with the receipt keeps a newer socket message from being dropped as
-    out of order.
+    out of order. A snapshot with no bid or no ask is not a book: writing
+    it would wipe the touch the chart and the ladder read.
     """
     bids = list(yes.get("bids") or [])
     asks = list(yes.get("asks") or [])
+    if not bids or not asks:
+        return []
     digest = str(yes.get("hash") or seq)
     payloads = {
         "up": {"timestamp": local_stamp, "hash": f"{digest}:up", "bids": bids, "asks": asks},
@@ -193,6 +201,15 @@ def yes_to_events(
             "asks": complement_levels(bids, precision),
         },
     }
+    tokens = {"up": up_token, "down": down_token}
+    for outcome, payload in payloads.items():
+        token = tokens[outcome]
+        if token:
+            payload["asset_id"] = str(token)
+        if tick not in (None, ""):
+            payload["tick_size"] = str(tick)
+        if min_size not in (None, ""):
+            payload["min_order_size"] = str(min_size)
     events = []
     for outcome, payload in payloads.items():
         event = clob_book_event(

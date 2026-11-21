@@ -392,12 +392,11 @@ def test_old_book_and_chainlink_heartbeat_still_quote_from_binance(tmp_path, cap
         engine,
         [{"type": "heartbeat", "event_id": "hb-old-book", "ts": quote + 1, "market_id": "m1"}],
     )
-    assert "stale_feed" not in (market.skip_counts or {})
-    assert market.bids_posted > 0
-    assert market.last_combined == Decimal("60334")
-    assert market.price_spot_source == "binance"
-    sides = {order.outcome for order in engine.state.orders.values()}
-    assert sides == {"up", "down"}
+    # A book older than stale_after_ms is the poll-loop stale_feed.
+    # The Chainlink heartbeat is not.
+    assert market.skip_counts.get("stale_feed", 0) >= 1
+    assert market.bids_posted == 0
+    assert market.reference_price == Decimal("60324.875")
     assert "binance_lean" in capsys.readouterr().err
 
     quiet = make_engine(
@@ -430,8 +429,11 @@ def test_old_book_and_chainlink_heartbeat_still_quote_from_binance(tmp_path, cap
         ],
     )
     quiet_market = quiet.state.markets["m1"]
-    assert quiet_market.skip_counts.get("stale_feed", 0) >= 1
-    assert quiet_market.bids_posted == 0
+    # Binance age and a 50s Chainlink print do not cancel a fresh book.
+    assert "stale_feed" not in (quiet_market.skip_counts or {})
+    assert quiet_market.bids_posted > 0
+    sides = {order.outcome for order in quiet.state.orders.values()}
+    assert sides == {"up", "down"}
     assert "binance_lean" in capsys.readouterr().err
 
 

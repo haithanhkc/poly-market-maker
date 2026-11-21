@@ -1276,10 +1276,6 @@ class Engine:
             self._cancel_market(market, "reject_pause")
             self._skip(market, "reject_pause")
             return
-        if not self.quoting_enabled:
-            self._cancel_market(market, "bot_off")
-            self._skip(market, "bot_off")
-            return
         window = window_seconds(series_of(market.slug))
         open_ms = round_open_ms(market.slug, market.end_ts_ms, window)
         age_s = (self.state.now_ms - open_ms) // 1000
@@ -1299,14 +1295,24 @@ class Engine:
             spot, s0, fair, age_binance = self._apply_binance_lean(
                 market, open_ms, window, age_s, up_bid, up_ask
             )
-        blocked = self._quote_feed_block(market, age_binance)
-        if blocked:
+        if not self.quoting_enabled:
             if self.config.small_pair_binance:
                 self._log_binance_lean(
-                    market, spot, s0, fair, up_bid, up_ask, blocked
+                    market, spot, s0, fair, up_bid, up_ask, "bot_off"
                 )
-            self._cancel_market(market, blocked)
-            self._skip(market, blocked)
+            self._cancel_market(market, "bot_off")
+            self._skip(market, "bot_off")
+            return
+        # Same book gate as the poll loop. Chainlink age is not an input:
+        # a 30–60s aggregator heartbeat must not cancel both sides.
+        if not self._feeds_ok(market):
+            reason = "disconnected" if not self.state.feed_up else "stale_feed"
+            if self.config.small_pair_binance:
+                self._log_binance_lean(
+                    market, spot, s0, fair, up_bid, up_ask, reason
+                )
+            self._cancel_market(market, reason)
+            self._skip(market, reason)
             return
         adverse_gap = self.config.small_pair_adverse_gap
         adverse_stale = self.config.small_pair_adverse_gap_stale
@@ -1469,22 +1475,27 @@ class Engine:
             (market.reference_price is None or market.reference_price <= 0)
             and self.state.now_ms >= open_ms
         ):
-            if mode == "binance" and spot is not None:
-                at_open = feed.price_at(open_ms) if feed is not None else None
-                market.reference_price = at_open or spot
-                market.reference_source = "binance"
-            elif mode == "combined" and spot is not None:
-                market.reference_price = spot
-                market.reference_source = "combined"
-            elif mode != "binance":
-                basis_px = link_px if link_px is not None else spot
-                if basis_px is not None:
+            # predict.fun's priceToBeat wins when the open event carried it.
+            # Otherwise the open print is the stream, the same fallback the
+            # poll loop used once a round was open.
+            chosen = spot if spot is not None else binance_px
+            if chosen is None:
+                chosen = link_px
+            if chosen is not None and chosen > 0:
+                if mode == "binance":
+                    at_open = feed.price_at(open_ms) if feed is not None else None
+                    market.reference_price = at_open or chosen
+                    market.reference_source = "binance"
+                elif mode == "combined":
+                    market.reference_price = chosen
+                    market.reference_source = "combined"
+                else:
                     at_open = (
                         link_feed.price_at(open_ms)
                         if link_feed is not None and link_px is not None
                         else None
                     )
-                    market.reference_price = at_open or basis_px
+                    market.reference_price = at_open or chosen
                     market.reference_source = (
                         "chainlink" if link_px is not None else (view.spot_source or mode)
                     )
@@ -2829,30 +2840,6 @@ class Engine:
 
     def _working_outcome(self, market: Market, outcome: str) -> bool:
         return bool(self._working(market, outcome))
-
-    def _quote_feed_block(self, market: Market, binance_age_s: float | None) -> str:
-        """Why this decision must not quote, or "" when it may.
-
-        For small_pair with a Binance feed, the book timer and the Chainlink
-        heartbeat are not a reason to stop. Chainlink only changes the blend.
-        ``stale_feed`` means Binance itself has had no tick for more than 5s.
-        A feed that has not printed yet does not block: the book is enough
-        until the first trade arrives. Other strategies still use book age.
-        """
-        feed = self.binance_feed
-        if (
-            self.config.strategy == "small_pair"
-            and self.config.small_pair_binance
-            and feed is not None
-        ):
-            if binance_age_s is None:
-                return ""
-            if float(binance_age_s) > 5:
-                return "stale_feed"
-            return ""
-        if not self._feeds_ok(market):
-            return "disconnected" if not self.state.feed_up else "stale_feed"
-        return ""
 
     def _retire_closed(self) -> None:
         """Drop ended rounds out of the open-market slot before the next open."""

@@ -333,16 +333,9 @@ function render(data) {
   state.data = data;
   state.snapAt = Date.now();
   if (data.mode === "live" && data.wall_ms) state.skew = data.wall_ms - Date.now();
-  const open = currentOpen(data);
-  const known = data.sessions.some((item) => item.id === state.selected);
-  if (open && state.liveId !== open.id) {
-    state.liveId = open.id;
-    state.pinned = null;
-    state.selected = open.id;
-  } else if (!known) {
+  if (!state.selected || !data.sessions.some((item) => item.id === state.selected)) {
+    const open = data.sessions.find((item) => item.status === "open");
     state.selected = (open || data.sessions[data.sessions.length - 1] || {}).id || null;
-  } else if (!state.pinned && open) {
-    state.selected = open.id;
   }
   const session = selectedSession();
   document.getElementById("bot").textContent = data.bot_enabled ? "BOT ON" : "BOT OFF";
@@ -418,11 +411,7 @@ function renderSessions(data) {
     const when = clock(session.open_ms, false);
     const flag = session.status === "open" ? "● " : (session.winner ? session.winner.toUpperCase() + " " : "");
     button.textContent = flag + when;
-    button.addEventListener("click", () => {
-      state.pinned = session.id;
-      state.selected = session.id;
-      render(state.data);
-    });
+    button.addEventListener("click", () => { state.selected = session.id; render(state.data); });
     bar.appendChild(button);
   });
 }
