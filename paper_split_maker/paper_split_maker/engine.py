@@ -9,6 +9,7 @@ latency and only while the feed is up.
 from __future__ import annotations
 
 import sys
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
@@ -117,6 +118,13 @@ class Engine:
         self.book_transport = "rest"
         self.book_connected = False
         self.decision_wall_ms = 0
+        self.stalled = False
+        self.restart_paper = False
+        # 0 writes state after every event. The fast loop raises this so a
+        # book tick does not rewrite state.json on the decision thread.
+        self.persist_gap_s = 0.0
+        self._last_persist = 0.0
+        self._lean_log_at: dict[str, tuple] = {}
 
     @classmethod
     def create(
@@ -252,8 +260,16 @@ class Engine:
     def _finish(self) -> None:
         if self.writer is not None:
             self.writer.write(self._batch)
-        if self.state_path is not None and self.persist_each_event:
-            save_state(self.state_path, self.state)
+        if self.state_path is None or not self.persist_each_event:
+            return
+        gap = float(getattr(self, "persist_gap_s", 0) or 0)
+        noisy = {"clock", "binance_lean", "skip", "feed", "book"}
+        important = gap <= 0 or any(row.get("kind") not in noisy for row in self._batch)
+        now = time.monotonic()
+        if not important and now - self._last_persist < gap:
+            return
+        save_state(self.state_path, self.state)
+        self._last_persist = now
 
     def flush(self) -> None:
         if self.state_path is not None:
@@ -1374,7 +1390,7 @@ class Engine:
     def _apply_binance_lean(self, market, open_ms, window, age_s, up_bid, up_ask):
         """Record S0, fair value, and the gap. Returns spot, S0, and P(Up)."""
         from paper_split_maker.binance_btc import fair_up
-        from paper_split_maker.price_blend import combine_prices
+        from paper_split_maker.price_blend import CHAINLINK_ANCHOR_S, combine_prices
 
         feed = self.binance_feed
         latest = feed.latest() if feed is not None else None
@@ -1397,16 +1413,20 @@ class Engine:
             link_age = (self.state.now_ms - int(link_latest[0])) / 1000
             if link_age < 0:
                 link_age = 0
-            if self._chainlink_anchor_ms != int(link_latest[0]):
-                self._chainlink_anchor_ms = int(link_latest[0])
+            link_stamp = int(link_latest[0])
+            # A missed snap must be retried. Locking the timestamp with an
+            # empty anchor kept the raw on-chain level for the whole round.
+            if self._chainlink_anchor_ms != link_stamp or self._chainlink_anchor_px is None:
+                self._chainlink_anchor_ms = link_stamp
                 snapped = None
                 if feed is not None:
-                    snapped = feed.price_at(int(link_latest[0]))
+                    snapped = feed.price_at(link_stamp)
                     if snapped is None and latest is not None:
                         snapped = latest[1]
-                self._chainlink_anchor_px = snapped
-                if snapped is not None and link_px is not None:
-                    self._basis.add(int(link_latest[0]), snapped - link_px)
+                if snapped is not None:
+                    self._chainlink_anchor_px = snapped
+                    if link_px is not None:
+                        self._basis.add(link_stamp, snapped - link_px)
             anchor = self._chainlink_anchor_px
         view = combine_prices(
             mode=mode,
@@ -1419,6 +1439,7 @@ class Engine:
             chainlink_stale_s=self.config.chainlink_stale_seconds,
             disagree_fraction=self.config.small_pair_price_disagree,
             basis=self._basis.median(),
+            chainlink_anchor_s=CHAINLINK_ANCHOR_S,
         )
         spot = binance_px if mode == "binance" else view.spot
         market.price_widen = bool(view.widen) and mode != "binance"
@@ -1530,6 +1551,19 @@ class Engine:
                 f"down_target={market.last_down_target if market.last_down_target is not None else '-'} "
                 f"down_best={market.down_book.best_bid() if market.down_book.best_bid() is not None else '-'}"
             )
+        signature = (
+            action or "",
+            str(fair) if fair is not None else "",
+            str(spot) if spot is not None else "",
+        )
+        previous = self._lean_log_at.get(market.market_id)
+        if (
+            previous is not None
+            and self.state.now_ms - int(previous[0]) < 1000
+            and previous[1] == signature
+        ):
+            return
+        self._lean_log_at[market.market_id] = (self.state.now_ms, signature)
         print(
             f"binance_lean {market.slug or market.market_id} {detail}",
             file=sys.stderr,

@@ -10,6 +10,7 @@ import socket
 import threading
 import time
 from argparse import Namespace
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from paper_split_maker.predict_ws import (
     yes_to_events,
 )
 from paper_split_maker.public_client import PublicReadClient
-from paper_split_maker.session import _paper_fast_loop
+from paper_split_maker.session import _paper_fast_loop, _watch_once
 from paper_split_maker.small_pair import plan_small_pair, shade_losing_touch, take_completion
 from tests.helpers import book_event, make_engine, market_event, run
 
@@ -571,6 +572,327 @@ def test_fast_loop_wakes_on_a_book_and_does_not_sleep_the_poll_interval(tmp_path
     assert live
 
 
+def test_watchdog_dumps_and_requests_a_restart_when_decisions_stop(tmp_path):
+    engine = _engine(tmp_path, small_pair_fast=True)
+    engine.decision_wall_ms = 1_000
+
+    class Feed:
+        def __init__(self):
+            self.dropped = 0
+            self.connected = True
+
+        def drop(self):
+            self.dropped += 1
+            self.connected = False
+
+    feed = Feed()
+    dumped = []
+    assert _watch_once(engine, feed, dumped.append, now_ms=5_000) is True
+    assert engine.stalled is True
+    assert engine.restart_paper is False
+    assert feed.dropped == 1
+    assert dumped == [4_000]
+    assert _watch_once(engine, feed, dumped.append, now_ms=10_000) is True
+    assert engine.restart_paper is True
+    engine.decision_wall_ms = 20_000
+    assert _watch_once(engine, feed, dumped.append, now_ms=20_500) is False
+    assert engine.stalled is False
+
+
+def test_fast_loop_stops_when_the_watchdog_asks_for_a_restart(tmp_path):
+    engine = _engine(tmp_path, small_pair_fast=True)
+
+    class Feed:
+        connected = False
+
+        def set_markets(self, ids):
+            return None
+
+        def drain(self):
+            return []
+
+        def stop(self):
+            return None
+
+    class Reader:
+        network = "mainnet"
+        api_key = ""
+        last_discovery = {}
+        _by_condition = {}
+
+        def discover_btc_updown(self, *args, **kwargs):
+            return []
+
+        def fetch_trades(self, *args, **kwargs):
+            return {"data": []}
+
+        def fetch_resolution(self, *args, **kwargs):
+            return {"data": []}
+
+        def fetch_orderbooks(self, ids):
+            return {}
+
+    box = {}
+
+    def _run():
+        box["summary"] = _paper_fast_loop(
+            engine.config,
+            tmp_path,
+            engine,
+            Reader(),
+            time.time,
+            time.sleep,
+            None,
+            0,
+            0,
+            lambda text: None,
+            ["stall"],
+            set(),
+            True,
+            0,
+            book_feed=Feed(),
+        )
+
+    thread = threading.Thread(target=_run, name="stall-restart", daemon=True)
+    thread.start()
+    try:
+        started = time.time() + 2
+        while time.time() < started and not engine.decision_wall_ms:
+            time.sleep(0.05)
+        assert engine.decision_wall_ms > 0
+        engine.restart_paper = True
+        thread.join(3)
+    finally:
+        engine.restart_paper = True
+        (tmp_path / "STOP").write_text("stop", encoding="utf-8")
+        thread.join(2)
+    assert not thread.is_alive()
+    assert box["summary"]["stop_reason"] == "stall"
+
+
+def test_rollover_and_toggle_do_not_block_the_decision_loop(tmp_path):
+    """A blocked discovery GET must not freeze quotes or the bot toggle."""
+    from paper_split_maker.app import PaperControl
+
+    engine = _engine(
+        tmp_path,
+        small_pair_fast=True,
+        small_pair_fast_start_seconds=0,
+        small_pair_series=("btc-updown-5m",),
+        ack_latency_ms=0,
+        cancel_latency_ms=0,
+        max_open_markets=6,
+    )
+    now_s = int(time.time())
+    open_s = (now_s // 300) * 300
+    opened_ms = now_s * 1000
+    run(
+        engine,
+        [
+            market_event(
+                slug=f"btc-updown-5m-{open_s}",
+                end_ts=(open_s + 300) * 1000,
+                ts=opened_ms,
+                reference_price="60324.875",
+            ),
+            book_event("m1", "up", "0.48", "0.52", ts=opened_ms + 1, digest="up"),
+            book_event("m1", "down", "0.48", "0.52", ts=opened_ms + 1, digest="down"),
+        ],
+    )
+    control = PaperControl(True)
+    engine.paper_control = control
+
+    class Feed:
+        def __init__(self):
+            self.connected = True
+            self.markets = []
+            self._frames = []
+            self.sent = set()
+
+        def set_markets(self, ids):
+            self.markets = list(ids)
+            for ident in self.markets:
+                if ident in self.sent:
+                    continue
+                self.sent.add(ident)
+                self._frames.append(
+                    {
+                        "market_id": ident,
+                        "bids": [{"price": "0.48", "size": "10"}],
+                        "asks": [{"price": "0.52", "size": "10"}],
+                        "timestamp": int(time.time() * 1000),
+                        "hash": f"h-{ident}",
+                    }
+                )
+
+        def drain(self):
+            rows = self._frames
+            self._frames = []
+            return rows
+
+        def stop(self):
+            self.connected = False
+
+    class Reader:
+        network = "mainnet"
+        api_key = ""
+
+        def __init__(self):
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.calls = 0
+            self._by_condition = {"0xm1": {"market_id": "123", "precision": 2}}
+            self.last_discovery = {
+                "error": "",
+                "rounds": 1,
+                "network": "mainnet",
+                "series": "btc-updown-5m",
+                "http_status": 200,
+                "parsed": 1,
+                "matched": 1,
+                "unparsed": 0,
+                "starts": [],
+            }
+
+        def begin_poll(self):
+            return None
+
+        def discover_btc_updown(self, now_s, limit, slugs=None, series=None):
+            self.calls += 1
+            if self.calls == 1:
+                self.entered.set()
+                assert self.release.wait(8), "discovery was not released"
+            found = []
+            for slug in slugs or []:
+                tail = str(slug).rsplit("-", 1)[-1]
+                if not tail.isdigit():
+                    continue
+                found.append(_gamma(int(tail)))
+                if len(found) >= int(limit or 1):
+                    break
+            for payload in found:
+                self._by_condition[str(payload["conditionId"]).lower()] = {
+                    "market_id": str(700000 + (int(payload["slug"].rsplit("-", 1)[-1]) % 10000)),
+                    "precision": 2,
+                }
+            self.last_discovery = {
+                "error": "",
+                "rounds": len(found),
+                "network": "mainnet",
+                "series": series or "btc-updown-5m",
+                "http_status": 200,
+                "parsed": len(found),
+                "matched": len(found),
+                "unparsed": 0,
+                "starts": [item.get("slug") for item in found],
+            }
+            return found
+
+        def fetch_trades(self, *args, **kwargs):
+            return {"data": []}
+
+        def fetch_resolution(self, *args, **kwargs):
+            return {"data": []}
+
+        def fetch_orderbooks(self, ids):
+            return {}
+
+    def _buys(status):
+        rows = []
+        for order in list(engine.state.orders.values()):
+            if order.market_id != "m1" or getattr(order, "side", "buy") != "buy":
+                continue
+            if order.status in status:
+                rows.append(order)
+        return rows
+
+    reader = Reader()
+    box = {}
+
+    def _run():
+        box["summary"] = _paper_fast_loop(
+            engine.config,
+            tmp_path,
+            engine,
+            reader,
+            time.time,
+            time.sleep,
+            None,
+            0,
+            0,
+            lambda text: None,
+            ["rollover toggle"],
+            set(),
+            True,
+            0,
+            book_feed=Feed(),
+        )
+
+    thread = threading.Thread(target=_run, name="rollover-test", daemon=True)
+    thread.start()
+    try:
+        assert reader.entered.wait(3), "discovery never started"
+        fresh = time.time() + 2
+        while time.time() < fresh:
+            wall = int(engine.decision_wall_ms or 0)
+            age = int(time.time() * 1000) - wall
+            if wall and age < 1000 and _buys({"live", "queued"}):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(
+                f"loop did not quote during discovery; decision_wall_ms={engine.decision_wall_ms}"
+            )
+        control.set_enabled(False)
+        toggled = time.time() + 2
+        while time.time() < toggled and (_buys({"live", "queued"}) or engine.quoting_enabled):
+            time.sleep(0.05)
+        assert engine.quoting_enabled is False
+        assert not _buys({"live", "queued"})
+        control.set_enabled(True)
+        resumed = time.time() + 2
+        while time.time() < resumed and not _buys({"live", "queued"}):
+            time.sleep(0.05)
+        assert _buys({"live", "queued"})
+        age = int(time.time() * 1000) - int(engine.decision_wall_ms or 0)
+        assert age < 1000, age
+        reader.release.set()
+        opened = time.time() + 3
+        while time.time() < opened:
+            extra = [market for market in engine.state.markets.values() if market.market_id != "m1"]
+            if extra:
+                break
+            time.sleep(0.05)
+        extra = [market for market in engine.state.markets.values() if market.market_id != "m1"]
+        assert extra, "next session was not opened after discovery returned"
+        assert any(market.status == "open" for market in extra)
+    finally:
+        reader.release.set()
+        (tmp_path / "STOP").write_text("stop", encoding="utf-8")
+        thread.join(4)
+    assert not thread.is_alive()
+    assert box["summary"]["stop_reason"] == "manual"
+
+
+def _gamma(open_s: int) -> dict:
+    slug = f"btc-updown-5m-{open_s}"
+    end = datetime.fromtimestamp(open_s + 300, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "id": slug,
+        "version": "v1",
+        "conditionId": f"0x{open_s:040x}",
+        "slug": slug,
+        "question": slug,
+        "outcomes": ["Up", "Down"],
+        "clobTokenIds": [f"{open_s}-up", f"{open_s}-down"],
+        "endDate": end,
+        "acceptingOrders": True,
+        "closed": False,
+        "orderMinSize": "5",
+        "orderPriceMinTickSize": "0.01",
+    }
+
+
 def test_fast_flag_defaults_off_and_dashboard_env_is_forwarded(tmp_path, monkeypatch):
     assert Config().small_pair_fast is False
     config = Config()
@@ -632,3 +954,7 @@ def test_fast_flag_defaults_off_and_dashboard_env_is_forwarded(tmp_path, monkeyp
     assert "--port 8767" in fast_script and "--fast" in fast_script and "app_fast" in fast_script
     assert "--no-fast" in slow_script and "8766" in slow_script
     assert 'id="latency"' in page
+    assert 'id="status"' in page
+    assert 'id="stalled"' in page
+    assert "currentOpen" in page
+    assert "STALLED" in page

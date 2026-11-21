@@ -138,6 +138,9 @@ class Hub:
                     with self.lock:
                         self._clear_memory()
                     continue
+                if summary.get("stop_reason") == "stall":
+                    time.sleep(1.0)
+                    continue
                 break
 
         self.thread = threading.Thread(target=loop, name="paper-dashboard", daemon=True)
@@ -180,6 +183,21 @@ class Hub:
         with self.lock:
             self._apply(row)
             body = self._body()
+        kind = str(row.get("kind") or "")
+        now = time.time()
+        urgent = kind in {
+            "fill",
+            "redeem",
+            "quote_submit",
+            "cancel_confirm",
+            "resolution",
+            "market_open",
+            "order_live",
+        }
+        last = getattr(self, "_last_flush", 0.0)
+        if not urgent and now - last < 0.2:
+            return
+        self._last_flush = now
         self._write_dashboard(body)
         self._notify()
 
@@ -1009,6 +1027,7 @@ def _feed_view(engine, config) -> dict:
         "connected": bool(getattr(engine, "book_connected", False)) if engine is not None else False,
         "decision_age_ms": age,
         "fast": bool(getattr(config, "small_pair_fast", False)),
+        "stalled": bool(getattr(engine, "stalled", False)) or (age is not None and age > 3000),
     }
 
 

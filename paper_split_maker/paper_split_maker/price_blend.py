@@ -10,12 +10,21 @@ Binance move since the Chainlink print:
 ``basis`` is the rolling median of ``binance - chainlink`` measured when
 Chainlink updates. A steady offset is not a disagreement. The quote still
 bids both Up and Down. Fair value only sets the price and the lot.
+
+An on-chain print older than ``CHAINLINK_ANCHOR_S`` is not the level. The
+spot is then the Binance stream. That age is a normal aggregator heartbeat,
+not a dead feed, so it does not widen and it does not stop quoting.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
+
+
+# On-chain BTC/USD often sits on one round for most of a minute. Past this
+# age the print is not a fair anchor. Binance is the settlement stream.
+CHAINLINK_ANCHOR_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -72,6 +81,7 @@ def combine_prices(
     chainlink_stale_s: float,
     disagree_fraction: Decimal,
     basis: Decimal | None = None,
+    chainlink_anchor_s: float = CHAINLINK_ANCHOR_S,
 ) -> PriceView:
     """Spot used for fair value. Widen only on a stale feed or a real residual."""
     chosen = mode if mode in {"binance", "chainlink", "combined"} else "binance"
@@ -104,6 +114,25 @@ def combine_prices(
             chainlink_stale,
             "chainlink" if chainlink is not None else "",
         )
+    if (
+        binance is not None
+        and _past_anchor(chainlink, chainlink_age_s, chainlink_anchor_s)
+    ):
+        # A normal heartbeat is not a dead feed. chainlink_stale stays false
+        # until chainlink_stale_s (hours). The level itself is still not used.
+        return PriceView(
+            binance,
+            binance,
+            chainlink,
+            binance_age_s,
+            chainlink_age_s,
+            gap,
+            False,
+            binance_stale or chainlink_stale,
+            "binance",
+            basis,
+            None,
+        )
     spot, used, residual, disagree = _debiased_spot(
         binance,
         chainlink,
@@ -133,9 +162,13 @@ def _debiased_spot(binance, chainlink, binance_at_chainlink, basis, disagree_fra
         return None, "", None, False
     if chainlink is None:
         return binance, "binance", None, False
-    if binance is None or binance_at_chainlink is None:
+    if binance is None:
         level = chainlink if basis is None else chainlink + basis
         return level, "chainlink", None, False
+    if binance_at_chainlink is None:
+        # No Binance sample at the Chainlink timestamp. The raw on-chain
+        # level is a different pair and must not replace the stream.
+        return binance, "binance", None, False
     offset = basis
     if offset is None:
         offset = binance_at_chainlink - chainlink
@@ -146,6 +179,12 @@ def _debiased_spot(binance, chainlink, binance_at_chainlink, basis, disagree_fra
     if chainlink > 0 and disagree_fraction > 0:
         disagree = abs(residual) / chainlink > disagree_fraction
     return spot, "combined", residual, disagree
+
+
+def _past_anchor(chainlink, age_s, limit: float) -> bool:
+    if chainlink is None or age_s is None:
+        return False
+    return float(age_s) > float(limit)
 
 
 def _stale(price, age_s, limit: float) -> bool:

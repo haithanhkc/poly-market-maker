@@ -5,7 +5,9 @@ from __future__ import annotations
 import csv
 import json
 import sys
+import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -376,10 +378,214 @@ def _paper_loop(
 # Wake at least this often so a book that arrived during the sleep is
 # handled inside the 1s decision budget. Ack is still 250ms and cancel
 # is still 500ms; the clock only promotes those timers.
+# Discovery, trades, and REST books run on _RestWorker. A slow GET must
+# not freeze now_ms or the quote pass.
 _FAST_SLEEP_S = 0.05
 _FAST_CLOCK_S = 0.10
 _FAST_TRADE_S = 0.25
 _FAST_DISCOVER_S = 0.5
+_FAST_BOOK_S = 2.0
+_FAST_HTTP_TIMEOUT_S = 2.5
+_STALL_MS = 3000
+_RESTART_MS = 8000
+
+
+class _RestWorker:
+    """REST for discovery, books, and trades. The decision thread only applies results."""
+
+    def __init__(self, reader):
+        self.reader = reader
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._job = None
+        self._busy = False
+        self._results: list = []
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="paper-rest", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
+    def idle(self) -> bool:
+        with self._lock:
+            return self._job is None and not self._busy
+
+    def submit(self, job) -> bool:
+        with self._lock:
+            if self._job is not None or self._busy:
+                return False
+            self._job = job
+        self._wake.set()
+        return True
+
+    def take(self) -> list:
+        with self._lock:
+            rows = self._results
+            self._results = []
+        return rows
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._wake.wait(0.2)
+            self._wake.clear()
+            if self._stop.is_set():
+                return
+            with self._lock:
+                job = self._job
+                self._job = None
+                if job is None:
+                    continue
+                self._busy = True
+            try:
+                result = self._run(job)
+            except Exception as exc:
+                result = ("error", job[0] if job else "rest", str(exc) or exc.__class__.__name__)
+            with self._lock:
+                self._busy = False
+                self._results.append(result)
+
+    def _run(self, job):
+        kind = job[0]
+        if kind == "discover":
+            return ("discover", self._discover(job[1]))
+        if kind == "books":
+            return ("books", self._books(job[1]))
+        if kind == "market":
+            return self._market(job[1], job[2])
+        return ("error", "job", str(kind))
+
+    def _discover(self, planned):
+        rows = []
+        reader = self.reader
+        for series, slugs, now_s, limit in planned:
+            begin = getattr(reader, "begin_poll", None)
+            if begin is not None:
+                begin()
+            error = ""
+            payloads = []
+            try:
+                payloads = reader.discover_btc_updown(
+                    now_s, limit, slugs, series=series
+                )
+            except Exception as exc:
+                error = str(exc) or exc.__class__.__name__
+            stats = dict(getattr(reader, "last_discovery", {}) or {})
+            rows.append(
+                (
+                    series,
+                    list(slugs),
+                    list(payloads or []),
+                    stats,
+                    error,
+                    getattr(reader, "network", ""),
+                )
+            )
+        return rows
+
+    def _books(self, pairs):
+        reader = self.reader
+        fetch_many = getattr(reader, "fetch_orderbooks", None)
+        if fetch_many is not None:
+            return fetch_many([ident for ident, _token in pairs])
+        books = {}
+        for ident, token in pairs:
+            books[ident] = reader.fetch_book(token)
+        return books
+
+    def _market(self, market_id, condition_id):
+        reader = self.reader
+        info = None
+        try:
+            payload = reader.fetch_trades(condition_id)
+            raw = getattr(reader, "last_trade_fetch", None)
+            info = dict(raw) if isinstance(raw, dict) else None
+        except Exception as exc:
+            payload = str(exc) or exc.__class__.__name__
+        try:
+            resolution = reader.fetch_resolution(condition_id)
+        except Exception:
+            resolution = None
+        return ("market", market_id, payload, info, resolution)
+
+
+def _watch_once(engine, feed, dump, *, now_ms: int, stall_ms: int = _STALL_MS, restart_ms: int = _RESTART_MS) -> bool:
+    """Mark a stalled decision loop, dump stacks, and fall back to REST."""
+    decision = int(getattr(engine, "decision_wall_ms", 0) or 0)
+    if not decision:
+        return False
+    age = int(now_ms) - decision
+    if age <= stall_ms:
+        engine.stalled = False
+        return False
+    engine.stalled = True
+    if dump is not None:
+        dump(age)
+    drop = getattr(feed, "drop", None) if feed is not None else None
+    if drop is not None:
+        drop()
+    if age > restart_ms:
+        engine.restart_paper = True
+    return True
+
+
+def _dump_thread_stacks(age_ms: int) -> None:
+    import faulthandler
+
+    _stderr(f"paper loop stalled; decision_age_ms={int(age_ms)}; thread stacks follow")
+    try:
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    except Exception as exc:
+        _stderr(f"faulthandler dump failed: {exc}")
+    try:
+        for ident, frame in sys._current_frames().items():
+            _stderr(f"--- thread {ident} ---")
+            _stderr("".join(traceback.format_stack(frame)))
+    except Exception as exc:
+        _stderr(f"frame dump failed: {exc}")
+
+
+def _start_watchdog(engine, feed, stop: threading.Event) -> threading.Thread:
+    def run() -> None:
+        armed = False
+        started = time.time()
+        while not stop.wait(1.0):
+            decision = int(getattr(engine, "decision_wall_ms", 0) or 0)
+            now_ms = int(time.time() * 1000)
+            if not decision:
+                if time.time() - started > 5 and not armed:
+                    armed = True
+                    _dump_thread_stacks(int((time.time() - started) * 1000))
+                    engine.stalled = True
+                    drop = getattr(feed, "drop", None) if feed is not None else None
+                    if drop is not None:
+                        drop()
+                    engine.restart_paper = True
+                continue
+            if now_ms - decision <= _STALL_MS:
+                armed = False
+                engine.stalled = False
+                continue
+            engine.stalled = True
+            if not armed:
+                armed = True
+                _dump_thread_stacks(now_ms - decision)
+                drop = getattr(feed, "drop", None) if feed is not None else None
+                if drop is not None:
+                    drop()
+            if now_ms - decision > _RESTART_MS:
+                engine.restart_paper = True
+
+    thread = threading.Thread(target=run, name="paper-watchdog", daemon=True)
+    thread.start()
+    return thread
 
 
 def _paper_fast_loop(
@@ -410,6 +616,16 @@ def _paper_fast_loop(
             str(getattr(reader, "api_key", "") or ""),
         )
         feed.start()
+    transport = getattr(reader, "transport", None)
+    if transport is not None and float(getattr(transport, "timeout", 0) or 0) > _FAST_HTTP_TIMEOUT_S:
+        transport.timeout = _FAST_HTTP_TIMEOUT_S
+    engine.persist_gap_s = 1.0
+    engine.stalled = False
+    engine.restart_paper = False
+    worker = _RestWorker(reader)
+    worker.start()
+    stop_watch = threading.Event()
+    watchdog = _start_watchdog(engine, feed, stop_watch)
     stop_reason = "running"
     redeemed_ids = {
         market.market_id
@@ -419,9 +635,16 @@ def _paper_fast_loop(
     last_clock = 0.0
     last_trades = 0.0
     last_discover = -1e9
+    last_status = 0.0
+    last_hb = 0.0
+    last_book_wall = 0.0
     last_price = None
+    trade_cursor = 0
     try:
         while True:
+            if getattr(engine, "restart_paper", False):
+                stop_reason = "stall"
+                break
             if deadline is not None and clock() >= deadline:
                 stop_reason = "duration"
                 break
@@ -445,14 +668,25 @@ def _paper_fast_loop(
                     break
             now = clock()
             stamp = int(now * 1000)
-            if now - last_discover >= _FAST_DISCOVER_S:
-                begin = getattr(reader, "begin_poll", None)
-                if begin is not None:
-                    begin()
-                _discover_due(
-                    engine, reader, config, stamp, max_markets, note, opened_slugs
-                )
-                last_discover = now
+            rest_frames, book_error = _take_rest(
+                worker, engine, reader, stamp, max_markets, note, opened_slugs
+            )
+            last_discover, last_trades, trade_cursor = _queue_rest(
+                worker,
+                engine,
+                reader,
+                config,
+                stamp,
+                now,
+                max_markets,
+                note,
+                opened_slugs,
+                feed,
+                last_book_wall,
+                last_discover,
+                last_trades,
+                trade_cursor,
+            )
             routes = _predict_routes(reader, engine)
             try:
                 feed.set_markets(list(routes))
@@ -460,33 +694,27 @@ def _paper_fast_loop(
             except Exception as exc:
                 frames = []
                 note(f"book socket read failed: {exc}")
+            frames = _latest_frames(list(frames) + list(rest_frames))
             applied = False
-            failed = False
+            failed = bool(book_error) and not getattr(feed, "connected", False)
             if frames:
-                applied, failed, polls = _apply_yes_frames(
+                applied, frame_failed, polls = _apply_yes_frames(
                     engine, frames, routes, stamp, polls, yes_to_events
                 )
+                failed = failed or frame_failed
                 if applied:
-                    engine.book_transport = "ws"
-                    engine.book_connected = True
-                    polls += 1
-                    _heartbeat(engine, stamp, polls)
-            elif not getattr(feed, "connected", False) and now - last_trades >= _FAST_TRADE_S:
-                rest_applied, rest_failed, polls = _apply_rest_books(
-                    engine, reader, routes, stamp, polls, note, yes_to_events
-                )
-                applied = rest_applied
-                failed = rest_failed
-                if applied:
-                    engine.book_transport = "rest"
-                    engine.book_connected = False
-                    polls += 1
-                    _heartbeat(engine, stamp, polls)
-            if getattr(feed, "connected", False):
+                    last_book_wall = time.time() * 1000
+            connected = bool(getattr(feed, "connected", False))
+            if connected:
                 engine.book_transport = "ws"
                 engine.book_connected = True
+            elif applied:
+                engine.book_transport = "rest"
+                engine.book_connected = False
             else:
                 engine.book_connected = False
+                if engine.book_transport == "ws":
+                    engine.book_transport = "rest"
             if failed and not engine.book_connected:
                 public_ok = False
                 polls += 1
@@ -509,10 +737,14 @@ def _paper_fast_loop(
                     }
                 )
             price = _btc_token(engine)
-            if last_price is not None and price != last_price and price:
+            price_changed = last_price is not None and price != last_price and bool(price)
+            last_price = price
+            if engine.state.markets and (
+                applied or price_changed or now - last_hb >= _FAST_CLOCK_S
+            ):
                 polls += 1
                 _heartbeat(engine, stamp, polls)
-            last_price = price
+                last_hb = now
             if now - last_clock >= _FAST_CLOCK_S:
                 polls += 1
                 engine.handle_event(
@@ -523,13 +755,12 @@ def _paper_fast_loop(
                     }
                 )
                 last_clock = now
-            if now - last_trades >= _FAST_TRADE_S:
-                _poll_open_trades(engine, reader, stamp, note)
-                _poll_resolutions(engine, reader)
-                last_trades = now
+            if now - last_status >= _FAST_TRADE_S:
+                last_status = now
                 if str(getattr(config, "strategy", "")) == "small_pair":
                     for market in engine.state.markets.values():
                         note(_status_line("small_pair", market))
+            engine.decision_wall_ms = int(time.time() * 1000)
             fresh = {
                 market.market_id
                 for market in engine.state.markets.values()
@@ -560,8 +791,11 @@ def _paper_fast_loop(
     except KeyboardInterrupt:
         stop_reason = "manual"
     finally:
+        stop_watch.set()
+        worker.stop()
         if own_feed and feed is not None:
             feed.stop()
+        watchdog.join(timeout=2.0)
     opened = len(opened_slugs)
     stats = dict(getattr(reader, "last_discovery", {}) or {})
     note(_discovery_line(stats))
@@ -578,6 +812,169 @@ def _paper_fast_loop(
         stats,
         stop_reason,
     )
+
+
+def _latest_frames(frames) -> list:
+    order = []
+    latest = {}
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        ident = str(frame.get("market_id") or "")
+        if not ident:
+            continue
+        if ident not in latest:
+            order.append(ident)
+        latest[ident] = frame
+    return [latest[ident] for ident in order]
+
+
+def _book_rows(books) -> list:
+    frames = []
+    if not isinstance(books, dict):
+        return frames
+    for ident, yes in books.items():
+        if not isinstance(yes, dict):
+            continue
+        row = dict(yes)
+        row["market_id"] = str(ident)
+        frames.append(row)
+    return frames
+
+
+def _take_rest(worker, engine, reader, stamp, max_markets, note, opened_slugs):
+    frames = []
+    book_error = False
+    for item in worker.take():
+        kind = item[0]
+        if kind == "discover":
+            _apply_discover_rows(
+                engine, reader, stamp, max_markets, note, opened_slugs, item[1]
+            )
+        elif kind == "books":
+            frames.extend(_book_rows(item[1]))
+        elif kind == "market":
+            _apply_market_fetch(engine, stamp, note, item[1], item[2], item[3], item[4])
+        elif kind == "error":
+            note(f"rest {item[1]} failed: {item[2]}")
+            if item[1] == "books":
+                book_error = True
+    return frames, book_error
+
+
+def _apply_discover_rows(engine, reader, stamp, max_markets, note, opened_slugs, rows) -> None:
+    discoveries = []
+    for series, slugs, payloads, stats, error, network in rows:
+        _install_discovery(
+            engine,
+            stamp,
+            max_markets,
+            note,
+            opened_slugs,
+            series,
+            slugs,
+            payloads,
+            stats,
+            error,
+            network,
+        )
+        if stats:
+            discoveries.append(stats)
+    if not hasattr(reader, "last_discovery"):
+        return
+    if len(discoveries) > 1:
+        reader.last_discovery = _merge_discovery(discoveries)
+    elif discoveries:
+        reader.last_discovery = discoveries[-1]
+
+
+def _apply_market_fetch(engine, stamp, note, market_id, payload, info, resolution) -> None:
+    market = engine.state.markets.get(market_id)
+    if market is None or market.status == "redeemed":
+        return
+    view = {
+        "market_id": market.market_id,
+        "condition_id": market.condition_id,
+        "up_token_id": market.up_token_id,
+        "down_token_id": market.down_token_id,
+    }
+    body = _poll_trades(None, market, note, payload=payload, info=info)
+    for trade in data_api_trade_events(view, body):
+        trade["trade_ts"] = trade["ts"]
+        trade["ts"] = stamp
+        engine.handle_event(trade)
+    if not isinstance(resolution, dict):
+        return
+    event = data_api_resolution_event(view, resolution)
+    if event is not None:
+        event["ts"] = engine.state.now_ms or stamp
+        engine.handle_event(event)
+
+
+def _queue_rest(
+    worker,
+    engine,
+    reader,
+    config,
+    stamp,
+    now,
+    max_markets,
+    note,
+    opened_slugs,
+    feed,
+    last_book_wall,
+    last_discover,
+    last_trades,
+    trade_cursor,
+):
+    if not worker.idle():
+        return last_discover, last_trades, trade_cursor
+    routes = _predict_routes(reader, engine)
+    connected = bool(getattr(feed, "connected", False))
+    book_age = time.time() * 1000 - float(last_book_wall or 0)
+    need_books = bool(routes) and (
+        not connected or book_age >= _FAST_BOOK_S * 1000
+    )
+    discover_due = now - last_discover >= _FAST_DISCOVER_S
+    # Books win the worker, but a rollover still has to be fetched. A discover
+    # that has already waited 2s runs even while the book is due.
+    discover_late = now - last_discover >= 2.0
+    if not engine.state.markets or (discover_due and (not need_books or discover_late)):
+        if discover_due:
+            planned = []
+            for series in _series_list(config):
+                if _hit_cap(len(opened_slugs), max_markets):
+                    break
+                slugs = _discovery_slugs(config, stamp, max_markets, note, series)
+                if slugs:
+                    planned.append(
+                        (series, slugs, stamp // 1000, max(len(slugs), 1))
+                    )
+                if str(getattr(config, "strategy", "") or "") != "small_pair":
+                    break
+            if planned and worker.submit(("discover", planned)):
+                last_discover = now
+            elif not planned:
+                last_discover = now
+        return last_discover, last_trades, trade_cursor
+    if need_books:
+        pairs = [(ident, routes[ident][0].up_token_id) for ident in routes]
+        if pairs and worker.submit(("books", pairs)):
+            return last_discover, last_trades, trade_cursor
+    if now - last_trades >= _FAST_TRADE_S:
+        markets = [
+            market
+            for market in engine.state.markets.values()
+            if market.status != "redeemed"
+        ]
+        if markets:
+            market = markets[trade_cursor % len(markets)]
+            trade_cursor += 1
+            if worker.submit(("market", market.market_id, market.condition_id)):
+                last_trades = now
+        else:
+            last_trades = now
+    return last_discover, last_trades, trade_cursor
 
 
 def _heartbeat(engine, stamp: int, polls: int) -> None:
@@ -854,6 +1251,19 @@ def _start_price_feeds(config, engine, note) -> list:
     return started
 
 
+def _series_list(config) -> list[str]:
+    strategy = str(getattr(config, "strategy", "") or "")
+    if strategy == "small_pair":
+        return [
+            str(item)
+            for item in (
+                getattr(config, "small_pair_series", None)
+                or ("btc-updown-5m", "btc-updown-15m")
+            )
+        ]
+    return [str(getattr(config, "series_slug", "") or "btc-updown-5m")]
+
+
 def sessions_due(series: str, now_s: int, lead: int, *, include_current: bool) -> list[str]:
     """Current window, when requested, plus later windows that open inside the lead."""
     window = window_seconds(series)
@@ -871,16 +1281,7 @@ def _discover_due(engine, reader, config, stamp: int, max_markets: int, note, op
     loads each series in ``small_pair_series`` (5m and 15m by default).
     """
     strategy = str(getattr(config, "strategy", "") or "")
-    if strategy == "small_pair":
-        series_list = [
-            str(item)
-            for item in (
-                getattr(config, "small_pair_series", None)
-                or ("btc-updown-5m", "btc-updown-15m")
-            )
-        ]
-    else:
-        series_list = [str(getattr(config, "series_slug", "") or "btc-updown-5m")]
+    series_list = _series_list(config)
     discoveries = []
     for series in series_list:
         if _hit_cap(len(opened_slugs), max_markets):
@@ -899,6 +1300,35 @@ def _discover_due(engine, reader, config, stamp: int, max_markets: int, note, op
 def _discover_series(
     engine, reader, config, stamp, max_markets, note, opened_slugs, series: str
 ) -> None:
+    slugs = _discovery_slugs(config, stamp, max_markets, note, series)
+    if not slugs:
+        return
+    now_s = stamp // 1000
+    try:
+        payloads = reader.discover_btc_updown(
+            now_s, max(len(slugs), 1), slugs, series=series
+        )
+    except PublicDataError as exc:
+        note(f"discovery failed: {exc}")
+        return
+    stats = getattr(reader, "last_discovery", {}) or {}
+    _install_discovery(
+        engine,
+        stamp,
+        max_markets,
+        note,
+        opened_slugs,
+        series,
+        slugs,
+        payloads,
+        stats,
+        "",
+        getattr(reader, "network", ""),
+    )
+
+
+def _discovery_slugs(config, stamp, max_markets, note, series: str) -> list[str]:
+    """Slugs to fetch. Notes the open window. Does not touch the network."""
     strategy = str(getattr(config, "strategy", "") or "")
     window = window_seconds(series)
     now_s = stamp // 1000
@@ -939,18 +1369,32 @@ def _discover_series(
         else:
             nxt = current + window
             note(f"next session {series}-{nxt} opens in {nxt - now_s}s; lead is {lead}s")
-        return
-    try:
-        payloads = reader.discover_btc_updown(now_s, max(len(slugs), 1), slugs, series=series)
-    except PublicDataError as exc:
-        note(f"discovery failed: {exc}")
-        return
-    stats = getattr(reader, "last_discovery", {}) or {}
-    if stats.get("error"):
+    return slugs
+
+
+def _install_discovery(
+    engine,
+    stamp,
+    max_markets,
+    note,
+    opened_slugs,
+    series,
+    slugs,
+    payloads,
+    stats,
+    error,
+    network,
+) -> None:
+    stats = stats or {}
+    if error:
+        note(f"discovery failed: {error}")
+    elif stats.get("error"):
         note(f"discovery failed: {stats['error']}")
     elif int(stats.get("rounds") or 0) == 0:
-        note(f"discovery returned no rounds for {series} on {reader.network}")
-    by_slug = {str(item.get("slug") or ""): item for item in payloads if isinstance(item, dict)}
+        note(f"discovery returned no rounds for {series} on {network}")
+    by_slug = {
+        str(item.get("slug") or ""): item for item in payloads if isinstance(item, dict)
+    }
     for slug in slugs:
         if _hit_cap(len(opened_slugs), max_markets):
             break
@@ -961,7 +1405,9 @@ def _discover_series(
         payload = by_slug.get(slug)
         if payload is None:
             starts = stats.get("starts") or []
-            note(f"wanted {slug} not in {stats.get('rounds', 0)} rounds; saw starts {starts}")
+            note(
+                f"wanted {slug} not in {stats.get('rounds', 0)} rounds; saw starts {starts}"
+            )
             continue
         event = gamma_market_event(payload, market_id=slug, synthetic=False)
         if event is None:
@@ -1021,16 +1467,25 @@ def _stamp_missing(value) -> bool:
         return False
 
 
-def _poll_trades(reader, market, note) -> dict:
-    """Count the matches request. A trade error does not take the book feed down."""
-    try:
-        payload = reader.fetch_trades(market.condition_id)
-    except PublicDataError as exc:
+def _poll_trades(reader, market, note, payload=None, info=None) -> dict:
+    """Count the matches request. A trade error does not take the book feed down.
+
+    The fast loop fetches on a side thread and passes ``payload``. The slow
+    loop leaves it empty and this function performs the GET.
+    """
+    if payload is None:
+        try:
+            payload = reader.fetch_trades(market.condition_id)
+        except PublicDataError as exc:
+            market.trade_fetches_failed += 1
+            market.trade_fetch_status = int(getattr(exc, "status", 0) or 0)
+            note(f"trades {market.slug} http {market.trade_fetch_status}")
+            return {"data": []}
+        info = getattr(reader, "last_trade_fetch", None)
+    elif isinstance(payload, str):
         market.trade_fetches_failed += 1
-        market.trade_fetch_status = int(getattr(exc, "status", 0) or 0)
-        note(f"trades {market.slug} http {market.trade_fetch_status}")
+        note(f"trades {market.slug} {payload}")
         return {"data": []}
-    info = getattr(reader, "last_trade_fetch", None)
     if not isinstance(info, dict):
         market.trade_fetches_ok += 1
         market.trade_fetch_status = market.trade_fetch_status or 200

@@ -251,6 +251,17 @@ class PredictBookFeed:
         self._thread = threading.Thread(target=self._run, name="predict-book", daemon=True)
         self._thread.start()
 
+    def drop(self) -> None:
+        """Close the socket so a stuck reader unblocks and the loop uses REST."""
+        self.connected = False
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
     def stop(self) -> None:
         self._stop.set()
         sock = self._sock
